@@ -100,38 +100,3 @@ def edit_image(instruction: str, image_id: str, image_size: str = "1K") -> dict:
         ),
     )
     return _save_response_image(response)
-
-
-def generate_image_with_references(
-    prompt: str,
-    aspect_ratio: str,
-    reference_image_ids: list[str],
-    image_size: str = "1K",
-) -> dict:
-    """Generates a new image conditioned on one or more reference images
-    (image-to-image), per PRD §7.4/§7.7's set-coherence formula: [references]
-    + [relation instruction] + [new scenario]. Unlike `edit_image`, this
-    produces a new composition (possibly a different aspect_ratio) that
-    shares the references' world/light/palette, rather than editing one in
-    place. `prompt` should carry both the relation instruction and the new
-    scenario. Saves the result under a new image_id and returns its metadata.
-    """
-    references = []
-    for image_id in reference_image_ids:
-        reference = _load_reference(image_id)
-        if isinstance(reference, dict):
-            return reference
-        references.append(reference)
-
-    client = genai.Client()
-    response = client.models.generate_content(
-        model="gemini-3.1-flash-image",
-        contents=[*references, prompt],
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            image_config=types.ImageConfig(
-                aspect_ratio=aspect_ratio, image_size=image_size
-            ),
-        ),
-    )
-    return _save_response_image(response)

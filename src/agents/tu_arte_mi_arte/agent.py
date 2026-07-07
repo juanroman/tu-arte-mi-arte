@@ -3,7 +3,6 @@ from google.adk.agents.llm_agent import Agent
 from engine.art_direction import build_prompt, load_art_direction
 from engine.generation import edit_image as edit_image_ai
 from engine.generation import generate_image as generate_image_ai
-from engine.generation import generate_image_with_references as generate_with_refs_ai
 from engine.preview import compose_preview as compose_preview_ai
 from engine.split import load_split_config
 from engine.split import split_wide_image as split_wide_image_ai
@@ -34,106 +33,79 @@ def refine_image(image_id: str, change: str) -> dict:
     return edit_image_ai(instruction=change, image_id=image_id)
 
 
-def generate_set(theme: str, mode: str = "diptico") -> dict:
-    """Genera de una sola vez las tres piezas de arte de la casa (paneles
-    43L, 43R y 50), todas para el mismo tema y coherentes entre sí como un
-    conjunto (PRD §7.4).
+def generate_set_diptico(scene_43l: str, scene_43r: str, scene_50: str) -> dict:
+    """Genera de una sola vez las tres piezas de arte de la casa en modo
+    díptico (PRD §7.3/§7.4): 43L y 43R como dos imágenes 9:16 independientes,
+    y 50 como panorama 16:9.
+
+    Cada `scene_*` debe ser una descripción de escena completa y autónoma
+    (sujeto + acción + lugar + composición/encuadre + luz) para ese panel
+    específico, ya elaborada por el agente a partir del tema/concepto
+    acordado con el usuario. Las tres escenas deben usar tipos de plano
+    (archetypes) claramente distintos entre sí — no repitas el mismo tipo de
+    toma con el sujeto cambiado. No incluyas lenguaje de adyacencia/layout
+    ("a la derecha de", "continúa la escena") ni flags de aspect ratio/cámara.
+
+    Cada panel se genera de forma independiente (sin referenciarse entre
+    sí) — la coherencia del conjunto viene solo del estilo de casa
+    compartido (aplicado automáticamente) y de que las tres escenas nacen
+    del mismo tema/turno.
 
     Esta es la tool por defecto cuando el usuario propone un tema nuevo de
-    arte (p. ej. "bicicletas vintage en Santorini"), ya que la v1 siempre
-    produce el conjunto de la casa, no piezas sueltas.
-
-    `mode` controla el formato de las dos 43" (PRD §7.3): 'diptico'
-    (default) genera 43L y 43R como dos imágenes 9:16 independientes pero
-    condicionadas entre sí; 'split' genera una sola imagen ancha y la parte
-    en dos con compensación de marco. Usa 'split' solo si el usuario lo pide
-    explícitamente (p. ej. "en modo split", "una sola imagen partida"); si no
-    lo aclara, usa 'diptico'.
-    """
-    if mode == "split":
-        return _generate_split_set(theme)
-    if mode != "diptico":
-        return {"error": f"Modo desconocido: {mode!r}"}
-    return _generate_diptico_set(theme)
-
-
-def _generate_diptico_set(theme: str) -> dict:
-    """Modo díptico (default): 43L se genera primero y 43R se genera
-    condicionada a 43L como "otra foto de la misma sesión, ángulo distinto"
-    (§7.7: [referencias] + [instrucción de relación] + [nuevo escenario]).
-    Importante: el prompt evita cualquier lenguaje de adyacencia/layout
-    ("a la derecha de", "continúa hacia", "díptico") — con Nano Banana 2 esa
-    redacción empuja al modelo a devolver un collage/grid de sub-imágenes en
-    vez de una sola composición, incluso pidiéndole explícitamente que no lo
-    haga. Pedirle una foto más de la misma sesión (sin relación espacial
-    explícita) es lo que produce una sola imagen limpia de forma consistente;
-    la relación de layout entre 43L/43R es curaduría nuestra, no del modelo.
-    La 50 se genera igual, condicionada al par, para compartir mundo y
-    paleta. 43L y 43R salen en 9:16 y 50 en 16:9. Devuelve un dict con el
-    resultado de cada panel; si algún paso falla, detiene la cadena y
-    devuelve lo generado hasta ahí más el error.
+    arte, ya que la v1 siempre produce el conjunto de la casa, no piezas
+    sueltas. Devuelve un dict con el resultado de cada panel; si algún paso
+    falla, detiene la cadena y devuelve lo generado hasta ahí más el error.
     """
     direction = load_art_direction()
-    base_prompt = build_prompt(theme, direction)
 
     results: dict = {}
 
-    results["43L"] = generate_image_ai(prompt=base_prompt, aspect_ratio="9:16")
+    results["43L"] = generate_image_ai(
+        prompt=build_prompt(scene_43l, direction), aspect_ratio="9:16"
+    )
     if "error" in results["43L"]:
         return results
 
-    results["43R"] = generate_with_refs_ai(
-        prompt=(
-            f"{base_prompt} Una nueva fotografía de la misma sesión que la "
-            "imagen de referencia: mismo lugar, mismos sujetos, misma luz "
-            "dorada, misma paleta, mismo grano de película y estilo "
-            "fotográfico — pero un ángulo de cámara y composición distintos "
-            "dentro de la escena, como si se hubiera tomado momentos después "
-            "durante la misma sesión."
-        ),
-        aspect_ratio="9:16",
-        reference_image_ids=[results["43L"]["image_id"]],
+    results["43R"] = generate_image_ai(
+        prompt=build_prompt(scene_43r, direction), aspect_ratio="9:16"
     )
     if "error" in results["43R"]:
         return results
 
-    results["50"] = generate_with_refs_ai(
-        prompt=(
-            f"{base_prompt} Una toma general abierta de la misma sesión que "
-            "las imágenes de referencia: mismo lugar, mismos sujetos, misma "
-            "luz dorada, misma paleta, mismo grano de película y estilo "
-            "fotográfico — un encuadre más abierto y un ángulo de cámara "
-            "distinto al de las referencias, como si se hubiera tomado "
-            "momentos después durante la misma sesión."
-        ),
-        aspect_ratio="16:9",
-        reference_image_ids=[results["43L"]["image_id"], results["43R"]["image_id"]],
+    results["50"] = generate_image_ai(
+        prompt=build_prompt(scene_50, direction), aspect_ratio="16:9"
     )
     return results
 
 
-def _generate_split_set(theme: str) -> dict:
-    """Modo split (PRD §7.3): una sola imagen ancha pensada para partirse
-    entre las dos 43", con la regla anti-centrado inyectada en el prompt
-    (el centro se recorta como franja de compensación de marco). La 50 se
-    genera condicionada a la imagen ancha para compartir mundo y paleta.
+def generate_set_split(scene_wide: str, scene_50: str) -> dict:
+    """Genera de una sola vez las tres piezas de arte de la casa en modo
+    split (PRD §7.3): una sola imagen ancha que se parte en dos para las
+    43" (con compensación de marco), y 50 como panorama 16:9 independiente.
+
+    Usa esta tool solo si el usuario pide explícitamente el modo split (p.
+    ej. "en modo split", "una sola imagen partida"); si no lo aclara, usa
+    generate_set_diptico.
+
+    `scene_wide` describe la composición panorámica única para las dos 43"
+    (sujeto + acción + lugar + composición/encuadre + luz) — no le pidas que
+    mantenga el centro vacío; el recorte final se ajusta con la
+    compensación de marco ya calibrada, no con instrucciones al modelo.
+    `scene_50` describe una escena distinta para el panel 50, con un tipo de
+    plano diferente al de `scene_wide` (ideal: más abierto/establishing, ya
+    que 50 es el panorama). Ninguna escena debe incluir lenguaje de
+    adyacencia/layout ni flags de aspect ratio/cámara.
+
     Devuelve un dict con 'wide', '43L', '43R' y '50'; si algún paso falla,
     detiene la cadena y devuelve lo generado hasta ahí más el error.
     """
     direction = load_art_direction()
-    base_prompt = build_prompt(theme, direction)
     split_config = load_split_config()
 
     results: dict = {}
 
     results["wide"] = generate_image_ai(
-        prompt=(
-            f"{base_prompt} Genera una sola composición panorámica pensada "
-            "para partirse verticalmente por la mitad entre dos pantallas: "
-            "mantén el área central de la composición vacía de sujetos "
-            "importantes y reparte el peso visual a los tercios laterales, "
-            "ya que el centro se recortará."
-        ),
+        prompt=build_prompt(scene_wide, direction),
         aspect_ratio=split_config.wide_aspect_ratio,
     )
     if "error" in results["wide"]:
@@ -148,17 +120,8 @@ def _generate_split_set(theme: str) -> dict:
     results["43L"] = split_result["left"]
     results["43R"] = split_result["right"]
 
-    results["50"] = generate_with_refs_ai(
-        prompt=(
-            f"{base_prompt} Una toma general abierta de la misma sesión que "
-            "la imagen de referencia: mismo lugar, mismos sujetos, misma luz "
-            "dorada, misma paleta, mismo grano de película y estilo "
-            "fotográfico — un encuadre más abierto y un ángulo de cámara "
-            "distinto al de la referencia, como si se hubiera tomado "
-            "momentos después durante la misma sesión."
-        ),
-        aspect_ratio="16:9",
-        reference_image_ids=[results["wide"]["image_id"]],
+    results["50"] = generate_image_ai(
+        prompt=build_prompt(scene_50, direction), aspect_ratio="16:9"
     )
     return results
 
@@ -179,17 +142,41 @@ root_agent = Agent(
     name="root_agent",
     description="Asistente de arte generativo para las Samsung Frame TVs de la casa.",
     instruction=(
-        "Eres el asistente de arte generativo de la casa. "
-        "Cuando el usuario proponga un tema nuevo (p. ej. 'bicicletas "
-        "vintage en Santorini'), usa generate_set: la casa siempre se "
-        "piensa como un conjunto de tres pantallas (43L, 43R, 50), no como "
-        "piezas sueltas. Por defecto usa mode='diptico' (43L y 43R como dos "
-        "imágenes 9:16 condicionadas entre sí); usa mode='split' solo si el "
+        "Eres el asistente de arte generativo de la casa. La casa siempre "
+        "se piensa como un conjunto de tres pantallas (43L, 43R, 50), no "
+        "como piezas sueltas — para un tema nuevo usa generate_set_diptico "
+        "o generate_set_split, nunca generate_image (esa es solo para "
+        "cuando el usuario pida explícitamente una sola pieza o un panel "
+        "específico). \n\n"
+        "ETAPA 1 — CONCEPTO (sin llamar ninguna tool todavía). Cuando el "
+        "usuario proponga un tema nuevo, evalúa si es amplio (admite varias "
+        "direcciones visuales distintas, p. ej. 'Día de los Muertos', "
+        "'otoño') o ya es un concepto específico (p. ej. 'bicicletas "
+        "vintage en Santorini', 'faroles de papel picado en un patio'). Si "
+        "es amplio, responde en el chat con 2-3 opciones de concepto "
+        "concretas (una línea cada una, p. ej. 'podría ser retratos de "
+        "calaveras, un jardín de cempasúchil, o una ofrenda — ofrenda da "
+        "más variedad para el conjunto') y espera a que el usuario elija o "
+        "proponga otra antes de generar nada. Si ya es específico, sáltate "
+        "esta etapa y ve directo a elaborar.\n\n"
+        "ETAPA 2 — ELABORACIÓN (una vez el concepto está definido, en este "
+        "turno o uno anterior). Escribe tú mismo una descripción de escena "
+        "distinta para cada panel (3 para diptico: 43L, 43R, 50; 2 para "
+        "split: wide, 50), en prosa, siguiendo sujeto + acción + "
+        "lugar/escena + composición/encuadre + luz. No uses lenguaje de "
+        "adyacencia o layout ('a la derecha de', 'continúa la escena', "
+        "'misma sesión que la anterior') ni menciones aspect ratio o flags "
+        "de cámara — eso lo maneja la tool. Elige un tipo de plano "
+        "(archetype) distinto para cada panel dentro del mismo conjunto, "
+        "nunca repitas el mismo tipo de toma con el sujeto cambiado; usa "
+        "como guía (no como lista cerrada): macro/detalle, plano general "
+        "abierto/paisaje, figura humana en la escena, silueta, textura/"
+        "abstracto en close-up, aéreo/elevado, reflejo/agua, líneas que "
+        "guían la mirada, luz dorada/contraluz. Para el panel 50 inclínate "
+        "por un plano general abierto, ya que es el panorama. Por defecto "
+        "usa generate_set_diptico; usa generate_set_split solo si el "
         "usuario lo pide explícitamente (p. ej. 'en modo split', 'una sola "
-        "imagen partida'), que genera una sola imagen ancha partida en dos "
-        "con compensación de marco. Usa generate_image en su lugar solo si "
-        "el usuario pide explícitamente una sola pieza o un panel "
-        "específico. "
+        "imagen partida'). \n\n"
         "Si el usuario está corrigiendo o ajustando el resultado más reciente "
         "de la conversación (p. ej. 'más otoñal', 'quita eso'), en vez de "
         "generar una imagen nueva desde cero usa refine_image con el image_id "
@@ -201,5 +188,11 @@ root_agent = Agent(
         "la conversación (si el usuario refinó una pieza, usa el image_id "
         "más nuevo de esa pieza)."
     ),
-    tools=[generate_image, refine_image, generate_set, compose_preview],
+    tools=[
+        generate_image,
+        refine_image,
+        generate_set_diptico,
+        generate_set_split,
+        compose_preview,
+    ],
 )

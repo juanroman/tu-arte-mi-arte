@@ -24,9 +24,14 @@ def test_root_agent_has_refine_image_tool():
     assert "refine_image" in tool_names
 
 
-def test_root_agent_has_generate_set_tool():
+def test_root_agent_has_generate_set_diptico_tool():
     tool_names = {tool.__name__ for tool in agent.root_agent.tools}
-    assert "generate_set" in tool_names
+    assert "generate_set_diptico" in tool_names
+
+
+def test_root_agent_has_generate_set_split_tool():
+    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    assert "generate_set_split" in tool_names
 
 
 def test_root_agent_has_compose_preview_tool():
@@ -34,21 +39,21 @@ def test_root_agent_has_compose_preview_tool():
     assert "compose_preview" in tool_names
 
 
-def test_generate_set_produces_the_three_house_panels(monkeypatch):
-    ref_calls = []
+def test_generate_set_diptico_produces_the_three_house_panels(monkeypatch):
+    calls = []
 
     def fake_generate_image_ai(prompt, aspect_ratio):
-        return {"image_id": "img_43L", "aspect_ratio": aspect_ratio}
-
-    def fake_generate_with_refs_ai(prompt, aspect_ratio, reference_image_ids):
-        ref_calls.append((aspect_ratio, tuple(reference_image_ids)))
-        image_id = f"img_{aspect_ratio.replace(':', '_')}_{len(ref_calls)}"
+        calls.append((prompt, aspect_ratio))
+        image_id = f"img_{len(calls)}"
         return {"image_id": image_id, "aspect_ratio": aspect_ratio}
 
     monkeypatch.setattr(agent, "generate_image_ai", fake_generate_image_ai)
-    monkeypatch.setattr(agent, "generate_with_refs_ai", fake_generate_with_refs_ai)
 
-    result = agent.generate_set("bicicletas vintage en Santorini")
+    result = agent.generate_set_diptico(
+        scene_43l="macro de una bicicleta oxidada apoyada en una pared azul",
+        scene_43r="figura humana caminando junto a bicicletas estacionadas",
+        scene_50="plano general abierto de una calle empedrada con bicicletas",
+    )
 
     assert set(result.keys()) == {"43L", "43R", "50"}
     assert result["43L"]["aspect_ratio"] == "9:16"
@@ -56,47 +61,44 @@ def test_generate_set_produces_the_three_house_panels(monkeypatch):
     assert result["50"]["aspect_ratio"] == "16:9"
     assert result["43L"]["image_id"] != result["50"]["image_id"]
 
-    # 43R se condiciona solo a 43L; la 50 se condiciona al par ya generado.
-    assert ref_calls[0] == ("9:16", ("img_43L",))
-    assert ref_calls[1] == ("16:9", ("img_43L", result["43R"]["image_id"]))
+    # cada panel se genera de forma independiente, sin referencias entre sí,
+    # a partir de su propia descripción de escena.
+    assert len(calls) == 3
+    assert "bicicleta oxidada" in calls[0][0]
+    assert "caminando junto a bicicletas" in calls[1][0]
+    assert "calle empedrada" in calls[2][0]
 
 
-def test_generate_set_stops_the_chain_on_first_error(monkeypatch):
+def test_generate_set_diptico_stops_the_chain_on_first_error(monkeypatch):
+    calls = []
+
     def failing_generate_image_ai(prompt, aspect_ratio):
+        calls.append((prompt, aspect_ratio))
         return {"error": "rechazo por política"}
 
-    def unexpected_generate_with_refs_ai(prompt, aspect_ratio, reference_image_ids):
-        raise AssertionError("no debería llamarse tras un error en 43L")
-
     monkeypatch.setattr(agent, "generate_image_ai", failing_generate_image_ai)
-    monkeypatch.setattr(
-        agent, "generate_with_refs_ai", unexpected_generate_with_refs_ai
-    )
 
-    result = agent.generate_set("un tema con derechos")
+    result = agent.generate_set_diptico(
+        scene_43l="un tema con derechos",
+        scene_43r="otra escena",
+        scene_50="otra escena más",
+    )
 
     assert set(result.keys()) == {"43L"}
     assert "error" in result["43L"]
+    assert len(calls) == 1
 
 
-def test_generate_set_rejects_unknown_mode():
-    result = agent.generate_set("un tema", mode="collage")
-
-    assert "error" in result
-
-
-def test_generate_set_split_mode_crops_and_orchestrates(monkeypatch):
+def test_generate_set_split_crops_and_orchestrates(monkeypatch):
     from engine.split import SplitConfig
 
-    def fake_generate_image_ai(prompt, aspect_ratio):
-        return {"image_id": "img_wide", "aspect_ratio": aspect_ratio}
+    calls = []
 
-    def fake_generate_with_refs_ai(prompt, aspect_ratio, reference_image_ids):
-        return {
-            "image_id": "img_50",
-            "aspect_ratio": aspect_ratio,
-            "reference_image_ids": tuple(reference_image_ids),
-        }
+    def fake_generate_image_ai(prompt, aspect_ratio):
+        calls.append((prompt, aspect_ratio))
+        if len(calls) == 1:
+            return {"image_id": "img_wide", "aspect_ratio": aspect_ratio}
+        return {"image_id": "img_50", "aspect_ratio": aspect_ratio}
 
     split_calls = []
 
@@ -108,7 +110,6 @@ def test_generate_set_split_mode_crops_and_orchestrates(monkeypatch):
         }
 
     monkeypatch.setattr(agent, "generate_image_ai", fake_generate_image_ai)
-    monkeypatch.setattr(agent, "generate_with_refs_ai", fake_generate_with_refs_ai)
     monkeypatch.setattr(agent, "split_wide_image_ai", fake_split_wide_image_ai)
     monkeypatch.setattr(
         agent,
@@ -118,13 +119,21 @@ def test_generate_set_split_mode_crops_and_orchestrates(monkeypatch):
         ),
     )
 
-    result = agent.generate_set("faros de playa", mode="split")
+    result = agent.generate_set_split(
+        scene_wide="faros de playa vistos desde la duna, luz de atardecer",
+        scene_50="plano general abierto del muelle de madera al amanecer",
+    )
 
     assert set(result.keys()) == {"wide", "43L", "43R", "50"}
     assert result["wide"]["aspect_ratio"] == "5:4"
     assert result["43L"]["image_id"] == "img_left"
     assert result["43R"]["image_id"] == "img_right"
-    assert result["50"]["reference_image_ids"] == ("img_wide",)
+    assert result["50"]["image_id"] == "img_50"
+    assert result["50"]["aspect_ratio"] == "16:9"
+
+    # 50 no lleva referencias — se genera de forma independiente.
+    assert len(calls) == 2
+    assert "muelle de madera" in calls[1][0]
 
     assert len(split_calls) == 1
     called_image_id, called_gap_fraction = split_calls[0]
@@ -132,45 +141,35 @@ def test_generate_set_split_mode_crops_and_orchestrates(monkeypatch):
     assert 0 < called_gap_fraction < 1
 
 
-def test_generate_set_split_mode_stops_the_chain_if_wide_image_fails(monkeypatch):
+def test_generate_set_split_stops_the_chain_if_wide_image_fails(monkeypatch):
     def failing_generate_image_ai(prompt, aspect_ratio):
         return {"error": "rechazo por política"}
 
     def unexpected_split_wide_image_ai(image_id, gap_fraction):
         raise AssertionError("no debería llamarse tras un error en 'wide'")
 
-    def unexpected_generate_with_refs_ai(prompt, aspect_ratio, reference_image_ids):
-        raise AssertionError("no debería llamarse tras un error en 'wide'")
-
     monkeypatch.setattr(agent, "generate_image_ai", failing_generate_image_ai)
     monkeypatch.setattr(agent, "split_wide_image_ai", unexpected_split_wide_image_ai)
-    monkeypatch.setattr(
-        agent, "generate_with_refs_ai", unexpected_generate_with_refs_ai
-    )
 
-    result = agent.generate_set("un tema con derechos", mode="split")
+    result = agent.generate_set_split(
+        scene_wide="un tema con derechos", scene_50="otra escena"
+    )
 
     assert set(result.keys()) == {"wide"}
     assert "error" in result["wide"]
 
 
-def test_generate_set_split_mode_stops_the_chain_if_split_fails(monkeypatch):
+def test_generate_set_split_stops_the_chain_if_split_fails(monkeypatch):
     def fake_generate_image_ai(prompt, aspect_ratio):
         return {"image_id": "img_wide", "aspect_ratio": aspect_ratio}
 
     def failing_split_wide_image_ai(image_id, gap_fraction):
         return {"error": "no existe la imagen fuente"}
 
-    def unexpected_generate_with_refs_ai(prompt, aspect_ratio, reference_image_ids):
-        raise AssertionError("no debería llamarse tras un error en el split")
-
     monkeypatch.setattr(agent, "generate_image_ai", fake_generate_image_ai)
     monkeypatch.setattr(agent, "split_wide_image_ai", failing_split_wide_image_ai)
-    monkeypatch.setattr(
-        agent, "generate_with_refs_ai", unexpected_generate_with_refs_ai
-    )
 
-    result = agent.generate_set("un tema", mode="split")
+    result = agent.generate_set_split(scene_wide="un tema", scene_50="otra escena")
 
     assert set(result.keys()) == {"wide", "error"}
 

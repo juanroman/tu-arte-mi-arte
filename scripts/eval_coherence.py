@@ -1,11 +1,14 @@
-"""Eval script (dev-only, NOT a pytest test): runs generate_set across a list
-of themes and asks Gemini (vision) to judge set coherence per PRD §7.4.
+"""Eval script (dev-only, NOT a pytest test): drives the real root_agent
+(text turn in, tool call out) across a list of themes and asks Gemini
+(vision) to judge set coherence per PRD §7.4.
 
 Hits the real API, costs money, and is non-deterministic — run manually with
 `uv run python scripts/eval_coherence.py` (optionally passing themes as CLI
-args) when validating changes to the image-to-image chaining in generate_set.
+args) when validating changes to how root_agent authors per-panel scenes in
+generate_set_diptico/generate_set_split.
 """
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -15,8 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "agents"
 
 from dotenv import load_dotenv  # noqa: E402
 from google import genai  # noqa: E402
+from google.adk.runners import Runner  # noqa: E402
+from google.adk.sessions import InMemorySessionService  # noqa: E402
 from google.genai import types  # noqa: E402
-from tu_arte_mi_arte.agent import generate_set  # noqa: E402
+from tu_arte_mi_arte.agent import root_agent  # noqa: E402
 
 load_dotenv()
 
@@ -24,10 +29,10 @@ EVALS_DIR = Path(__file__).resolve().parent.parent / "data" / "evals"
 
 DEFAULT_THEMES = [
     "bicicletas vintage estacionadas tipo Santorini",
-    "un mercado de flores en la Provenza al amanecer",
+    "un puesto de flores de lavanda en un mercado de la Provenza al amanecer",
     "veleros anclados en una bahía de la costa amalfitana",
-    "una cabaña de montaña rodeada de pinos nevados",
-    "un café de esquina en Buenos Aires en otoño",
+    "una cabaña de troncos con luces cálidas rodeada de pinos nevados",
+    "las mesas de chapa de un café notable porteño con hojas de otoño en la vereda",
 ]
 
 JUDGE_SCHEMA = types.Schema(
@@ -41,14 +46,12 @@ JUDGE_SCHEMA = types.Schema(
             type=types.Type.INTEGER,
             description="1-5: ¿se sienten el mismo mundo/tema, no escenas inconexas?",
         ),
-        "shoot_variety_coherence": types.Schema(
+        "archetype_diversity": types.Schema(
             type=types.Type.INTEGER,
             description=(
-                "1-5: ¿43L y 43R se sienten de la misma sesión/tema (mismo "
-                "lugar, luz, sujetos) Y con suficiente variedad de ángulo o "
-                "encuadre entre sí para no verse redundantes colgadas juntas "
-                "en la pared? Penaliza tanto la inconsistencia (mundos "
-                "distintos) como la redundancia (casi la misma toma)."
+                "1-5: ¿43L, 43R y 50 usan tipos de plano claramente distintos "
+                "entre sí (p. ej. macro vs. plano abierto vs. figura), en vez "
+                "de repetir la misma composición con el sujeto cambiado?"
             ),
         ),
         "overall_pass": types.Schema(
@@ -63,7 +66,7 @@ JUDGE_SCHEMA = types.Schema(
     required=[
         "palette_lighting_coherence",
         "world_story_coherence",
-        "shoot_variety_coherence",
+        "archetype_diversity",
         "overall_pass",
         "notes",
     ],
@@ -72,14 +75,13 @@ JUDGE_SCHEMA = types.Schema(
 JUDGE_PROMPT = (
     "Eres un juez de dirección de arte. Te muestro tres imágenes generadas para "
     "las pantallas de una casa a partir del mismo tema: primero el panel 43L "
-    "(vertical), luego 43R (vertical, otra toma de la misma sesión) y finalmente "
-    "el panorama de la pantalla 50 (horizontal). Evalúa si se leen como UN "
-    "CONJUNTO curado e intencional -no como tres imágenes sueltas e inconexas, "
-    "ni como la misma toma repetida- según estos criterios del PRD de la casa: "
-    "tratamiento visual compartido (paleta, luz, grano, tono), 43L/43R se sienten "
-    "de la misma sesión/lugar pero con ángulo o encuadre suficientemente "
-    "distintos entre sí para no verse redundantes colgadas juntas, y el panorama "
-    "de la 50 pertenece al mismo mundo/tema que el par."
+    "(vertical), luego 43R (vertical) y finalmente el panorama de la pantalla 50 "
+    "(horizontal). Evalúa si se leen como UN CONJUNTO curado e intencional -no "
+    "como tres imágenes sueltas e inconexas, ni como la misma toma repetida- "
+    "según estos criterios del PRD de la casa: tratamiento visual compartido "
+    "(paleta, luz, grano, tono), 43L/43R/50 usan tipos de plano/composición "
+    "claramente distintos entre sí para no verse redundantes colgadas juntas, y "
+    "las tres piezas pertenecen al mismo mundo/tema."
 )
 
 
@@ -112,11 +114,55 @@ def judge_set(result: dict) -> dict:
     return json.loads(response.text)
 
 
+async def _send(runner: Runner, user_id: str, session_id: str, text: str) -> list:
+    events = []
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=types.Content(role="user", parts=[types.Part(text=text)]),
+    ):
+        events.append(event)
+    return events
+
+
+async def run_agent_for_theme(theme: str, follow_up: str | None = None) -> dict:
+    """Drives root_agent through a real conversational turn (and optional
+    follow-up) and returns the result dict from whichever generate_set_*
+    tool it called, or {} if it never called one (e.g. it only pitched
+    concepts and no follow_up was given to resolve them).
+    """
+    user_id = "eval"
+    session_service = InMemorySessionService()
+    session = await session_service.create_session(
+        app_name="tu_arte_mi_arte", user_id=user_id
+    )
+    runner = Runner(
+        app_name="tu_arte_mi_arte",
+        agent=root_agent,
+        session_service=session_service,
+    )
+
+    events = await _send(runner, user_id, session.id, theme)
+    if follow_up:
+        events += await _send(runner, user_id, session.id, follow_up)
+
+    result: dict = {}
+    for event in events:
+        for resp in event.get_function_responses():
+            if resp.name in ("generate_set_diptico", "generate_set_split"):
+                result = resp.response
+    return result
+
+
 def run_eval(themes: list[str]) -> list[dict]:
     runs = []
     for theme in themes:
         print(f"-> generando conjunto para: {theme!r}")
-        result = generate_set(theme)
+        result = asyncio.run(run_agent_for_theme(theme))
+        if not result:
+            print("   ERROR: el agente no llamó a generate_set_diptico/split")
+            runs.append({"theme": theme, "result": result, "judgment": None})
+            continue
         if any("error" in panel for panel in result.values()):
             print(f"   ERROR generando el conjunto: {result}")
             runs.append({"theme": theme, "result": result, "judgment": None})
@@ -127,7 +173,7 @@ def run_eval(themes: list[str]) -> list[dict]:
         print(
             f"   paleta/luz={judgment['palette_lighting_coherence']} "
             f"mundo={judgment['world_story_coherence']} "
-            f"variedad={judgment['shoot_variety_coherence']} "
+            f"archetype_diversity={judgment['archetype_diversity']} "
             f"pass={judgment['overall_pass']}"
         )
         runs.append({"theme": theme, "result": result, "judgment": judgment})
@@ -144,10 +190,16 @@ def main() -> None:
 
     judged = [r for r in runs if r["judgment"]]
     passed = sum(1 for r in judged if r["judgment"]["overall_pass"])
+    mean_archetype_diversity = (
+        sum(r["judgment"]["archetype_diversity"] for r in judged) / len(judged)
+        if judged
+        else 0.0
+    )
     print(
         f"\n{passed}/{len(judged)} conjuntos evaluados pasaron "
         f"(de {len(runs)} temas totales)."
     )
+    print(f"archetype_diversity promedio: {mean_archetype_diversity:.2f}/5")
     print(f"Detalle guardado en {out_path}")
 
 
