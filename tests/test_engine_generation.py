@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from motor.generacion import generar_imagen_ia
+from engine.generation import generate_image
 
 JPEG_MAGIC_NUMBER = b"\xff\xd8"
 
@@ -17,8 +17,8 @@ requires_gemini_key = pytest.mark.skipif(
 
 
 @requires_gemini_key
-def test_generar_imagen_ia_guarda_jpeg_valido():
-    result = generar_imagen_ia("a small red apple on a wooden table", "1:1")
+def test_generate_image_saves_valid_jpeg():
+    result = generate_image("a small red apple on a wooden table", "1:1")
 
     assert "image_id" in result
     path = Path(result["path"])

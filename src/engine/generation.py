@@ -1,7 +1,7 @@
-"""Wrapper plano sobre google-genai para generar imágenes con Nano Banana 2.
+"""Plain wrapper over google-genai to generate images with Nano Banana 2.
 
-Sin dependencias de google.adk: esta función es testeable de forma aislada
-y reutilizable desde cualquier interfaz (adk web hoy, Telegram en Etapa 2).
+No dependency on google.adk: this function is testable in isolation and
+reusable from any interface (adk web today, Telegram in Etapa 2).
 """
 
 import uuid
@@ -13,9 +13,9 @@ from google.genai import types
 IMAGES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "images"
 
 
-def generar_imagen_ia(prompt: str, aspect_ratio: str, image_size: str = "1K") -> dict:
-    """Genera una imagen con Nano Banana 2 (gemini-3.1-flash-image) a partir de
-    un prompt y la guarda en disco. Devuelve el image_id y la ruta del archivo.
+def generate_image(prompt: str, aspect_ratio: str, image_size: str = "1K") -> dict:
+    """Generates an image with Nano Banana 2 (gemini-3.1-flash-image) from a
+    prompt and saves it to disk. Returns the image_id and file path.
     """
     client = genai.Client()
     response = client.models.generate_content(
