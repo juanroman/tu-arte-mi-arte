@@ -93,10 +93,26 @@ def edit_image(instruction: str, image_id: str, image_size: str = "1K") -> dict:
     client = genai.Client()
     response = client.models.generate_content(
         model="gemini-3.1-flash-image",
-        contents=[reference, instruction],
+        contents=[reference, instruction],  # type: ignore[arg-type]
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE"],
             image_config=types.ImageConfig(image_size=image_size),
         ),
     )
     return _save_response_image(response)
+
+
+FINAL_HIGH_RES_INSTRUCTION = (
+    "Escalado 4K de la imagen de referencia: mantén el layout, la "
+    "geometría y la ubicación exacta de los objetos; no introduzcas "
+    "elementos nuevos; realza texturas y micro-detalle de forma nativa."
+)
+
+
+def generate_final_high_res(image_id: str) -> dict:
+    """Segunda pasada (PRD §7.7): re-genera el draft aprobado en 4K vía
+    image-to-image, con una instrucción estricta que preserva layout,
+    geometría y contenido — nunca un upscale ciego ni un modelo distinto
+    del usado para el draft.
+    """
+    return edit_image(FINAL_HIGH_RES_INSTRUCTION, image_id, image_size="4K")

@@ -20,9 +20,7 @@ def test_load_room_config_reads_house_config():
 
 def test_load_room_config_reads_custom_path(tmp_path):
     config_path = tmp_path / "room.toml"
-    config_path.write_text(
-        '[panels."43L"]\nx0 = 0.1\ny0 = 0.2\nx1 = 0.3\ny1 = 0.4\n'
-    )
+    config_path.write_text('[panels."43L"]\nx0 = 0.1\ny0 = 0.2\nx1 = 0.3\ny1 = 0.4\n')
 
     config = load_room_config(path=config_path)
 
@@ -54,9 +52,7 @@ def test_compose_preview_pastes_panels_into_room_photo(tmp_path, monkeypatch):
     _solid_jpeg(tmp_path / "img_right.jpg", (200, 400), (0, 255, 0))
     _solid_jpeg(tmp_path / "img_wide.jpg", (400, 200), (0, 0, 255))
 
-    result = compose_preview(
-        {"43L": "img_left", "43R": "img_right", "50": "img_wide"}
-    )
+    result = compose_preview({"43L": "img_left", "43R": "img_right", "50": "img_wide"})
 
     assert "error" not in result
     path = Path(result["path"])

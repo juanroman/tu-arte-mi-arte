@@ -187,3 +187,98 @@ def test_compose_preview_forwards_the_three_panel_image_ids(monkeypatch):
 
     assert captured == {"43L": "img_43L", "43R": "img_43R", "50": "img_50"}
     assert result["image_id"] == "img_preview"
+
+
+def test_root_agent_has_finalize_high_res_tool():
+    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    assert "finalize_high_res" in tool_names
+
+
+def test_finalize_high_res_single_panel_returns_upscaled_image(monkeypatch):
+    def fake_generate_final_high_res_ai(image_id):
+        return {"image_id": "img_final_43l", "path": "/tmp/img_final_43l.jpg"}
+
+    def unexpected_split_wide_image_ai(image_id, gap_fraction):
+        raise AssertionError("no debería llamarse para un panel individual")
+
+    monkeypatch.setattr(
+        agent, "generate_final_high_res_ai", fake_generate_final_high_res_ai
+    )
+    monkeypatch.setattr(agent, "split_wide_image_ai", unexpected_split_wide_image_ai)
+
+    result = agent.finalize_high_res("img_draft_43l")
+
+    assert result == {"image_id": "img_final_43l", "path": "/tmp/img_final_43l.jpg"}
+
+
+def test_finalize_high_res_split_wide_reruns_split_and_returns_43l_43r(monkeypatch):
+    from engine.split import SplitConfig
+
+    def fake_generate_final_high_res_ai(image_id):
+        return {"image_id": "img_wide_4k", "path": "/tmp/img_wide_4k.jpg"}
+
+    split_calls = []
+
+    def fake_split_wide_image_ai(image_id, gap_fraction):
+        split_calls.append((image_id, gap_fraction))
+        return {
+            "left": {"image_id": "img_final_43l"},
+            "right": {"image_id": "img_final_43r"},
+        }
+
+    monkeypatch.setattr(
+        agent, "generate_final_high_res_ai", fake_generate_final_high_res_ai
+    )
+    monkeypatch.setattr(agent, "split_wide_image_ai", fake_split_wide_image_ai)
+    monkeypatch.setattr(
+        agent,
+        "load_split_config",
+        lambda: SplitConfig(
+            gap_inches=1.0, panel_diagonal_inches=43.0, wide_aspect_ratio="5:4"
+        ),
+    )
+
+    result = agent.finalize_high_res("img_draft_wide", is_split_wide=True)
+
+    assert result == {
+        "43L": {"image_id": "img_final_43l"},
+        "43R": {"image_id": "img_final_43r"},
+    }
+    assert len(split_calls) == 1
+    called_image_id, called_gap_fraction = split_calls[0]
+    assert called_image_id == "img_wide_4k"
+    assert 0 < called_gap_fraction < 1
+
+
+def test_finalize_high_res_stops_on_upscale_error(monkeypatch):
+    def failing_generate_final_high_res_ai(image_id):
+        return {"error": "rechazo por política"}
+
+    def unexpected_split_wide_image_ai(image_id, gap_fraction):
+        raise AssertionError("no debería llamarse tras un error en el upscale")
+
+    monkeypatch.setattr(
+        agent, "generate_final_high_res_ai", failing_generate_final_high_res_ai
+    )
+    monkeypatch.setattr(agent, "split_wide_image_ai", unexpected_split_wide_image_ai)
+
+    result = agent.finalize_high_res("img_draft_wide", is_split_wide=True)
+
+    assert "error" in result
+
+
+def test_finalize_high_res_stops_if_split_fails(monkeypatch):
+    def fake_generate_final_high_res_ai(image_id):
+        return {"image_id": "img_wide_4k", "path": "/tmp/img_wide_4k.jpg"}
+
+    def failing_split_wide_image_ai(image_id, gap_fraction):
+        return {"error": "no existe la imagen fuente"}
+
+    monkeypatch.setattr(
+        agent, "generate_final_high_res_ai", fake_generate_final_high_res_ai
+    )
+    monkeypatch.setattr(agent, "split_wide_image_ai", failing_split_wide_image_ai)
+
+    result = agent.finalize_high_res("img_draft_wide", is_split_wide=True)
+
+    assert "error" in result

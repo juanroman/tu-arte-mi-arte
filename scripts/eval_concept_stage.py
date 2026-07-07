@@ -47,7 +47,9 @@ CONCEPT_PITCH_SCHEMA = types.Schema(
     properties={
         "proposed_multiple_concepts": types.Schema(
             type=types.Type.BOOLEAN,
-            description="true si el texto ofrece 2 o más direcciones de concepto distintas",
+            description=(
+                "true si el texto ofrece 2 o más direcciones de concepto " "distintas"
+            ),
         ),
         "concept_count": types.Schema(
             type=types.Type.INTEGER,
@@ -130,9 +132,7 @@ async def run_case(theme: str, follow_up: str | None = None) -> dict:
     if follow_up:
         follow_up_events = await _send(runner, user_id, session.id, follow_up)
         result["follow_up"] = follow_up
-        result["follow_up_called_generate_set"] = _called_generate_set(
-            follow_up_events
-        )
+        result["follow_up_called_generate_set"] = _called_generate_set(follow_up_events)
 
     return result
 
@@ -151,8 +151,9 @@ def run_broad_theme_checks() -> list[dict]:
             judgment = judge_concept_pitch(run["first_turn_text"])
             run["judgment"] = judgment
             run["passed"] = judgment["proposed_multiple_concepts"]
+            proposed = judgment["proposed_multiple_concepts"]
             print(
-                f"   proposed_multiple_concepts={judgment['proposed_multiple_concepts']} "
+                f"   proposed_multiple_concepts={proposed} "
                 f"concept_count={judgment['concept_count']} pass={run['passed']}"
             )
         runs.append(run)

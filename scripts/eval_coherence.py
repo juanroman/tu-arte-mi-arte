@@ -103,7 +103,7 @@ def judge_set(result: dict) -> dict:
     ]
     response = client.models.generate_content(
         model="gemini-flash-latest",
-        contents=parts,
+        contents=parts,  # type: ignore[arg-type]
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=JUDGE_SCHEMA,

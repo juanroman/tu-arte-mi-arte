@@ -2,6 +2,7 @@ from google.adk.agents.llm_agent import Agent
 
 from engine.art_direction import build_prompt, load_art_direction
 from engine.generation import edit_image as edit_image_ai
+from engine.generation import generate_final_high_res as generate_final_high_res_ai
 from engine.generation import generate_image as generate_image_ai
 from engine.preview import compose_preview as compose_preview_ai
 from engine.split import load_split_config
@@ -126,6 +127,32 @@ def generate_set_split(scene_wide: str, scene_50: str) -> dict:
     return results
 
 
+def finalize_high_res(image_id: str, is_split_wide: bool = False) -> dict:
+    """Produce la versión final en alta resolución (4K) de un draft aprobado
+    (PRD §7.7), re-generándolo vía image-to-image con una instrucción
+    estricta que preserva layout/geometría/contenido — nunca sube de
+    resolución a ciegas ni cambia de modelo entre draft y final.
+
+    Usa is_split_wide=True solo cuando image_id es la imagen ancha ('wide')
+    de un conjunto generado con generate_set_split (la fuente antes de
+    partir); en ese caso la función re-genera esa imagen ancha en 4K y la
+    vuelve a partir con la misma compensación de marco, devolviendo
+    directamente las mitades finales 43L/43R. Para cualquier otro panel
+    (43L/43R de un conjunto díptico, o 50 en cualquier modo) usa
+    is_split_wide=False (default) y pasa el image_id de ese panel
+    individual.
+    """
+    result = generate_final_high_res_ai(image_id)
+    if "error" in result or not is_split_wide:
+        return result
+
+    split_config = load_split_config()
+    split_result = split_wide_image_ai(result["image_id"], split_config.gap_fraction)
+    if "error" in split_result:
+        return split_result
+    return {"43L": split_result["left"], "43R": split_result["right"]}
+
+
 def compose_preview(image_43l: str, image_43r: str, image_50: str) -> dict:
     """Compone el preview de la sala pegando las tres piezas del conjunto
     (43L, 43R, 50) sobre la foto real de la pared (PRD §7.5).
@@ -186,7 +213,21 @@ root_agent = Agent(
         "'muéstrame el preview', 'cómo se ve en la sala'), usa "
         "compose_preview con los image_id más recientes de 43L, 43R y 50 de "
         "la conversación (si el usuario refinó una pieza, usa el image_id "
-        "más nuevo de esa pieza)."
+        "más nuevo de esa pieza).\n\n"
+        "ETAPA 3 — APROBACIÓN. Cuando el usuario apruebe la versión actual "
+        "para colgar (p. ej. 'apruébalo', 'sube esta versión', 'me gusta, "
+        "ya quedó'), usa finalize_high_res para producir la versión final "
+        "en 4K de cada pieza, siempre a partir del image_id más reciente de "
+        "cada panel en la conversación (el draft aprobado, o la última "
+        "corrección si hubo refine_image de por medio). Si el conjunto se "
+        "generó con generate_set_diptico, llama finalize_high_res tres "
+        "veces (43L, 43R, 50), siempre con is_split_wide=False. Si se "
+        "generó con generate_set_split, llama finalize_high_res una vez "
+        "sobre el image_id de 'wide' con is_split_wide=True (esto ya "
+        "devuelve los 43L/43R finales directamente, no vuelvas a partir "
+        "nada tú) y otra vez sobre el image_id de 50 con "
+        "is_split_wide=False. Confirma al usuario los image_id finales de "
+        "cada pieza."
     ),
     tools=[
         generate_image,
@@ -194,5 +235,6 @@ root_agent = Agent(
         generate_set_diptico,
         generate_set_split,
         compose_preview,
+        finalize_high_res,
     ],
 )
