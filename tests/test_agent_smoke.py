@@ -4,7 +4,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "agents"))
 
 from google.adk.agents.llm_agent import Agent
-
 from tu_arte_mi_arte import agent
 
 
@@ -13,3 +12,8 @@ def test_root_agent_is_well_formed():
     assert agent.root_agent.name
     assert agent.root_agent.model
     assert agent.root_agent.instruction
+
+
+def test_root_agent_has_generar_imagen_tool():
+    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    assert "generar_imagen" in tool_names
