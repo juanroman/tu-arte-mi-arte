@@ -1,0 +1,8 @@
+# House art direction (PRD §7.8) — edit without touching code.
+# Applied as the style clause, in prose, on every generation.
+
+style = "fine art photography"
+palette = "soft pastel, muted saturation"
+lighting = "soft golden light"
+grain = "subtle film grain"
+tone = "serene and contemplative"
