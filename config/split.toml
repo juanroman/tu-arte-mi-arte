@@ -1,0 +1,11 @@
+# Constantes físicas de la instalación (PRD §7.3). Medir una sola vez;
+# reeditar aquí si se vuelve a medir.
+# Franja central a recortar: marco derecho de 43L + hueco + marco izquierdo
+# de 43R.
+gap_inches = 1.0
+# Diagonal de cada panel de 43" (para derivar su ancho físico en orientación
+# 9:16 y así convertir gap_inches a una fracción del ancho de la imagen).
+panel_diagonal_inches = 43.0
+# Ratio soportado por la API más cercano a "2x9:16 + franja" (PRD §7.7,
+# marcado ahí como "a validar en la práctica" — 1.7 es donde se valida).
+wide_aspect_ratio = "5:4"

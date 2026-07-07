@@ -13,6 +13,21 @@ from google.genai import types
 IMAGES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "images"
 
 
+def _new_image_id() -> str:
+    return f"img_{uuid.uuid4().hex[:8]}"
+
+
+def _save_image_bytes(data: bytes, mime_type: str) -> dict:
+    """Saves raw image bytes to disk under a fresh image_id and returns its
+    metadata. Shared by Gemini-response saves and local (Pillow) saves.
+    """
+    image_id = _new_image_id()
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    path = IMAGES_DIR / f"{image_id}.jpg"
+    path.write_bytes(data)
+    return {"image_id": image_id, "path": str(path), "mime_type": mime_type}
+
+
 def _save_response_image(response: types.GenerateContentResponse) -> dict:
     """Extracts the generated/edited image from a Gemini response, saves it
     to disk under a fresh image_id, and returns its metadata.
@@ -30,16 +45,9 @@ def _save_response_image(response: types.GenerateContentResponse) -> dict:
             "error": "El modelo no devolvió una imagen (posible rechazo por política)."
         }
 
-    image_id = f"img_{uuid.uuid4().hex[:8]}"
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    path = IMAGES_DIR / f"{image_id}.jpg"
-    path.write_bytes(part.inline_data.data)
-
-    return {
-        "image_id": image_id,
-        "path": str(path),
-        "mime_type": part.inline_data.mime_type,
-    }
+    return _save_image_bytes(
+        part.inline_data.data, part.inline_data.mime_type or "image/jpeg"
+    )
 
 
 def _load_reference(image_id: str) -> types.Part | dict:

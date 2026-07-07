@@ -4,6 +4,8 @@ from engine.art_direction import build_prompt, load_art_direction
 from engine.generation import edit_image as edit_image_ai
 from engine.generation import generate_image as generate_image_ai
 from engine.generation import generate_image_with_references as generate_with_refs_ai
+from engine.split import load_split_config
+from engine.split import split_wide_image as split_wide_image_ai
 
 
 def generate_image(theme: str, aspect_ratio: str = "1:1") -> dict:
@@ -31,21 +33,37 @@ def refine_image(image_id: str, change: str) -> dict:
     return edit_image_ai(instruction=change, image_id=image_id)
 
 
-def generate_set(theme: str) -> dict:
+def generate_set(theme: str, mode: str = "diptico") -> dict:
     """Genera de una sola vez las tres piezas de arte de la casa (paneles
     43L, 43R y 50), todas para el mismo tema y coherentes entre sí como un
     conjunto (PRD §7.4).
 
     Esta es la tool por defecto cuando el usuario propone un tema nuevo de
     arte (p. ej. "bicicletas vintage en Santorini"), ya que la v1 siempre
-    produce el conjunto de la casa, no piezas sueltas. Para lograr la
-    coherencia del set (§7.7: [referencias] + [instrucción de relación] +
-    [nuevo escenario]), 43L se genera primero y 43R se genera condicionada a
-    43L ("continúa esta escena, mismo horizonte/luz/paleta"); la 50 se genera
-    condicionada al par para compartir mundo y paleta. 43L y 43R salen en
-    9:16 y 50 en 16:9. Devuelve un dict con el resultado de cada panel; si
-    algún paso falla, detiene la cadena y devuelve lo generado hasta ahí más
-    el error.
+    produce el conjunto de la casa, no piezas sueltas.
+
+    `mode` controla el formato de las dos 43" (PRD §7.3): 'diptico'
+    (default) genera 43L y 43R como dos imágenes 9:16 independientes pero
+    condicionadas entre sí; 'split' genera una sola imagen ancha y la parte
+    en dos con compensación de marco. Usa 'split' solo si el usuario lo pide
+    explícitamente (p. ej. "en modo split", "una sola imagen partida"); si no
+    lo aclara, usa 'diptico'.
+    """
+    if mode == "split":
+        return _generate_split_set(theme)
+    if mode != "diptico":
+        return {"error": f"Modo desconocido: {mode!r}"}
+    return _generate_diptico_set(theme)
+
+
+def _generate_diptico_set(theme: str) -> dict:
+    """Modo díptico (default): 43L se genera primero y 43R se genera
+    condicionada a 43L ("continúa esta escena, mismo horizonte/luz/paleta");
+    la 50 se genera condicionada al par para compartir mundo y paleta
+    (§7.7: [referencias] + [instrucción de relación] + [nuevo escenario]).
+    43L y 43R salen en 9:16 y 50 en 16:9. Devuelve un dict con el resultado
+    de cada panel; si algún paso falla, detiene la cadena y devuelve lo
+    generado hasta ahí más el error.
     """
     direction = load_art_direction()
     base_prompt = build_prompt(theme, direction)
@@ -80,6 +98,54 @@ def generate_set(theme: str) -> dict:
     return results
 
 
+def _generate_split_set(theme: str) -> dict:
+    """Modo split (PRD §7.3): una sola imagen ancha pensada para partirse
+    entre las dos 43", con la regla anti-centrado inyectada en el prompt
+    (el centro se recorta como franja de compensación de marco). La 50 se
+    genera condicionada a la imagen ancha para compartir mundo y paleta.
+    Devuelve un dict con 'wide', '43L', '43R' y '50'; si algún paso falla,
+    detiene la cadena y devuelve lo generado hasta ahí más el error.
+    """
+    direction = load_art_direction()
+    base_prompt = build_prompt(theme, direction)
+    split_config = load_split_config()
+
+    results: dict = {}
+
+    results["wide"] = generate_image_ai(
+        prompt=(
+            f"{base_prompt} Genera una sola composición panorámica pensada "
+            "para partirse verticalmente por la mitad entre dos pantallas: "
+            "mantén el área central de la composición vacía de sujetos "
+            "importantes y reparte el peso visual a los tercios laterales, "
+            "ya que el centro se recortará."
+        ),
+        aspect_ratio=split_config.wide_aspect_ratio,
+    )
+    if "error" in results["wide"]:
+        return results
+
+    split_result = split_wide_image_ai(
+        results["wide"]["image_id"], split_config.gap_fraction
+    )
+    if "error" in split_result:
+        results["error"] = split_result["error"]
+        return results
+    results["43L"] = split_result["left"]
+    results["43R"] = split_result["right"]
+
+    results["50"] = generate_with_refs_ai(
+        prompt=(
+            f"{base_prompt} Genera un panorama horizontal que pertenezca al "
+            "mismo mundo y tema que la imagen de referencia (mismo "
+            "horizonte, luz y paleta), no una escena distinta."
+        ),
+        aspect_ratio="16:9",
+        reference_image_ids=[results["wide"]["image_id"]],
+    )
+    return results
+
+
 root_agent = Agent(
     model="gemini-flash-latest",
     name="root_agent",
@@ -89,8 +155,13 @@ root_agent = Agent(
         "Cuando el usuario proponga un tema nuevo (p. ej. 'bicicletas "
         "vintage en Santorini'), usa generate_set: la casa siempre se "
         "piensa como un conjunto de tres pantallas (43L, 43R, 50), no como "
-        "piezas sueltas. Usa generate_image en su lugar solo si el usuario "
-        "pide explícitamente una sola pieza o un panel específico. "
+        "piezas sueltas. Por defecto usa mode='diptico' (43L y 43R como dos "
+        "imágenes 9:16 condicionadas entre sí); usa mode='split' solo si el "
+        "usuario lo pide explícitamente (p. ej. 'en modo split', 'una sola "
+        "imagen partida'), que genera una sola imagen ancha partida en dos "
+        "con compensación de marco. Usa generate_image en su lugar solo si "
+        "el usuario pide explícitamente una sola pieza o un panel "
+        "específico. "
         "Si el usuario está corrigiendo o ajustando el resultado más reciente "
         "de la conversación (p. ej. 'más otoñal', 'quita eso'), en vez de "
         "generar una imagen nueva desde cero usa refine_image con el image_id "
