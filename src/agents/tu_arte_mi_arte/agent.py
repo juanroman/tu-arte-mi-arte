@@ -3,9 +3,7 @@ from google.adk.agents.llm_agent import Agent
 from engine.art_direction import build_prompt, load_art_direction
 from engine.generation import edit_image as edit_image_ai
 from engine.generation import generate_image as generate_image_ai
-
-# PRD §6: 43L y 43R son verticales 9:16, la 50 es horizontal 16:9.
-PANEL_ASPECT_RATIOS = {"43L": "9:16", "43R": "9:16", "50": "16:9"}
+from engine.generation import generate_image_with_references as generate_with_refs_ai
 
 
 def generate_image(theme: str, aspect_ratio: str = "1:1") -> dict:
@@ -35,21 +33,51 @@ def refine_image(image_id: str, change: str) -> dict:
 
 def generate_set(theme: str) -> dict:
     """Genera de una sola vez las tres piezas de arte de la casa (paneles
-    43L, 43R y 50), todas para el mismo tema.
+    43L, 43R y 50), todas para el mismo tema y coherentes entre sí como un
+    conjunto (PRD §7.4).
 
     Esta es la tool por defecto cuando el usuario propone un tema nuevo de
     arte (p. ej. "bicicletas vintage en Santorini"), ya que la v1 siempre
-    produce el conjunto de la casa, no piezas sueltas. Cada pieza se genera
-    de forma independiente, sin referenciarse entre sí todavía (eso llega en
-    una iteración posterior). 43L y 43R salen en 9:16 y 50 en 16:9. Devuelve
-    un dict con el resultado de cada panel.
+    produce el conjunto de la casa, no piezas sueltas. Para lograr la
+    coherencia del set (§7.7: [referencias] + [instrucción de relación] +
+    [nuevo escenario]), 43L se genera primero y 43R se genera condicionada a
+    43L ("continúa esta escena, mismo horizonte/luz/paleta"); la 50 se genera
+    condicionada al par para compartir mundo y paleta. 43L y 43R salen en
+    9:16 y 50 en 16:9. Devuelve un dict con el resultado de cada panel; si
+    algún paso falla, detiene la cadena y devuelve lo generado hasta ahí más
+    el error.
     """
     direction = load_art_direction()
-    prompt = build_prompt(theme, direction)
-    return {
-        panel: generate_image_ai(prompt=prompt, aspect_ratio=aspect_ratio)
-        for panel, aspect_ratio in PANEL_ASPECT_RATIOS.items()
-    }
+    base_prompt = build_prompt(theme, direction)
+
+    results: dict = {}
+
+    results["43L"] = generate_image_ai(prompt=base_prompt, aspect_ratio="9:16")
+    if "error" in results["43L"]:
+        return results
+
+    results["43R"] = generate_with_refs_ai(
+        prompt=(
+            f"{base_prompt} Continúa la escena de la imagen de referencia hacia "
+            "la derecha, como la mitad complementaria de un díptico: mismo "
+            "horizonte, misma luz y la misma paleta."
+        ),
+        aspect_ratio="9:16",
+        reference_image_ids=[results["43L"]["image_id"]],
+    )
+    if "error" in results["43R"]:
+        return results
+
+    results["50"] = generate_with_refs_ai(
+        prompt=(
+            f"{base_prompt} Genera un panorama horizontal que pertenezca al "
+            "mismo mundo y tema que las imágenes de referencia (mismo "
+            "horizonte, luz y paleta), no una escena distinta."
+        ),
+        aspect_ratio="16:9",
+        reference_image_ids=[results["43L"]["image_id"], results["43R"]["image_id"]],
+    )
+    return results
 
 
 root_agent = Agent(

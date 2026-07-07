@@ -42,6 +42,18 @@ def _save_response_image(response: types.GenerateContentResponse) -> dict:
     }
 
 
+def _load_reference(image_id: str) -> types.Part | dict:
+    """Loads a previously saved image as a reference Part for image-to-image
+    calls, or an error dict if no image exists under that image_id.
+    """
+    reference_path = IMAGES_DIR / f"{image_id}.jpg"
+    if not reference_path.exists():
+        return {"error": f"No existe una imagen con image_id={image_id!r}."}
+    return types.Part.from_bytes(
+        data=reference_path.read_bytes(), mime_type="image/jpeg"
+    )
+
+
 def generate_image(prompt: str, aspect_ratio: str, image_size: str = "1K") -> dict:
     """Generates an image with Nano Banana 2 (gemini-3.1-flash-image) from a
     prompt and saves it to disk. Returns the image_id and file path.
@@ -66,20 +78,52 @@ def edit_image(instruction: str, image_id: str, image_size: str = "1K") -> dict:
     scratch. `instruction` should state what changes and what stays the same.
     Saves the result under a new image_id and returns its metadata.
     """
-    reference_path = IMAGES_DIR / f"{image_id}.jpg"
-    if not reference_path.exists():
-        return {"error": f"No existe una imagen con image_id={image_id!r}."}
+    reference = _load_reference(image_id)
+    if isinstance(reference, dict):
+        return reference
 
     client = genai.Client()
-    reference = types.Part.from_bytes(
-        data=reference_path.read_bytes(), mime_type="image/jpeg"
-    )
     response = client.models.generate_content(
         model="gemini-3.1-flash-image",
         contents=[reference, instruction],
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE"],
             image_config=types.ImageConfig(image_size=image_size),
+        ),
+    )
+    return _save_response_image(response)
+
+
+def generate_image_with_references(
+    prompt: str,
+    aspect_ratio: str,
+    reference_image_ids: list[str],
+    image_size: str = "1K",
+) -> dict:
+    """Generates a new image conditioned on one or more reference images
+    (image-to-image), per PRD §7.4/§7.7's set-coherence formula: [references]
+    + [relation instruction] + [new scenario]. Unlike `edit_image`, this
+    produces a new composition (possibly a different aspect_ratio) that
+    shares the references' world/light/palette, rather than editing one in
+    place. `prompt` should carry both the relation instruction and the new
+    scenario. Saves the result under a new image_id and returns its metadata.
+    """
+    references = []
+    for image_id in reference_image_ids:
+        reference = _load_reference(image_id)
+        if isinstance(reference, dict):
+            return reference
+        references.append(reference)
+
+    client = genai.Client()
+    response = client.models.generate_content(
+        model="gemini-3.1-flash-image",
+        contents=[*references, prompt],
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE"],
+            image_config=types.ImageConfig(
+                aspect_ratio=aspect_ratio, image_size=image_size
+            ),
         ),
     )
     return _save_response_image(response)
