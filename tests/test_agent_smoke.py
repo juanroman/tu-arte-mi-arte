@@ -17,3 +17,8 @@ def test_root_agent_is_well_formed():
 def test_root_agent_has_generar_imagen_tool():
     tool_names = {tool.__name__ for tool in agent.root_agent.tools}
     assert "generate_image" in tool_names
+
+
+def test_root_agent_has_refine_image_tool():
+    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    assert "refine_image" in tool_names
