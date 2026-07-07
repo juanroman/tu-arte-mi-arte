@@ -6,3 +6,5 @@ __pycache__/
 .adk/
 data/images/*
 !data/images/.gitkeep
+data/evals/*
+!data/evals/.gitkeep
