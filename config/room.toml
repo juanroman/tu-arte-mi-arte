@@ -1,0 +1,22 @@
+# Room preview layout (PRD §7.5, §7.10): calibración de cada panel contra
+# data/room/reference.jpg. Rectángulos por ahora (sin warp de perspectiva):
+# cada panel como (x0, y0, x1, y1), fracciones del ancho/alto de la foto.
+# Re-medir y editar aquí si cambia la foto o la posición de las TVs.
+
+[panels."43L"]
+x0 = 0.1243
+y0 = 0.2642
+x1 = 0.2101
+y1 = 0.4573
+
+[panels."43R"]
+x0 = 0.2205
+y0 = 0.2629
+x1 = 0.3061
+y1 = 0.4557
+
+[panels."50"]
+x0 = 0.7259
+y0 = 0.2870
+x1 = 0.9020
+y1 = 0.4206

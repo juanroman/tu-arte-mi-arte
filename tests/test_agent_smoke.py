@@ -29,6 +29,11 @@ def test_root_agent_has_generate_set_tool():
     assert "generate_set" in tool_names
 
 
+def test_root_agent_has_compose_preview_tool():
+    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    assert "compose_preview" in tool_names
+
+
 def test_generate_set_produces_the_three_house_panels(monkeypatch):
     ref_calls = []
 
@@ -168,3 +173,18 @@ def test_generate_set_split_mode_stops_the_chain_if_split_fails(monkeypatch):
     result = agent.generate_set("un tema", mode="split")
 
     assert set(result.keys()) == {"wide", "error"}
+
+
+def test_compose_preview_forwards_the_three_panel_image_ids(monkeypatch):
+    captured = {}
+
+    def fake_compose_preview_ai(image_ids):
+        captured.update(image_ids)
+        return {"image_id": "img_preview", "path": "/tmp/img_preview.jpg"}
+
+    monkeypatch.setattr(agent, "compose_preview_ai", fake_compose_preview_ai)
+
+    result = agent.compose_preview("img_43L", "img_43R", "img_50")
+
+    assert captured == {"43L": "img_43L", "43R": "img_43R", "50": "img_50"}
+    assert result["image_id"] == "img_preview"

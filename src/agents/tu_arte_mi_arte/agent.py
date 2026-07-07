@@ -4,6 +4,7 @@ from engine.art_direction import build_prompt, load_art_direction
 from engine.generation import edit_image as edit_image_ai
 from engine.generation import generate_image as generate_image_ai
 from engine.generation import generate_image_with_references as generate_with_refs_ai
+from engine.preview import compose_preview as compose_preview_ai
 from engine.split import load_split_config
 from engine.split import split_wide_image as split_wide_image_ai
 
@@ -146,6 +147,17 @@ def _generate_split_set(theme: str) -> dict:
     return results
 
 
+def compose_preview(image_43l: str, image_43r: str, image_50: str) -> dict:
+    """Compone el preview de la sala pegando las tres piezas del conjunto
+    (43L, 43R, 50) sobre la foto real de la pared (PRD §7.5).
+
+    Úsala después de generate_set (o de un refine_image sobre alguna pieza),
+    pasando los image_id más recientes de cada panel. Muestra las tres
+    pantallas juntas para poder juzgar el conjunto como un todo.
+    """
+    return compose_preview_ai({"43L": image_43l, "43R": image_43r, "50": image_50})
+
+
 root_agent = Agent(
     model="gemini-flash-latest",
     name="root_agent",
@@ -166,7 +178,12 @@ root_agent = Agent(
         "de la conversación (p. ej. 'más otoñal', 'quita eso'), en vez de "
         "generar una imagen nueva desde cero usa refine_image con el image_id "
         "de esa última pieza y una descripción de qué cambiar. "
-        "Confirma siempre el/los image_id de lo que generaste o refinaste."
+        "Confirma siempre el/los image_id de lo que generaste o refinaste. "
+        "Cuando el usuario pida ver el preview del conjunto (p. ej. "
+        "'muéstrame el preview', 'cómo se ve en la sala'), usa "
+        "compose_preview con los image_id más recientes de 43L, 43R y 50 de "
+        "la conversación (si el usuario refinó una pieza, usa el image_id "
+        "más nuevo de esa pieza)."
     ),
-    tools=[generate_image, refine_image, generate_set],
+    tools=[generate_image, refine_image, generate_set, compose_preview],
 )
