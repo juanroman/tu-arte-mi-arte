@@ -59,12 +59,19 @@ def generate_set(theme: str, mode: str = "diptico") -> dict:
 
 def _generate_diptico_set(theme: str) -> dict:
     """Modo díptico (default): 43L se genera primero y 43R se genera
-    condicionada a 43L ("continúa esta escena, mismo horizonte/luz/paleta");
-    la 50 se genera condicionada al par para compartir mundo y paleta
+    condicionada a 43L como "otra foto de la misma sesión, ángulo distinto"
     (§7.7: [referencias] + [instrucción de relación] + [nuevo escenario]).
-    43L y 43R salen en 9:16 y 50 en 16:9. Devuelve un dict con el resultado
-    de cada panel; si algún paso falla, detiene la cadena y devuelve lo
-    generado hasta ahí más el error.
+    Importante: el prompt evita cualquier lenguaje de adyacencia/layout
+    ("a la derecha de", "continúa hacia", "díptico") — con Nano Banana 2 esa
+    redacción empuja al modelo a devolver un collage/grid de sub-imágenes en
+    vez de una sola composición, incluso pidiéndole explícitamente que no lo
+    haga. Pedirle una foto más de la misma sesión (sin relación espacial
+    explícita) es lo que produce una sola imagen limpia de forma consistente;
+    la relación de layout entre 43L/43R es curaduría nuestra, no del modelo.
+    La 50 se genera igual, condicionada al par, para compartir mundo y
+    paleta. 43L y 43R salen en 9:16 y 50 en 16:9. Devuelve un dict con el
+    resultado de cada panel; si algún paso falla, detiene la cadena y
+    devuelve lo generado hasta ahí más el error.
     """
     direction = load_art_direction()
     base_prompt = build_prompt(theme, direction)
@@ -77,9 +84,12 @@ def _generate_diptico_set(theme: str) -> dict:
 
     results["43R"] = generate_with_refs_ai(
         prompt=(
-            f"{base_prompt} Continúa la escena de la imagen de referencia hacia "
-            "la derecha, como la mitad complementaria de un díptico: mismo "
-            "horizonte, misma luz y la misma paleta."
+            f"{base_prompt} Una nueva fotografía de la misma sesión que la "
+            "imagen de referencia: mismo lugar, mismos sujetos, misma luz "
+            "dorada, misma paleta, mismo grano de película y estilo "
+            "fotográfico — pero un ángulo de cámara y composición distintos "
+            "dentro de la escena, como si se hubiera tomado momentos después "
+            "durante la misma sesión."
         ),
         aspect_ratio="9:16",
         reference_image_ids=[results["43L"]["image_id"]],
@@ -89,9 +99,12 @@ def _generate_diptico_set(theme: str) -> dict:
 
     results["50"] = generate_with_refs_ai(
         prompt=(
-            f"{base_prompt} Genera un panorama horizontal que pertenezca al "
-            "mismo mundo y tema que las imágenes de referencia (mismo "
-            "horizonte, luz y paleta), no una escena distinta."
+            f"{base_prompt} Una toma general abierta de la misma sesión que "
+            "las imágenes de referencia: mismo lugar, mismos sujetos, misma "
+            "luz dorada, misma paleta, mismo grano de película y estilo "
+            "fotográfico — un encuadre más abierto y un ángulo de cámara "
+            "distinto al de las referencias, como si se hubiera tomado "
+            "momentos después durante la misma sesión."
         ),
         aspect_ratio="16:9",
         reference_image_ids=[results["43L"]["image_id"], results["43R"]["image_id"]],
@@ -137,9 +150,12 @@ def _generate_split_set(theme: str) -> dict:
 
     results["50"] = generate_with_refs_ai(
         prompt=(
-            f"{base_prompt} Genera un panorama horizontal que pertenezca al "
-            "mismo mundo y tema que la imagen de referencia (mismo "
-            "horizonte, luz y paleta), no una escena distinta."
+            f"{base_prompt} Una toma general abierta de la misma sesión que "
+            "la imagen de referencia: mismo lugar, mismos sujetos, misma luz "
+            "dorada, misma paleta, mismo grano de película y estilo "
+            "fotográfico — un encuadre más abierto y un ángulo de cámara "
+            "distinto al de la referencia, como si se hubiera tomado "
+            "momentos después durante la misma sesión."
         ),
         aspect_ratio="16:9",
         reference_image_ids=[results["wide"]["image_id"]],

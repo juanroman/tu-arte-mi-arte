@@ -41,10 +41,14 @@ JUDGE_SCHEMA = types.Schema(
             type=types.Type.INTEGER,
             description="1-5: ¿se sienten el mismo mundo/tema, no escenas inconexas?",
         ),
-        "diptych_seam_coherence": types.Schema(
+        "shoot_variety_coherence": types.Schema(
             type=types.Type.INTEGER,
             description=(
-                "1-5: ¿43L y 43R embonan como un díptico (mismo horizonte/luz)?"
+                "1-5: ¿43L y 43R se sienten de la misma sesión/tema (mismo "
+                "lugar, luz, sujetos) Y con suficiente variedad de ángulo o "
+                "encuadre entre sí para no verse redundantes colgadas juntas "
+                "en la pared? Penaliza tanto la inconsistencia (mundos "
+                "distintos) como la redundancia (casi la misma toma)."
             ),
         ),
         "overall_pass": types.Schema(
@@ -59,7 +63,7 @@ JUDGE_SCHEMA = types.Schema(
     required=[
         "palette_lighting_coherence",
         "world_story_coherence",
-        "diptych_seam_coherence",
+        "shoot_variety_coherence",
         "overall_pass",
         "notes",
     ],
@@ -68,12 +72,14 @@ JUDGE_SCHEMA = types.Schema(
 JUDGE_PROMPT = (
     "Eres un juez de dirección de arte. Te muestro tres imágenes generadas para "
     "las pantallas de una casa a partir del mismo tema: primero el panel 43L "
-    "(vertical), luego 43R (vertical, mitad derecha del díptico) y finalmente el "
-    "panorama de la pantalla 50 (horizontal). Evalúa si se leen como UN CONJUNTO "
-    "curado e intencional -no como tres imágenes sueltas e inconexas- según estos "
-    "criterios del PRD de la casa: tratamiento visual compartido (paleta, luz, "
-    "grano, tono), el díptico 43L/43R embona como par (mismo horizonte/luz), y "
-    "el panorama de la 50 pertenece al mismo mundo/tema que el par."
+    "(vertical), luego 43R (vertical, otra toma de la misma sesión) y finalmente "
+    "el panorama de la pantalla 50 (horizontal). Evalúa si se leen como UN "
+    "CONJUNTO curado e intencional -no como tres imágenes sueltas e inconexas, "
+    "ni como la misma toma repetida- según estos criterios del PRD de la casa: "
+    "tratamiento visual compartido (paleta, luz, grano, tono), 43L/43R se sienten "
+    "de la misma sesión/lugar pero con ángulo o encuadre suficientemente "
+    "distintos entre sí para no verse redundantes colgadas juntas, y el panorama "
+    "de la 50 pertenece al mismo mundo/tema que el par."
 )
 
 
@@ -121,7 +127,7 @@ def run_eval(themes: list[str]) -> list[dict]:
         print(
             f"   paleta/luz={judgment['palette_lighting_coherence']} "
             f"mundo={judgment['world_story_coherence']} "
-            f"diptico={judgment['diptych_seam_coherence']} "
+            f"variedad={judgment['shoot_variety_coherence']} "
             f"pass={judgment['overall_pass']}"
         )
         runs.append({"theme": theme, "result": result, "judgment": judgment})
