@@ -1,0 +1,14 @@
+[project]
+name = "tu-arte-mi-arte"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-adk~=2.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
