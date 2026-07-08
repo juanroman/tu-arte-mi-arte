@@ -11,18 +11,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from google.adk.runners import Runner  # noqa: E402
 from google.adk.sessions import InMemorySessionService  # noqa: E402
 from google.genai import types  # noqa: E402
-from telegram.ext import CommandHandler, MessageHandler  # noqa: E402
+from telegram.ext import (  # noqa: E402
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+)
 from telegram.ext import filters as tg_filters  # noqa: E402
 
-from bot import session_store  # noqa: E402
+from bot import preview_store, session_store  # noqa: E402
 from bot.telegram_bot import (  # noqa: E402
     APP_NAME,
+    CONFIRM_CALLBACK_PREFIX,
+    GENERIC_ERROR_TEXT,
     RESET_BUTTON_TEXT,
+    STALE_PREVIEW_TEXT,
+    UNKNOWN_PREVIEW_TEXT,
+    _to_markdown_v2,
     build_application,
+    confirm_handler,
     handle_message,
     load_allowed_user_ids,
     load_session_timeout_seconds,
     reset_handler,
+    rotate_session,
 )
 
 DEFAULT_TIMEOUT = 10_800
@@ -31,6 +42,7 @@ DEFAULT_TIMEOUT = 10_800
 @pytest.fixture(autouse=True)
 def _isolate_session_store(tmp_path, monkeypatch):
     monkeypatch.setattr(session_store, "DB_PATH", tmp_path / "bot_state.sqlite3")
+    monkeypatch.setattr(preview_store, "DB_PATH", tmp_path / "bot_state.sqlite3")
 
 
 def test_load_allowed_user_ids_parses_comma_separated_ints():
@@ -62,6 +74,13 @@ def test_load_session_timeout_seconds_defaults_when_invalid():
     assert load_session_timeout_seconds("not-a-number") == DEFAULT_TIMEOUT
 
 
+def test_to_markdown_v2_escapes_underscores_in_image_ids():
+    converted = _to_markdown_v2("listo, img_123")
+
+    assert converted == "listo, img\\_123"
+    assert "_img_123_" not in converted
+
+
 def test_build_application_registers_reset_and_generic_handlers():
     app = build_application("123:fake-token-for-tests", [111, 222])
 
@@ -91,6 +110,15 @@ def test_build_application_with_empty_whitelist_matches_no_one():
     assert generic_handler.filters.base_filter.user_ids == frozenset()
 
 
+def test_build_application_registers_confirm_callback_handler():
+    app = build_application("123:fake-token-for-tests", [111])
+
+    group0 = app.handlers.get(0, [])
+    callback_handlers = [h for h in group0 if isinstance(h, CallbackQueryHandler)]
+    assert len(callback_handlers) == 1
+    assert callback_handlers[0].callback is confirm_handler
+
+
 def _text_event(text: str) -> SimpleNamespace:
     return SimpleNamespace(
         content=types.Content(role="model", parts=[types.Part(text=text)])
@@ -114,15 +142,68 @@ def _no_text_event() -> SimpleNamespace:
     return SimpleNamespace(content=None)
 
 
+def _compose_preview_call_event(image_43l, image_43r, image_50) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="compose_preview",
+                        args={
+                            "image_43l": image_43l,
+                            "image_43r": image_43r,
+                            "image_50": image_50,
+                        },
+                    )
+                )
+            ],
+        )
+    )
+
+
+def _compose_preview_response_event(response: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="compose_preview", response=response
+                    )
+                )
+            ],
+        )
+    )
+
+
+def _finalize_response_event(response: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="finalize_high_res", response=response
+                    )
+                )
+            ],
+        )
+    )
+
+
 def _fake_run_async_factory(events_by_call):
     """Returns a fake run_async bound method that yields events_by_call[i]
-    (a list of lists) on the i-th call, tracking (user_id, session_id) seen.
+    (a list of lists) on the i-th call, tracking (user_id, session_id,
+    text) seen.
     """
     calls = []
 
     async def fake_run_async(self, *, user_id, session_id, new_message):
-        calls.append((user_id, session_id))
+        text = new_message.parts[0].text
+        calls.append((user_id, session_id, text))
         idx = len(calls) - 1
+        await asyncio.sleep(0)  # let the chat-action background task run once
         for event in events_by_call[idx]:
             yield event
 
@@ -130,11 +211,22 @@ def _fake_run_async_factory(events_by_call):
     return fake_run_async
 
 
+def _make_bot():
+    return SimpleNamespace(
+        send_chat_action=AsyncMock(),
+        send_photo=AsyncMock(),
+        send_message=AsyncMock(return_value=SimpleNamespace(edit_text=AsyncMock())),
+    )
+
+
 def _make_update_and_context(
     runner, session_service, chat_id, text="hola", timeout_seconds=DEFAULT_TIMEOUT
 ):
     update = SimpleNamespace(
-        message=SimpleNamespace(text=text, reply_text=AsyncMock()),
+        message=SimpleNamespace(
+            text=text,
+            reply_text=AsyncMock(return_value=SimpleNamespace(edit_text=AsyncMock())),
+        ),
         effective_chat=SimpleNamespace(id=chat_id),
     )
     context = SimpleNamespace(
@@ -143,8 +235,10 @@ def _make_update_and_context(
                 "runner": runner,
                 "session_service": session_service,
                 "session_timeout_seconds": timeout_seconds,
+                "allowed_user_ids": frozenset({111}),
             }
-        )
+        ),
+        bot=_make_bot(),
     )
     return update, context
 
@@ -157,6 +251,12 @@ def _build_runner_with_fake_run_async(events_by_call):
     return runner, session_service, fake_run_async
 
 
+def _final_reply(update):
+    """The final agent text now goes out via editing the progress
+    placeholder returned by reply_text, not a second reply_text call."""
+    return update.message.reply_text.return_value.edit_text
+
+
 def test_first_message_creates_session_and_replies_with_agent_text():
     runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
         [[_text_event("listo, img_123")]]
@@ -165,9 +265,9 @@ def test_first_message_creates_session_and_replies_with_agent_text():
 
     asyncio.run(handle_message(update, context))
 
-    update.message.reply_text.assert_awaited_once()
-    args, kwargs = update.message.reply_text.call_args
-    assert args[0] == "listo, img_123"
+    _final_reply(update).assert_awaited_once()
+    args, kwargs = _final_reply(update).call_args
+    assert args[0] == _to_markdown_v2("listo, img_123")
 
     pointer = session_store.get_current_session(42)
     assert pointer is not None
@@ -190,7 +290,7 @@ def test_second_message_in_same_chat_reuses_existing_session():
     asyncio.run(handle_message(update2, context2))
 
     assert len(fake_run_async.calls) == 2
-    (_, session_id_1), (_, session_id_2) = fake_run_async.calls
+    (_, session_id_1, _), (_, session_id_2, _) = fake_run_async.calls
     assert session_id_1 == session_id_2
 
 
@@ -204,7 +304,7 @@ def test_two_different_chats_get_independent_sessions():
     asyncio.run(handle_message(update1, context1))
     asyncio.run(handle_message(update2, context2))
 
-    (user_id_1, session_id_1), (user_id_2, session_id_2) = fake_run_async.calls
+    (user_id_1, session_id_1, _), (user_id_2, session_id_2, _) = fake_run_async.calls
     assert user_id_1 != user_id_2
     assert session_id_1 != session_id_2
 
@@ -217,8 +317,8 @@ def test_multiple_text_events_are_concatenated_into_the_reply():
 
     asyncio.run(handle_message(update, context))
 
-    args, _ = update.message.reply_text.call_args
-    assert args[0] == "primero\nsegundo"
+    args, _ = _final_reply(update).call_args
+    assert args[0] == _to_markdown_v2("primero\nsegundo")
 
 
 def test_events_without_text_parts_contribute_nothing_to_the_reply():
@@ -229,8 +329,8 @@ def test_events_without_text_parts_contribute_nothing_to_the_reply():
 
     asyncio.run(handle_message(update, context))
 
-    args, _ = update.message.reply_text.call_args
-    assert args[0] == "listo"
+    args, _ = _final_reply(update).call_args
+    assert args[0] == _to_markdown_v2("listo")
 
 
 def test_no_text_at_all_falls_back_to_a_non_empty_message():
@@ -241,8 +341,8 @@ def test_no_text_at_all_falls_back_to_a_non_empty_message():
 
     asyncio.run(handle_message(update, context))
 
-    update.message.reply_text.assert_awaited_once()
-    (reply_arg,), _ = update.message.reply_text.call_args
+    _final_reply(update).assert_awaited_once()
+    (reply_arg,), _ = _final_reply(update).call_args
     assert reply_arg
 
 
@@ -267,6 +367,226 @@ def test_exception_in_run_async_propagates():
         asyncio.run(handle_message(update, context))
 
 
+def test_handle_message_edits_placeholder_to_error_on_exception():
+    session_service = InMemorySessionService()
+    runner = Runner(app_name=APP_NAME, agent=object(), session_service=session_service)
+
+    async def raising_run_async(self, *, user_id, session_id, new_message):
+        raise RuntimeError("boom")
+        yield  # pragma: no cover - makes this an async generator
+
+    runner.run_async = raising_run_async.__get__(runner, Runner)
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(handle_message(update, context))
+
+    _final_reply(update).assert_awaited_once()
+    args, kwargs = _final_reply(update).call_args
+    assert args[0] == _to_markdown_v2(GENERIC_ERROR_TEXT)
+
+
+def test_handle_message_sends_generating_placeholder_then_edits_with_final_text():
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [[_text_event("listo")]]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    first_call_args, _ = update.message.reply_text.call_args_list[0]
+    assert "Generando" in first_call_args[0]
+    _final_reply(update).assert_awaited_once()
+
+
+def test_handle_message_sends_chat_action_typing_during_run():
+    from telegram.constants import ChatAction
+
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [[_text_event("listo")]]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    context.bot.send_chat_action.assert_any_await(42, ChatAction.TYPING)
+
+
+def test_compose_preview_response_sends_photo_with_confirm_button():
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _compose_preview_call_event("img_l", "img_r", "img_50"),
+                _compose_preview_response_event(
+                    {"image_id": "img_preview1", "path": "x"}
+                ),
+                _text_event("aquí está el preview"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    context.bot.send_photo.assert_awaited_once()
+    _, kwargs = context.bot.send_photo.call_args
+    assert kwargs["chat_id"] == 42
+    assert str(kwargs["photo"]).endswith("img_preview1.jpg")
+
+    keyboard = kwargs["reply_markup"]
+    button = keyboard.inline_keyboard[0][0]
+    assert button.callback_data.startswith(CONFIRM_CALLBACK_PREFIX)
+
+    token = button.callback_data[len(CONFIRM_CALLBACK_PREFIX) :]
+    preview = preview_store.get_preview(token)
+    assert preview is not None
+    assert preview.chat_id == 42
+    assert preview.image_43l == "img_l"
+    assert preview.image_43r == "img_r"
+    assert preview.image_50 == "img_50"
+
+
+def test_compose_preview_error_response_sends_no_photo():
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _compose_preview_call_event("img_l", "img_r", "img_50"),
+                _compose_preview_response_event({"error": "no existe la foto"}),
+                _text_event("hubo un problema"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    context.bot.send_photo.assert_not_awaited()
+
+
+def test_successful_finalize_rotates_session_silently():
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
+        [[_finalize_response_event({"image_id": "img_final1"}), _text_event("listo")]]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    pointer_after = session_store.get_current_session(42)
+    _, session_id_used, _ = fake_run_async.calls[0]
+    assert pointer_after.session_id != session_id_used
+
+    # Silent: no extra reply beyond the placeholder-turned-final-text.
+    assert update.message.reply_text.await_count == 1
+
+
+def test_partial_finalize_failure_does_not_rotate_session():
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
+        [
+            [
+                _finalize_response_event({"image_id": "img_final1"}),
+                _finalize_response_event({"error": "fallo transitorio"}),
+                _text_event("una pieza falló"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    pointer_after = session_store.get_current_session(42)
+    _, session_id_used, _ = fake_run_async.calls[0]
+    assert pointer_after.session_id == session_id_used
+
+
+def test_turn_without_finalize_does_not_rotate_session():
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
+        [[_text_event("listo, img_123")]]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    pointer_after = session_store.get_current_session(42)
+    _, session_id_used, _ = fake_run_async.calls[0]
+    assert pointer_after.session_id == session_id_used
+
+
+def test_message_right_after_finalize_reuses_rotated_session_without_warning():
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
+        [
+            [
+                _finalize_response_event({"image_id": "img_final1"}),
+                _text_event("listo"),
+            ],
+            [_text_event("un tema nuevo")],
+        ]
+    )
+    update1, context1 = _make_update_and_context(runner, session_service, chat_id=42)
+    asyncio.run(handle_message(update1, context1))
+    rotated_session_id = session_store.get_current_session(42).session_id
+
+    update2, context2 = _make_update_and_context(runner, session_service, chat_id=42)
+    asyncio.run(handle_message(update2, context2))
+
+    # No expiry warning: the rotated session was freshly closed, not abandoned.
+    assert update2.message.reply_text.await_count == 1
+    _, session_id_used, _ = fake_run_async.calls[1]
+    assert session_id_used == rotated_session_id
+
+
+def test_long_absence_after_finalize_still_shows_expiry_warning():
+    """Locks in current behavior: the session rotated by a successful
+    finalize is otherwise a normal session, so if the user's next message
+    comes after the inactivity timeout, get_or_rotate_session treats it
+    like any other stale pointer and shows the "expiró por inactividad"
+    warning — even though nothing was actually abandoned mid-work, since
+    the prior session was cleanly closed on approval. This is a known,
+    accepted imprecision in the warning copy, not a bug to fix here.
+    """
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
+        [
+            [
+                _finalize_response_event({"image_id": "img_final1"}),
+                _text_event("listo"),
+            ],
+            [_text_event("un tema nuevo, 3 días después")],
+        ]
+    )
+    update1, context1 = _make_update_and_context(
+        runner, session_service, chat_id=42, timeout_seconds=0
+    )
+    asyncio.run(handle_message(update1, context1))
+    rotated_session_id = session_store.get_current_session(42).session_id
+
+    update2, context2 = _make_update_and_context(
+        runner, session_service, chat_id=42, timeout_seconds=0
+    )
+    asyncio.run(handle_message(update2, context2))
+
+    assert update2.message.reply_text.await_count == 2
+    first_call_args, _ = update2.message.reply_text.await_args_list[0]
+    assert "expiró" in first_call_args[0]
+
+    _, session_id_used, _ = fake_run_async.calls[1]
+    assert session_id_used != rotated_session_id
+
+
+def test_confirm_handler_rotates_session_after_successful_finalize():
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
+        [[_finalize_response_event({"image_id": "img_final1"}), _text_event("listo")]]
+    )
+    session_id = asyncio.run(rotate_session(session_service, 42))
+    preview_store.save_preview("tok1", 42, session_id, "img_l", "img_r", "img_50", 0.0)
+    update, context, query = _make_callback_update_and_context(
+        runner, session_service, chat_id=42, preview_token="tok1"
+    )
+
+    asyncio.run(confirm_handler(update, context))
+
+    pointer_after = session_store.get_current_session(42)
+    assert pointer_after.session_id != session_id
+
+
 def test_expired_session_sends_warning_before_agent_reply():
     runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
         [[_text_event("uno")], [_text_event("dos")]]
@@ -285,7 +605,7 @@ def test_expired_session_sends_warning_before_agent_reply():
     first_call_args, _ = update2.message.reply_text.await_args_list[0]
     assert "expiró" in first_call_args[0]
 
-    (_, session_id_1), (_, session_id_2) = fake_run_async.calls
+    (_, session_id_1, _), (_, session_id_2, _) = fake_run_async.calls
     assert session_id_1 != session_id_2
 
 
@@ -312,7 +632,7 @@ def test_reset_handler_rotates_session_and_replies():
     update2, context2 = _make_update_and_context(runner, session_service, chat_id=42)
     asyncio.run(handle_message(update2, context2))
 
-    (_, session_id_1), (_, session_id_2) = fake_run_async.calls
+    (_, session_id_1, _), (_, session_id_2, _) = fake_run_async.calls
     assert session_id_1 != session_id_2
     assert session_id_2 == pointer_after.session_id
 
@@ -321,3 +641,114 @@ def test_reset_button_text_matches_constant_used_in_handler_registration():
     app = build_application("123:fake-token-for-tests", [111])
     button_handler = [h for h in app.handlers[0] if isinstance(h, MessageHandler)][0]
     assert RESET_BUTTON_TEXT in button_handler.filters.and_filter.strings
+
+
+def _make_callback_update_and_context(
+    runner,
+    session_service,
+    chat_id,
+    preview_token,
+    user_id=111,
+    allowed_user_ids=frozenset({111}),
+    timeout_seconds=DEFAULT_TIMEOUT,
+):
+    query = SimpleNamespace(
+        data=f"{CONFIRM_CALLBACK_PREFIX}{preview_token}", answer=AsyncMock()
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=SimpleNamespace(id=user_id),
+    )
+    context = SimpleNamespace(
+        application=SimpleNamespace(
+            bot_data={
+                "runner": runner,
+                "session_service": session_service,
+                "session_timeout_seconds": timeout_seconds,
+                "allowed_user_ids": allowed_user_ids,
+            }
+        ),
+        bot=_make_bot(),
+    )
+    return update, context, query
+
+
+def test_confirm_handler_resolves_token_and_sends_synthetic_message():
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
+        [[_text_event("subido")]]
+    )
+    session_id = asyncio.run(rotate_session(session_service, 42))
+    preview_store.save_preview("tok1", 42, session_id, "img_l", "img_r", "img_50", 0.0)
+    update, context, query = _make_callback_update_and_context(
+        runner, session_service, chat_id=42, preview_token="tok1"
+    )
+
+    asyncio.run(confirm_handler(update, context))
+
+    query.answer.assert_awaited_once()
+    assert len(fake_run_async.calls) == 1
+    _, _, text = fake_run_async.calls[0]
+    assert "img_l" in text
+    assert "img_r" in text
+    assert "img_50" in text
+
+
+def test_confirm_handler_ignores_unauthorized_user():
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
+        [[_text_event("subido")]]
+    )
+    session_id = asyncio.run(rotate_session(session_service, 42))
+    preview_store.save_preview("tok1", 42, session_id, "img_l", "img_r", "img_50", 0.0)
+    update, context, query = _make_callback_update_and_context(
+        runner,
+        session_service,
+        chat_id=42,
+        preview_token="tok1",
+        user_id=999,
+        allowed_user_ids=frozenset({111}),
+    )
+
+    asyncio.run(confirm_handler(update, context))
+
+    query.answer.assert_awaited_once()
+    assert len(fake_run_async.calls) == 0
+
+
+def test_confirm_handler_unknown_token_replies_gracefully():
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async([])
+    update, context, query = _make_callback_update_and_context(
+        runner, session_service, chat_id=42, preview_token="does-not-exist"
+    )
+
+    asyncio.run(confirm_handler(update, context))
+
+    query.answer.assert_awaited_once()
+    context.bot.send_message.assert_awaited_once()
+    args, kwargs = context.bot.send_message.call_args
+    assert args[1] == _to_markdown_v2(UNKNOWN_PREVIEW_TEXT)
+    assert len(fake_run_async.calls) == 0
+
+
+def test_confirm_handler_rejects_stale_token_after_session_rotated():
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
+        [[_text_event("subido")]]
+    )
+    old_session_id = asyncio.run(rotate_session(session_service, 42))
+    preview_store.save_preview(
+        "tok1", 42, old_session_id, "img_l", "img_r", "img_50", 0.0
+    )
+
+    asyncio.run(rotate_session(session_service, 42))
+
+    update, context, query = _make_callback_update_and_context(
+        runner, session_service, chat_id=42, preview_token="tok1"
+    )
+
+    asyncio.run(confirm_handler(update, context))
+
+    query.answer.assert_awaited_once()
+    context.bot.send_message.assert_awaited_once()
+    args, kwargs = context.bot.send_message.call_args
+    assert args[1] == _to_markdown_v2(STALE_PREVIEW_TEXT)
+    assert len(fake_run_async.calls) == 0

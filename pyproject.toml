@@ -10,6 +10,7 @@ dependencies = [
     "greenlet>=3.1.1",
     "pillow>=12.3.0",
     "python-telegram-bot~=22.8",
+    "telegramify-markdown>=1.2.0",
 ]
 
 [dependency-groups]
@@ -40,7 +41,7 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "S"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "S108"]
+"tests/*" = ["S101", "S106", "S108"]
 
 [tool.mypy]
 python_version = "3.12"
