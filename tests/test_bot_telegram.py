@@ -18,7 +18,11 @@ from telegram.ext import (  # noqa: E402
 )
 from telegram.ext import filters as tg_filters  # noqa: E402
 
-from bot import preview_store, session_store  # noqa: E402
+from bot import (  # noqa: E402
+    preview_store,
+    session_store,
+    telegram_bot,  # noqa: E402
+)
 from bot.telegram_bot import (  # noqa: E402
     APP_NAME,
     CONFIRM_CALLBACK_PREFIX,
@@ -43,6 +47,7 @@ DEFAULT_TIMEOUT = 10_800
 def _isolate_session_store(tmp_path, monkeypatch):
     monkeypatch.setattr(session_store, "DB_PATH", tmp_path / "bot_state.sqlite3")
     monkeypatch.setattr(preview_store, "DB_PATH", tmp_path / "bot_state.sqlite3")
+    monkeypatch.setattr(telegram_bot, "IMAGES_DIR", tmp_path)
 
 
 def test_load_allowed_user_ids_parses_comma_separated_ints():
@@ -215,6 +220,7 @@ def _make_bot():
     return SimpleNamespace(
         send_chat_action=AsyncMock(),
         send_photo=AsyncMock(),
+        send_media_group=AsyncMock(),
         send_message=AsyncMock(return_value=SimpleNamespace(edit_text=AsyncMock())),
     )
 
@@ -412,7 +418,13 @@ def test_handle_message_sends_chat_action_typing_during_run():
     context.bot.send_chat_action.assert_any_await(42, ChatAction.TYPING)
 
 
+def _write_fixture_images(*image_ids):
+    for image_id in image_ids:
+        (telegram_bot.IMAGES_DIR / f"{image_id}.jpg").write_bytes(b"fake-jpeg-bytes")
+
+
 def test_compose_preview_response_sends_photo_with_confirm_button():
+    _write_fixture_images("img_l", "img_r", "img_50")
     runner, session_service, _ = _build_runner_with_fake_run_async(
         [
             [
@@ -461,6 +473,55 @@ def test_compose_preview_error_response_sends_no_photo():
     asyncio.run(handle_message(update, context))
 
     context.bot.send_photo.assert_not_awaited()
+
+
+def test_compose_preview_response_sends_panel_album_before_composed_photo():
+    _write_fixture_images("img_l", "img_r", "img_50")
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _compose_preview_call_event("img_l", "img_r", "img_50"),
+                _compose_preview_response_event(
+                    {"image_id": "img_preview1", "path": "x"}
+                ),
+                _text_event("aquí está el preview"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+    order = []
+    context.bot.send_media_group.side_effect = lambda **_: order.append("album")
+    context.bot.send_photo.side_effect = lambda **_: order.append("photo")
+
+    asyncio.run(handle_message(update, context))
+
+    context.bot.send_media_group.assert_awaited_once()
+    _, kwargs = context.bot.send_media_group.call_args
+    assert kwargs["chat_id"] == 42
+    media = kwargs["media"]
+    assert len(media) == 3
+    assert media[0].caption is not None
+    assert media[1].caption is None
+    assert media[2].caption is None
+
+    assert order == ["album", "photo"]
+
+
+def test_compose_preview_error_response_sends_no_album():
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _compose_preview_call_event("img_l", "img_r", "img_50"),
+                _compose_preview_response_event({"error": "no existe la foto"}),
+                _text_event("hubo un problema"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    context.bot.send_media_group.assert_not_awaited()
 
 
 def test_successful_finalize_rotates_session_silently():

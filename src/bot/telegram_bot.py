@@ -35,6 +35,7 @@ from sqlalchemy import event
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     ReplyKeyboardMarkup,
     Update,
 )
@@ -65,6 +66,7 @@ PREVIEW_CAPTION = (
     "🖼️ Así se vería en la sala. Si te gusta, toca *Confirmar* para subir "
     "esta versión a alta resolución."
 )
+PANELS_ALBUM_CAPTION = "🎞️ Las piezas del conjunto por separado."
 STALE_PREVIEW_TEXT = (
     "⏱️ Esta vista previa es de una sesión que ya no está activa (expiró o "
     "se reinició) — pide el preview de nuevo antes de confirmar."
@@ -248,14 +250,48 @@ def _finalize_high_res_all_succeeded(events: list) -> bool:
     return bool(responses) and all("error" not in r for r in responses)
 
 
+def _panels_album(preview: "_ComposedPreview") -> list[InputMediaPhoto]:
+    """Arma el álbum de las tres piezas por separado (43L, 43R, 50) para
+    darle al usuario detalle real de cada panel — la foto compuesta del
+    preview los muestra pegados a la foto de la sala, demasiado chicos
+    para juzgar composición/nitidez individual (hallazgo de uso real,
+    2026-07-08). Solo la primera imagen del álbum lleva caption (limitación
+    de Telegram en sendMediaGroup); las tres ya están identificadas por
+    panel en el mensaje de texto que las acompaña.
+
+    Se leen los bytes de cada archivo en vez de pasar el `Path` directo: a
+    diferencia de `send_photo` (que respeta el `local_mode` real del bot),
+    `InputMediaPhoto` fija `local_mode=True` de forma interna al parsear
+    rutas, lo que produce un URI `file://` que la Bot API real rechaza
+    (`Invalid file http url specified`) — confirmado en verificación
+    manual contra el bot real, no es un caso hipotético. Pasar bytes evita
+    esa rama por completo sin dejar descriptores de archivo abiertos.
+    """
+    panels = [
+        ("43L", preview.image_43l),
+        ("43R", preview.image_43r),
+        ("50", preview.image_50),
+    ]
+    return [
+        InputMediaPhoto(
+            media=(IMAGES_DIR / f"{image_id}.jpg").read_bytes(),
+            caption=_to_markdown_v2(PANELS_ALBUM_CAPTION) if index == 0 else None,
+            parse_mode=ParseMode.MARKDOWN_V2 if index == 0 else None,
+        )
+        for index, (_, image_id) in enumerate(panels)
+    ]
+
+
 async def _deliver_turn_result(
     bot: object, chat_id: int, session_id: str, progress_message: object, events: list
 ) -> None:
-    """Envía como foto cada preview compuesto en la corrida (con su botón
-    de confirmación atado al image_id exacto mostrado), y luego edita el
-    mensaje de progreso con el texto final del turno. Una corrida que solo
-    finaliza en alta resolución (sin compose_preview) no produce fotos —
-    el ciclo de arriba simplemente no itera nada.
+    """Por cada preview compuesto en la corrida: manda primero un álbum
+    con las tres piezas por separado (detalle real de cada panel), luego
+    la foto compuesta sobre la sala con su botón de confirmación atado al
+    image_id exacto mostrado, y al final edita el mensaje de progreso con
+    el texto final del turno. Una corrida que solo finaliza en alta
+    resolución (sin compose_preview) no produce fotos — el ciclo de arriba
+    simplemente no itera nada.
     """
     for preview in _extract_compose_previews(events):
         token = preview_store.new_token()
@@ -279,6 +315,9 @@ async def _deliver_turn_result(
             ]
         )
         await bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)  # type: ignore[attr-defined]
+        await bot.send_media_group(  # type: ignore[attr-defined]
+            chat_id=chat_id, media=_panels_album(preview)
+        )
         await bot.send_photo(  # type: ignore[attr-defined]
             chat_id=chat_id,
             photo=IMAGES_DIR / f"{preview.preview_image_id}.jpg",
