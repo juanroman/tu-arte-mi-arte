@@ -1,16 +1,27 @@
-"""Telegram bot con lista blanca (PRD §7.1, §9): puerta de acceso mínima
-antes de conectar el motor de generación (Etapa 2, iteración 2.1).
+"""Telegram bot con lista blanca (PRD §7.1, §9) conectado al agente ADK
+(§7.11, Etapa 2 iteración 2.2). Cada mensaje autorizado se mapea a una
+llamada al `Runner` con el `root_agent` construido en Etapa 1 — mismas
+tools, sin reescribir nada.
 
-No dependency on the ADK agent yet — eso llega en 2.2.
+Sesión en memoria únicamente (PRD §7.2): un `chat_id` de Telegram se liga
+a un `(user_id, session_id)` de ADK que vive mientras el proceso del bot
+esté corriendo. Se pierde al reiniciar — la persistencia llega en 2.3.
 """
 
 import os
 import sys
 
 from dotenv import load_dotenv
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, ContextTypes, MessageHandler
 from telegram.ext import filters as tg_filters
+
+from agents.tu_arte_mi_arte.agent import root_agent
+
+APP_NAME = "tu_arte_mi_arte"
 
 
 def load_allowed_user_ids(raw: str | None) -> list[int]:
@@ -23,19 +34,71 @@ def load_allowed_user_ids(raw: str | None) -> list[int]:
     return [int(piece.strip()) for piece in raw.split(",") if piece.strip()]
 
 
-async def pong_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text("pong")
+def build_runner() -> Runner:
+    return Runner(
+        app_name=APP_NAME,
+        agent=root_agent,
+        session_service=InMemorySessionService(),
+    )
+
+
+def _final_text(events: list) -> str:
+    texts = []
+    for event in events:
+        if event.content and event.content.parts:
+            for part in event.content.parts:
+                if part.text:
+                    texts.append(part.text)
+    return "\n".join(texts)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text or not update.effective_chat:
+        return
+
+    runner: Runner = context.application.bot_data["runner"]
+    session_service: InMemorySessionService = context.application.bot_data[
+        "session_service"
+    ]
+    user_id = str(update.effective_chat.id)
+
+    session = await session_service.get_session(
+        app_name=APP_NAME, user_id=user_id, session_id=user_id
+    )
+    if session is None:
+        session = await session_service.create_session(
+            app_name=APP_NAME, user_id=user_id, session_id=user_id
+        )
+
+    events = []
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session.id,
+        new_message=types.Content(
+            role="user", parts=[types.Part(text=update.message.text)]
+        ),
+    ):
+        events.append(event)
+
+    reply_text = _final_text(events) or "Listo."
+    await update.message.reply_text(reply_text)
 
 
 def build_application(token: str, allowed_user_ids: list[int]) -> Application:
     """Builds the Application with a single handler gated by the numeric-ID
     whitelist (§7.1): unauthorized messages never reach the callback, so
-    they get no reply at all.
+    they get no reply at all. Only text messages reach the agent handler.
     """
     application = ApplicationBuilder().token(token).build()
+    application.bot_data["runner"] = build_runner()
+    application.bot_data["session_service"] = application.bot_data[
+        "runner"
+    ].session_service
     application.add_handler(
-        MessageHandler(tg_filters.User(user_id=allowed_user_ids), pong_handler)
+        MessageHandler(
+            tg_filters.User(user_id=allowed_user_ids) & tg_filters.TEXT,
+            handle_message,
+        )
     )
     return application
 

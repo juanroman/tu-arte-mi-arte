@@ -41,3 +41,4 @@ select = ["E", "F", "I", "UP"]
 python_version = "3.12"
 warn_unused_configs = true
 ignore_missing_imports = true
+explicit_package_bases = true
