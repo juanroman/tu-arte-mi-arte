@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from google.genai import errors, types
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -15,6 +16,39 @@ requires_gemini_key = pytest.mark.skipif(
     not os.environ.get("GEMINI_API_KEY"),
     reason="GEMINI_API_KEY no está configurada",
 )
+
+
+class _FakeModels:
+    def __init__(self, response=None, exception=None):
+        self._response = response
+        self._exception = exception
+
+    def generate_content(self, **kwargs):
+        if self._exception is not None:
+            raise self._exception
+        return self._response
+
+
+class _FakeClient:
+    def __init__(self, response=None, exception=None, **kwargs):
+        self.models = _FakeModels(response=response, exception=exception)
+
+
+def _fake_client_factory(response=None, exception=None):
+    def factory(*args, **kwargs):
+        return _FakeClient(response=response, exception=exception)
+
+    return factory
+
+
+def _response_with_finish_reason(finish_reason):
+    return types.GenerateContentResponse(
+        candidates=[
+            types.Candidate(
+                finish_reason=finish_reason, content=types.Content(parts=[])
+            )
+        ]
+    )
 
 
 @requires_gemini_key
@@ -69,3 +103,43 @@ def test_generate_final_high_res_reports_missing_reference(tmp_path, monkeypatch
     result = generate_final_high_res("img_does_not_exist")
 
     assert "error" in result
+
+
+def test_generate_image_flags_policy_rejection(monkeypatch):
+    response = _response_with_finish_reason(types.FinishReason.PROHIBITED_CONTENT)
+    monkeypatch.setattr(
+        generation.genai, "Client", _fake_client_factory(response=response)
+    )
+
+    result = generate_image("un tema con derechos", "1:1")
+
+    assert result == {
+        "error": "El modelo rechazó la solicitud (política o derechos).",
+        "policy_rejection": True,
+    }
+
+
+def test_generate_image_reports_generic_error_without_policy_flag(monkeypatch):
+    response = _response_with_finish_reason(types.FinishReason.OTHER)
+    monkeypatch.setattr(
+        generation.genai, "Client", _fake_client_factory(response=response)
+    )
+
+    result = generate_image("un tema cualquiera", "1:1")
+
+    assert "error" in result
+    assert "policy_rejection" not in result
+
+
+def test_generate_image_catches_transient_api_error(monkeypatch):
+    exception = errors.ServerError(
+        503, {"message": "Service Unavailable", "status": "UNAVAILABLE"}
+    )
+    monkeypatch.setattr(
+        generation.genai, "Client", _fake_client_factory(exception=exception)
+    )
+
+    result = generate_image("un tema cualquiera", "1:1")
+
+    assert "error" in result
+    assert "policy_rejection" not in result

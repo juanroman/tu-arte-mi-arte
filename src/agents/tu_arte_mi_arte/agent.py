@@ -227,7 +227,21 @@ root_agent = Agent(
         "devuelve los 43L/43R finales directamente, no vuelvas a partir "
         "nada tú) y otra vez sobre el image_id de 50 con "
         "is_split_wide=False. Confirma al usuario los image_id finales de "
-        "cada pieza."
+        "cada pieza.\n\n"
+        "MANEJO DE ERRORES. Si una tool devuelve un dict con 'error': "
+        "distingue por la clave 'policy_rejection'. Si "
+        "'policy_rejection' es true (rechazo real de política o derechos, "
+        "irrecuperable con el mismo tema), NUNCA reescribas la escena ni "
+        "vuelvas a llamar la tool por tu cuenta — dile al usuario qué se "
+        "rechazó y ofrécele un pivote que capture la época/lugar/estética "
+        "del tema de forma libre de derechos y on-brand (ej.: 'De los "
+        "Beatles no puedo (personas reales). Pero puedo capturar su "
+        "época — Abbey Road, psicodelia sesentera. ¿Le entro?'), y espera "
+        "su confirmación antes de generar de nuevo. Si el error no trae "
+        "'policy_rejection' (falla técnica que ya agotó sus reintentos), "
+        "informa el fallo al usuario en una frase clara y sin tecnicismos "
+        "(nunca muestres el texto crudo del error ni te quedes sin "
+        "responder), y ofrece intentarlo de nuevo si el usuario quiere."
     ),
     tools=[
         generate_image,
