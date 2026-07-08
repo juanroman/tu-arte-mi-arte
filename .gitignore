@@ -9,3 +9,6 @@ data/images/*
 !data/images/.gitkeep
 data/evals/*
 !data/evals/.gitkeep
+data/*.sqlite3
+data/*.sqlite3-wal
+data/*.sqlite3-shm
