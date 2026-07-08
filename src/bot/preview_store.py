@@ -16,6 +16,7 @@ tabla separada) porque es igualmente "estado propio del bot", no del
 esquema interno de ADK.
 """
 
+import contextlib
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -66,7 +67,7 @@ def save_preview(
     created_at: float,
     path: Path | None = None,
 ) -> None:
-    with _connect(path or DB_PATH) as conn:
+    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
         conn.execute(
             "INSERT INTO preview_tokens "
             "(token, chat_id, session_id, image_43l, image_43r, image_50, created_at) "
@@ -80,11 +81,10 @@ def save_preview(
             "created_at = excluded.created_at",
             (token, chat_id, session_id, image_43l, image_43r, image_50, created_at),
         )
-        conn.commit()
 
 
 def get_preview(token: str, path: Path | None = None) -> Preview | None:
-    with _connect(path or DB_PATH) as conn:
+    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
         row = conn.execute(
             "SELECT chat_id, session_id, image_43l, image_43r, image_50, created_at "
             "FROM preview_tokens WHERE token = ?",
