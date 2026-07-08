@@ -2,6 +2,7 @@ import os
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 from google.genai import errors, types
 
@@ -135,6 +136,36 @@ def test_generate_image_catches_transient_api_error(monkeypatch):
     exception = errors.ServerError(
         503, {"message": "Service Unavailable", "status": "UNAVAILABLE"}
     )
+    monkeypatch.setattr(
+        generation.genai, "Client", _fake_client_factory(exception=exception)
+    )
+
+    result = generate_image("un tema cualquiera", "1:1")
+
+    assert "error" in result
+    assert "policy_rejection" not in result
+
+
+def test_generate_image_catches_network_connect_error(monkeypatch):
+    """The SDK's own retry predicate (tenacity, configured via
+    HttpRetryOptions) retries httpx.ConnectError/TimeoutException too, and
+    re-raises the raw httpx exception once retries are exhausted — these
+    are not genai.errors.ClientError/ServerError subclasses, so _call_model
+    must catch them explicitly instead of letting them propagate crudo
+    (§7.9 invariant)."""
+    exception = httpx.ConnectError("connection refused")
+    monkeypatch.setattr(
+        generation.genai, "Client", _fake_client_factory(exception=exception)
+    )
+
+    result = generate_image("un tema cualquiera", "1:1")
+
+    assert "error" in result
+    assert "policy_rejection" not in result
+
+
+def test_generate_image_catches_network_timeout_error(monkeypatch):
+    exception = httpx.TimeoutException("request timed out")
     monkeypatch.setattr(
         generation.genai, "Client", _fake_client_factory(exception=exception)
     )

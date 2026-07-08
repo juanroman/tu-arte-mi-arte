@@ -7,6 +7,7 @@ reusable from any interface (adk web today, Telegram in Etapa 2).
 import uuid
 from pathlib import Path
 
+import httpx
 from google import genai
 from google.genai import errors, types
 
@@ -112,8 +113,9 @@ def _call_model(contents, image_config: types.ImageConfig) -> dict:
     """Calls Nano Banana 2 and saves the resulting image, centralizing retry
     (§7.9: 1-2 reintentos silenciosos ante fallas transitorias, vía el
     HttpRetryOptions nativo del SDK) and exception handling — un
-    ClientError/ServerError que persiste tras los reintentos nunca debe
-    propagarse crudo, siempre vuelve como {'error': ...}.
+    ClientError/ServerError, o una falla de red (timeout, conexión rechazada)
+    que persiste tras los reintentos del SDK, nunca debe propagarse cruda,
+    siempre vuelve como {'error': ...}.
     """
     client = genai.Client(http_options=_RETRY_HTTP_OPTIONS)
     try:
@@ -126,6 +128,8 @@ def _call_model(contents, image_config: types.ImageConfig) -> dict:
         )
     except (errors.ClientError, errors.ServerError) as e:
         return {"error": f"Fallo al llamar al modelo: {e.message or e}"}
+    except httpx.RequestError as e:
+        return {"error": f"Fallo de red al llamar al modelo: {e}"}
     return _save_response_image(response)
 
 
