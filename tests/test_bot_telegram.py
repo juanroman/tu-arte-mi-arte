@@ -392,6 +392,35 @@ def test_handle_message_edits_placeholder_to_error_on_exception():
     assert args[0] == _to_markdown_v2(GENERIC_ERROR_TEXT)
 
 
+def test_delivery_crash_edits_placeholder_to_error_instead_of_hanging():
+    """A crash while delivering the result (album/photo, not the agent run
+    itself) must not leave the '🎨 Generando…' placeholder stuck forever —
+    same failure mode the keyboard-attachment bug caused in 2.4, here
+    triggered by a Telegram API error during _deliver_turn_result instead.
+    """
+    _write_fixture_images("img_l", "img_r", "img_50")
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _compose_preview_call_event("img_l", "img_r", "img_50"),
+                _compose_preview_response_event(
+                    {"image_id": "img_preview1", "path": "x"}
+                ),
+                _text_event("aquí está el preview"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+    context.bot.send_media_group.side_effect = RuntimeError("telegram API hiccup")
+
+    with pytest.raises(RuntimeError, match="telegram API hiccup"):
+        asyncio.run(handle_message(update, context))
+
+    _final_reply(update).assert_awaited_once()
+    args, _ = _final_reply(update).call_args
+    assert args[0] == _to_markdown_v2(GENERIC_ERROR_TEXT)
+
+
 def test_handle_message_sends_generating_placeholder_then_edits_with_final_text():
     runner, session_service, _ = _build_runner_with_fake_run_async(
         [[_text_event("listo")]]

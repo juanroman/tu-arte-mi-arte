@@ -343,27 +343,33 @@ async def _run_and_deliver(
     progress_message: object,
 ) -> None:
     """Corre un turno con feedback de progreso y entrega su resultado
-    (fotos de preview + edición final). Si la corrida lanza una excepción,
-    el mensaje de progreso se edita a un error genérico en vez de quedarse
-    en "Generando…" para siempre — la taxonomía fina de errores sigue
-    siendo trabajo de 2.5, esto solo evita el placeholder colgado.
+    (fotos de preview + edición final). Si la corrida del agente o la
+    entrega posterior (álbum/foto/edición final) lanzan una excepción, el
+    mensaje de progreso se edita a un error genérico en vez de quedarse en
+    "Generando…" para siempre — la entrega también puede fallar por su
+    cuenta (p. ej. un rate limit de Telegram al mandar fotos), no solo la
+    corrida del agente, así que ambas quedan bajo la misma red de
+    seguridad (§2.5). La taxonomía fina de errores de tool sigue siendo
+    trabajo del propio agente vía 'MANEJO DE ERRORES' en su instrucción.
 
     Si el turno completó finalize_high_res sin ningún error (aprobación
-    exitosa), rota la sesión en silencio al terminar: una sesión
-    "expirada" debe significar siempre un encargo abandonado a medias,
-    nunca uno que ya se completó (dev_plan §2.4).
+    exitosa) y la entrega también terminó sin excepción, rota la sesión en
+    silencio al terminar: una sesión "expirada" debe significar siempre un
+    encargo abandonado a medias, nunca uno que ya se completó (dev_plan
+    §2.4) — una entrega que truena a medias no cuenta como encargo
+    cerrado, mismo criterio que ya aplica a un fallo parcial de
+    finalize_high_res.
     """
     try:
         events = await _run_turn_with_progress(
             runner, bot, chat_id, user_id, session_id, text
         )
+        await _deliver_turn_result(bot, chat_id, session_id, progress_message, events)
     except Exception:
         await progress_message.edit_text(  # type: ignore[attr-defined]
             _to_markdown_v2(GENERIC_ERROR_TEXT), parse_mode=ParseMode.MARKDOWN_V2
         )
         raise
-
-    await _deliver_turn_result(bot, chat_id, session_id, progress_message, events)
 
     if _finalize_high_res_all_succeeded(events):
         await rotate_session(session_service, chat_id)
