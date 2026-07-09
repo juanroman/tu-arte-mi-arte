@@ -1,0 +1,59 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from engine import deploy_history  # noqa: E402
+
+
+def test_get_history_returns_none_when_tv_never_deployed(tmp_path):
+    db_path = tmp_path / "tv_deploy_history.sqlite3"
+
+    assert deploy_history.get_history("43L", path=db_path) is None
+
+
+def test_first_record_deploy_sets_current_with_no_previous(tmp_path):
+    db_path = tmp_path / "tv_deploy_history.sqlite3"
+
+    deploy_history.record_deploy("43L", "img_0001", path=db_path)
+    history = deploy_history.get_history("43L", path=db_path)
+
+    assert history.current_image_id == "img_0001"
+    assert history.previous_image_id is None
+
+
+def test_second_record_deploy_shifts_current_to_previous(tmp_path):
+    db_path = tmp_path / "tv_deploy_history.sqlite3"
+
+    deploy_history.record_deploy("43L", "img_0001", path=db_path)
+    deploy_history.record_deploy("43L", "img_0002", path=db_path)
+    history = deploy_history.get_history("43L", path=db_path)
+
+    assert history.current_image_id == "img_0002"
+    assert history.previous_image_id == "img_0001"
+
+
+def test_third_record_deploy_keeps_only_one_level_of_history(tmp_path):
+    db_path = tmp_path / "tv_deploy_history.sqlite3"
+
+    deploy_history.record_deploy("43L", "img_0001", path=db_path)
+    deploy_history.record_deploy("43L", "img_0002", path=db_path)
+    deploy_history.record_deploy("43L", "img_0003", path=db_path)
+    history = deploy_history.get_history("43L", path=db_path)
+
+    assert history.current_image_id == "img_0003"
+    assert history.previous_image_id == "img_0002"
+
+
+def test_history_is_independent_per_tv(tmp_path):
+    db_path = tmp_path / "tv_deploy_history.sqlite3"
+
+    deploy_history.record_deploy("43L", "img_left", path=db_path)
+    deploy_history.record_deploy("50", "img_wide", path=db_path)
+
+    assert deploy_history.get_history("43L", path=db_path).current_image_id == (
+        "img_left"
+    )
+    assert deploy_history.get_history("50", path=db_path).current_image_id == (
+        "img_wide"
+    )

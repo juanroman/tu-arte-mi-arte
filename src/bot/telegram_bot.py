@@ -16,6 +16,13 @@ image_id exacto de esa generación (`preview_store`), feedback de progreso
 continuo mientras el agente trabaja (los tool calls de generación tardan
 minutos), y las respuestas de texto se convierten a MarkdownV2 real de
 Telegram en vez de mostrar asteriscos crudos.
+
+Reversibilidad (PRD §7.6, dev_plan §3.5): comando `/revertir [43L|43R|50]`
+y un botón inline "↩️ Revertir cambios" que aparece automáticamente
+cuando un despliegue queda parcial (algunas TVs sí, otras no) —ambos
+actúan directo sobre `engine.tv_deploy`, sin pasar por el Runner de ADK,
+porque son acciones de infraestructura deterministas, no correcciones
+creativas.
 """
 
 import asyncio
@@ -52,6 +59,7 @@ from telegram.ext import filters as tg_filters
 
 from agents.tu_arte_mi_arte.agent import root_agent
 from bot import preview_store, session_store
+from engine import tv_deploy
 from engine.generation import IMAGES_DIR
 
 APP_NAME = "tu_arte_mi_arte"
@@ -63,6 +71,9 @@ UPSCALING_TEXT = "🔼 Generando en 4K y subiendo a las pantallas…"
 GENERIC_ERROR_TEXT = "⚠️ Algo salió mal generando esto. ¿Lo intentamos de nuevo?"
 CONFIRM_CALLBACK_PREFIX = "deploy:"
 CONFIRM_BUTTON_TEXT = "✅ Confirmar"
+REVERT_CALLBACK_PREFIX = "revert:"
+REVERT_BUTTON_TEXT = "↩️ Revertir cambios"
+KNOWN_TV_NAMES = ("43L", "43R", "50")
 PREVIEW_CAPTION = (
     "🖼️ Así se vería en la sala. Si te gusta, toca *Confirmar* para subir "
     "esta versión a alta resolución."
@@ -73,6 +84,11 @@ STALE_PREVIEW_TEXT = (
     "se reinició) — pide el preview de nuevo antes de confirmar."
 )
 UNKNOWN_PREVIEW_TEXT = "🤔 No encuentro esta vista previa (¿un token muy viejo?)."
+PARTIAL_DEPLOY_WARNING_TEXT = (
+    "⚠️ El despliegue quedó a medias: {succeeded} sí cambiaron, pero "
+    "{failed} falló. La pared quedó inconsistente — ¿revertimos las "
+    "pantallas que sí cambiaron para dejarlas como estaban antes?"
+)
 _TYPING_INTERVAL_SECONDS = 4.0
 
 RESET_KEYBOARD = ReplyKeyboardMarkup(
@@ -251,6 +267,57 @@ def _finalize_high_res_all_succeeded(events: list) -> bool:
     return bool(responses) and all("error" not in r for r in responses)
 
 
+def _extract_deploy_results(events: list) -> dict | None:
+    """Devuelve el dict de resultado de la última llamada a deploy_to_panels
+    en la corrida ({'43L': {...}, '43R': {...}, '50': {...}}), o None si
+    esa tool no se llamó en este turno. Mismo patrón de caminar
+    `event.content.parts` que `_extract_compose_previews` — no hace falta
+    correlacionar con la llamada, ya que deploy_to_panels no tiene
+    argumentos que nos interesen aquí (solo su respuesta).
+    """
+    result = None
+    for event_ in events:
+        if not event_.content or not event_.content.parts:
+            continue
+        for part in event_.content.parts:
+            if (
+                part.function_response
+                and part.function_response.name == "deploy_to_panels"
+            ):
+                result = part.function_response.response
+    return result
+
+
+def _partially_failed_tvs(deploy_results: dict) -> list[str]:
+    """De un resultado de deploy_to_panels, devuelve los nombres de las TVs
+    que sí se desplegaron con éxito, solo si el resultado es una falla
+    PARCIAL (al menos un éxito y al menos un error) — dev_plan §3.5: un
+    éxito total no tiene nada que revertir, y un fallo total no cambió
+    ninguna pantalla, así que tampoco hay nada que revertir en ninguno de
+    esos dos casos.
+    """
+    succeeded = [
+        tv_name
+        for tv_name in KNOWN_TV_NAMES
+        if tv_name in deploy_results and "error" not in deploy_results[tv_name]
+    ]
+    failed = [
+        tv_name
+        for tv_name in KNOWN_TV_NAMES
+        if tv_name in deploy_results and "error" in deploy_results[tv_name]
+    ]
+    if succeeded and failed:
+        return succeeded
+    return []
+
+
+def _revert_keyboard(tv_names: list[str]) -> InlineKeyboardMarkup:
+    callback_data = f"{REVERT_CALLBACK_PREFIX}{','.join(tv_names)}"
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(REVERT_BUTTON_TEXT, callback_data=callback_data)]]
+    )
+
+
 def _panels_album(preview: "_ComposedPreview") -> list[InputMediaPhoto]:
     """Arma el álbum de las tres piezas por separado (43L, 43R, 50) para
     darle al usuario detalle real de cada panel — la foto compuesta del
@@ -293,6 +360,11 @@ async def _deliver_turn_result(
     el texto final del turno. Una corrida que solo finaliza en alta
     resolución (sin compose_preview) no produce fotos — el ciclo de arriba
     simplemente no itera nada.
+
+    Si el turno incluyó un deploy_to_panels que quedó parcial (algunas
+    pantallas sí, otras no), manda además un aviso con un botón "↩️
+    Revertir cambios" atado solo a las TVs que sí cambiaron — nunca a la
+    que falló, porque esa nunca se tocó (dev_plan §3.5).
     """
     for preview in _extract_compose_previews(events):
         token = preview_store.new_token()
@@ -326,6 +398,26 @@ async def _deliver_turn_result(
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=keyboard,
         )
+
+    deploy_results = _extract_deploy_results(events)
+    if deploy_results is not None:
+        succeeded = _partially_failed_tvs(deploy_results)
+        if succeeded:
+            failed = [
+                tv_name
+                for tv_name in KNOWN_TV_NAMES
+                if tv_name in deploy_results and "error" in deploy_results[tv_name]
+            ]
+            await bot.send_message(  # type: ignore[attr-defined]
+                chat_id,
+                _to_markdown_v2(
+                    PARTIAL_DEPLOY_WARNING_TEXT.format(
+                        succeeded=", ".join(succeeded), failed=", ".join(failed)
+                    )
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=_revert_keyboard(succeeded),
+            )
 
     reply_text = _final_text(events) or "Listo."
     await progress_message.edit_text(  # type: ignore[attr-defined]
@@ -539,6 +631,98 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+def _format_revert_report(results: dict) -> str:
+    lines = []
+    for tv_name, result in results.items():
+        if "error" in result:
+            lines.append(f"❌ {tv_name}: {result['error']}")
+        else:
+            lines.append(f"↩️ {tv_name}: revertida ({result['content_id']}).")
+    return "\n".join(lines)
+
+
+async def revert_command_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Comando `/revertir [43L|43R|50]` (dev_plan §3.5, PRD §7.6): revierte
+    una TV física a la versión desplegada justo antes de la actual, sin
+    pasar por el agente ADK — es una acción de infraestructura
+    determinista, no una corrección creativa. Sin argumento, revierte las
+    tres pantallas; con un nombre, revierte solo esa.
+    """
+    if not update.message or not update.effective_chat:
+        return
+
+    args = context.args or []
+    tv_names: list[str]
+    if not args:
+        tv_names = list(KNOWN_TV_NAMES)
+    else:
+        requested = args[0].upper()
+        if requested not in KNOWN_TV_NAMES:
+            await update.message.reply_text(
+                _to_markdown_v2(
+                    f"🤔 No conozco una TV llamada {args[0]!r}. Usa una de: "
+                    f"{', '.join(KNOWN_TV_NAMES)}."
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return
+        tv_names = [requested]
+
+    results = tv_deploy.revert_panels(tv_names)
+    await update.message.reply_text(
+        _to_markdown_v2(_format_revert_report(results)),
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+async def revert_button_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Maneja el botón inline "↩️ Revertir cambios" que aparece tras un
+    despliegue parcial (dev_plan §3.5). El `callback_data` ya trae los
+    nombres exactos de las TVs a revertir (las que sí cambiaron) — igual
+    que `revert_command_handler`, actúa directo sobre `tv_deploy` sin pasar
+    por el agente ADK.
+    """
+    query = update.callback_query
+    if (
+        query is None
+        or not query.data
+        or not query.data.startswith(REVERT_CALLBACK_PREFIX)
+    ):
+        return
+
+    await query.answer()
+
+    allowed_user_ids = context.application.bot_data["allowed_user_ids"]
+    if (
+        update.effective_user is None
+        or update.effective_user.id not in allowed_user_ids
+    ):
+        return
+
+    if not update.effective_chat:
+        return
+    chat_id = update.effective_chat.id
+
+    tv_names = [
+        name
+        for name in query.data[len(REVERT_CALLBACK_PREFIX) :].split(",")
+        if name in KNOWN_TV_NAMES
+    ]
+    if not tv_names:
+        return
+
+    results = tv_deploy.revert_panels(tv_names)
+    await context.bot.send_message(
+        chat_id,
+        _to_markdown_v2(_format_revert_report(results)),
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
 async def reset_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_chat:
         return
@@ -586,6 +770,16 @@ def build_application(token: str, allowed_user_ids: list[int]) -> Application:
     )
     application.add_handler(
         MessageHandler(whitelist & tg_filters.Text([RESET_BUTTON_TEXT]), reset_handler),
+        group=0,
+    )
+    application.add_handler(
+        CommandHandler("revertir", revert_command_handler, filters=whitelist),
+        group=0,
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            revert_button_handler, pattern=f"^{REVERT_CALLBACK_PREFIX}"
+        ),
         group=0,
     )
     application.add_handler(

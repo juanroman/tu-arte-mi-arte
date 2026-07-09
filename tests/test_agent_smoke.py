@@ -316,3 +316,23 @@ def test_deploy_to_panels_forwards_image_ids(monkeypatch):
         "43R": {"content_id": "MY_43R"},
         "50": {"content_id": "MY_50"},
     }
+
+
+def test_root_agent_has_revert_tv_tool():
+    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    assert "revert_tv" in tool_names
+
+
+def test_revert_tv_forwards_tv_name(monkeypatch):
+    captured = {}
+
+    def fake_revert_tv_ai(tv_name):
+        captured["tv_name"] = tv_name
+        return {"content_id": "MY_reverted"}
+
+    monkeypatch.setattr(agent, "revert_tv_ai", fake_revert_tv_ai)
+
+    result = agent.revert_tv("43L")
+
+    assert captured == {"tv_name": "43L"}
+    assert result == {"content_id": "MY_reverted"}

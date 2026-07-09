@@ -8,6 +8,7 @@ from engine.preview import compose_preview as compose_preview_ai
 from engine.split import load_split_config
 from engine.split import split_wide_image as split_wide_image_ai
 from engine.tv_deploy import deploy_set_to_panels as deploy_set_to_panels_ai
+from engine.tv_deploy import revert_tv as revert_tv_ai
 
 
 def generate_image(theme: str, aspect_ratio: str = "1:1") -> dict:
@@ -184,6 +185,25 @@ def deploy_to_panels(image_43l: str, image_43r: str, image_50: str) -> dict:
     )
 
 
+def revert_tv(tv_name: str) -> dict:
+    """Revierte una TV física ('43L', '43R' o '50') a la versión que tenía
+    desplegada justo antes de la actual (PRD §7.6, dev_plan §3.5).
+
+    Distinta de refine_image: refine_image corrige el CONTENIDO de una
+    imagen (edición creativa), esta tool restaura lo que YA ESTABA
+    mostrándose en una pantalla física antes del despliegue más reciente
+    — úsala solo cuando el usuario pida deshacer/revertir/regresar lo que
+    hay colgado en una TV, nunca como sustituto de una corrección
+    conversacional. Solo guarda un nivel de historial (la versión
+    inmediata anterior), así que revertir dos veces seguidas alterna
+    entre las dos últimas versiones desplegadas. Devuelve {'content_id':
+    ...} si tuvo éxito, o {'error': ...} si esa TV nunca se ha desplegado
+    más de una vez (no hay versión anterior que restaurar) o si falla la
+    reconexión/subida.
+    """
+    return revert_tv_ai(tv_name)
+
+
 root_agent = Agent(
     model="gemini-flash-latest",
     name="root_agent",
@@ -261,6 +281,16 @@ root_agent = Agent(
         "manual') — una falla de deploy_to_panels es de red/TV, no de "
         "generación o política, y nunca debe reportarse con el mismo "
         "lenguaje que un rechazo o fallo de finalize_high_res.\n\n"
+        "REVERTIR UNA TV (revert_tv). Úsala solo cuando el usuario pida "
+        "explícitamente deshacer, revertir o regresar lo que está "
+        "colgado ahora mismo en una pantalla física (p. ej. 'no me "
+        "gustó cómo quedó en la 43L, regrésala', 'revierte la 50') — "
+        "nunca la uses como respuesta a una corrección creativa ('más "
+        "otoñal', 'cambia el color'), eso sigue siendo refine_image "
+        "sobre el image_id, seguido de su propio despliegue. Si "
+        "revert_tv devuelve 'error' porque no hay una versión anterior "
+        "guardada para esa TV, dilo con claridad (no es un fallo de red, "
+        "es que no existe ese estado previo) y no lo reintentes.\n\n"
         "MANEJO DE ERRORES. Si una tool devuelve un dict con 'error': "
         "distingue por la clave 'policy_rejection'. Si "
         "'policy_rejection' es true (rechazo real de política o derechos, "
@@ -307,5 +337,6 @@ root_agent = Agent(
         compose_preview,
         finalize_high_res,
         deploy_to_panels,
+        revert_tv,
     ],
 )

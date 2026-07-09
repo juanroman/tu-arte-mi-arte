@@ -7,12 +7,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from PIL import Image
 from samsungtvws import exceptions
 
-from engine import generation, tv_deploy
+from engine import deploy_history, generation, tv_deploy
 from engine.tv_deploy import (
     TvDeployConfig,
     deploy_image_to_tv,
     deploy_set_to_panels,
     load_tv_deploy_config,
+    revert_panels,
+    revert_tv,
 )
 from engine.tv_discovery import TvNotFoundError
 
@@ -102,6 +104,9 @@ def _install_fake(monkeypatch, tmp_path, **kwargs):
     monkeypatch.setattr(tv_deploy, "resolve_tv_host", lambda name: "10.0.0.1")
     monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
     monkeypatch.setattr(tv_deploy, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        deploy_history, "DB_PATH", tmp_path / "tv_deploy_history.sqlite3"
+    )
     return fake
 
 
@@ -311,3 +316,80 @@ def test_load_tv_deploy_config_reads_custom_path(tmp_path):
     config = load_tv_deploy_config(path=config_path)
 
     assert config == TvDeployConfig(matte="shadowbox_polar")
+
+
+def test_successful_deploy_records_history(tmp_path, monkeypatch):
+    _write_fixture_image(tmp_path, "img_0001")
+    _install_fake(monkeypatch, tmp_path, content_id="MY_F0099")
+
+    deploy_image_to_tv("43L", "img_0001")
+
+    history = deploy_history.get_history(
+        "43L", path=tmp_path / "tv_deploy_history.sqlite3"
+    )
+    assert history.current_image_id == "img_0001"
+    assert history.previous_image_id is None
+
+
+def test_revert_tv_without_prior_history_returns_error_without_touching_tv(
+    tmp_path, monkeypatch
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(monkeypatch, tmp_path)
+
+    result = revert_tv("43L")
+
+    assert "error" in result
+    assert fake.uploaded == []
+
+
+def test_revert_tv_with_history_redeploys_previous_image(tmp_path, monkeypatch):
+    _write_fixture_image(tmp_path, "img_old")
+    _write_fixture_image(tmp_path, "img_new")
+    fake = _install_fake(monkeypatch, tmp_path, content_id="MY_reverted")
+
+    deploy_image_to_tv("43L", "img_old")
+    deploy_image_to_tv("43L", "img_new")
+
+    result = revert_tv("43L")
+
+    assert result == {"content_id": "MY_reverted"}
+    assert fake.uploaded[-1][0] == str(tmp_path / "img_old.jpg")
+
+
+def test_reverting_twice_in_a_row_alternates_between_last_two_versions(
+    tmp_path, monkeypatch
+):
+    _write_fixture_image(tmp_path, "img_a")
+    _write_fixture_image(tmp_path, "img_b")
+    fake = _install_fake(monkeypatch, tmp_path, content_id="MY_x")
+
+    deploy_image_to_tv("43L", "img_a")
+    deploy_image_to_tv("43L", "img_b")
+
+    first_revert = revert_tv("43L")
+    second_revert = revert_tv("43L")
+
+    assert "error" not in first_revert
+    assert "error" not in second_revert
+    assert fake.uploaded[-2][0] == str(tmp_path / "img_a.jpg")
+    assert fake.uploaded[-1][0] == str(tmp_path / "img_b.jpg")
+
+
+def test_revert_panels_deploys_all_requested_tvs_independently(monkeypatch):
+    calls = []
+
+    def _fake_revert(tv_name):
+        calls.append(tv_name)
+        if tv_name == "43R":
+            return {"error": "no se pudo conectar"}
+        return {"content_id": f"MY_{tv_name}"}
+
+    monkeypatch.setattr(tv_deploy, "revert_tv", _fake_revert)
+
+    result = revert_panels(["43L", "43R"])
+
+    assert calls == ["43L", "43R"]
+    assert result["43L"] == {"content_id": "MY_43L"}
+    assert "error" in result["43R"]
+    assert "50" not in result

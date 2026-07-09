@@ -28,6 +28,7 @@ from bot.telegram_bot import (  # noqa: E402
     CONFIRM_CALLBACK_PREFIX,
     GENERIC_ERROR_TEXT,
     RESET_BUTTON_TEXT,
+    REVERT_CALLBACK_PREFIX,
     STALE_PREVIEW_TEXT,
     UNKNOWN_PREVIEW_TEXT,
     UPSCALING_TEXT,
@@ -38,8 +39,11 @@ from bot.telegram_bot import (  # noqa: E402
     load_allowed_user_ids,
     load_session_timeout_seconds,
     reset_handler,
+    revert_button_handler,
+    revert_command_handler,
     rotate_session,
 )
+from engine import tv_deploy  # noqa: E402
 
 DEFAULT_TIMEOUT = 10_800
 
@@ -94,9 +98,11 @@ def test_build_application_registers_reset_and_generic_handlers():
     group1 = app.handlers.get(1, [])
 
     command_handlers = [h for h in group0 if isinstance(h, CommandHandler)]
-    assert len(command_handlers) == 1
-    assert command_handlers[0].commands == frozenset({"nuevo"})
-    assert command_handlers[0].callback is reset_handler
+    reset_command_handlers = [
+        h for h in command_handlers if h.callback is reset_handler
+    ]
+    assert len(reset_command_handlers) == 1
+    assert reset_command_handlers[0].commands == frozenset({"nuevo"})
 
     button_handlers = [h for h in group0 if isinstance(h, MessageHandler)]
     assert len(button_handlers) == 1
@@ -121,8 +127,27 @@ def test_build_application_registers_confirm_callback_handler():
 
     group0 = app.handlers.get(0, [])
     callback_handlers = [h for h in group0 if isinstance(h, CallbackQueryHandler)]
-    assert len(callback_handlers) == 1
-    assert callback_handlers[0].callback is confirm_handler
+    confirm_handlers = [h for h in callback_handlers if h.callback is confirm_handler]
+    assert len(confirm_handlers) == 1
+
+
+def test_build_application_registers_revert_command_and_callback_handlers():
+    app = build_application("123:fake-token-for-tests", [111])
+
+    group0 = app.handlers.get(0, [])
+
+    command_handlers = [h for h in group0 if isinstance(h, CommandHandler)]
+    revert_commands = [
+        h for h in command_handlers if h.callback is revert_command_handler
+    ]
+    assert len(revert_commands) == 1
+    assert revert_commands[0].commands == frozenset({"revertir"})
+
+    callback_handlers = [h for h in group0 if isinstance(h, CallbackQueryHandler)]
+    revert_callbacks = [
+        h for h in callback_handlers if h.callback is revert_button_handler
+    ]
+    assert len(revert_callbacks) == 1
 
 
 def _text_event(text: str) -> SimpleNamespace:
@@ -191,6 +216,21 @@ def _finalize_response_event(response: dict) -> SimpleNamespace:
                 types.Part(
                     function_response=types.FunctionResponse(
                         name="finalize_high_res", response=response
+                    )
+                )
+            ],
+        )
+    )
+
+
+def _deploy_to_panels_response_event(response: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="deploy_to_panels", response=response
                     )
                 )
             ],
@@ -862,3 +902,205 @@ def test_confirm_handler_rejects_stale_token_after_session_rotated():
     args, kwargs = context.bot.send_message.call_args
     assert args[1] == _to_markdown_v2(STALE_PREVIEW_TEXT)
     assert len(fake_run_async.calls) == 0
+
+
+def _make_command_update_and_context(chat_id, args=None, user_id=111):
+    update = SimpleNamespace(
+        message=SimpleNamespace(reply_text=AsyncMock()),
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=SimpleNamespace(id=user_id),
+    )
+    context = SimpleNamespace(
+        args=args or [],
+        application=SimpleNamespace(bot_data={"allowed_user_ids": frozenset({111})}),
+        bot=_make_bot(),
+    )
+    return update, context
+
+
+def test_revert_command_without_args_reverts_all_three_panels(monkeypatch):
+    calls = []
+
+    def fake_revert_panels(tv_names):
+        calls.append(tv_names)
+        return {name: {"content_id": f"MY_{name}"} for name in tv_names}
+
+    monkeypatch.setattr(tv_deploy, "revert_panels", fake_revert_panels)
+    update, context = _make_command_update_and_context(chat_id=42)
+
+    asyncio.run(revert_command_handler(update, context))
+
+    assert calls == [["43L", "43R", "50"]]
+    update.message.reply_text.assert_awaited_once()
+
+
+def test_revert_command_with_valid_arg_reverts_only_that_panel(monkeypatch):
+    calls = []
+
+    def fake_revert_panels(tv_names):
+        calls.append(tv_names)
+        return {name: {"content_id": f"MY_{name}"} for name in tv_names}
+
+    monkeypatch.setattr(tv_deploy, "revert_panels", fake_revert_panels)
+    update, context = _make_command_update_and_context(chat_id=42, args=["43l"])
+
+    asyncio.run(revert_command_handler(update, context))
+
+    assert calls == [["43L"]]
+
+
+def test_revert_command_with_invalid_arg_replies_without_calling_revert(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        tv_deploy, "revert_panels", lambda tv_names: calls.append(tv_names)
+    )
+    update, context = _make_command_update_and_context(chat_id=42, args=["99"])
+
+    asyncio.run(revert_command_handler(update, context))
+
+    assert calls == []
+    update.message.reply_text.assert_awaited_once()
+
+
+def test_partial_deploy_sends_warning_with_revert_button_for_succeeded_tvs():
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _deploy_to_panels_response_event(
+                    {
+                        "43L": {"content_id": "MY_43L"},
+                        "43R": {"error": "no se pudo conectar"},
+                        "50": {"content_id": "MY_50"},
+                    }
+                ),
+                _text_event("desplegado parcialmente"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    context.bot.send_message.assert_awaited_once()
+    args, kwargs = context.bot.send_message.call_args
+    keyboard = kwargs["reply_markup"]
+    button = keyboard.inline_keyboard[0][0]
+    assert button.callback_data == f"{REVERT_CALLBACK_PREFIX}43L,50"
+
+
+def test_full_success_deploy_sends_no_revert_button():
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _deploy_to_panels_response_event(
+                    {
+                        "43L": {"content_id": "MY_43L"},
+                        "43R": {"content_id": "MY_43R"},
+                        "50": {"content_id": "MY_50"},
+                    }
+                ),
+                _text_event("desplegado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    context.bot.send_message.assert_not_awaited()
+
+
+def test_full_failure_deploy_sends_no_revert_button():
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _deploy_to_panels_response_event(
+                    {
+                        "43L": {"error": "no se pudo conectar"},
+                        "43R": {"error": "no se pudo conectar"},
+                        "50": {"error": "no se pudo conectar"},
+                    }
+                ),
+                _text_event("no se pudo desplegar"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    context.bot.send_message.assert_not_awaited()
+
+
+def _make_revert_callback_update_and_context(
+    chat_id, tv_names, user_id=111, allowed_user_ids=frozenset({111})
+):
+    query = SimpleNamespace(
+        data=f"{REVERT_CALLBACK_PREFIX}{','.join(tv_names)}", answer=AsyncMock()
+    )
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=SimpleNamespace(id=user_id),
+    )
+    context = SimpleNamespace(
+        application=SimpleNamespace(bot_data={"allowed_user_ids": allowed_user_ids}),
+        bot=_make_bot(),
+    )
+    return update, context, query
+
+
+def test_revert_button_handler_reverts_the_named_tvs(monkeypatch):
+    calls = []
+
+    def fake_revert_panels(tv_names):
+        calls.append(tv_names)
+        return {name: {"content_id": f"MY_{name}"} for name in tv_names}
+
+    monkeypatch.setattr(tv_deploy, "revert_panels", fake_revert_panels)
+    update, context, query = _make_revert_callback_update_and_context(
+        chat_id=42, tv_names=["43L", "50"]
+    )
+
+    asyncio.run(revert_button_handler(update, context))
+
+    query.answer.assert_awaited_once()
+    assert calls == [["43L", "50"]]
+    context.bot.send_message.assert_awaited_once()
+
+
+def test_revert_button_handler_ignores_unauthorized_user(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        tv_deploy, "revert_panels", lambda tv_names: calls.append(tv_names) or {}
+    )
+    update, context, query = _make_revert_callback_update_and_context(
+        chat_id=42, tv_names=["43L"], user_id=999, allowed_user_ids=frozenset({111})
+    )
+
+    asyncio.run(revert_button_handler(update, context))
+
+    query.answer.assert_awaited_once()
+    assert calls == []
+
+
+def test_revert_button_handler_ignores_malformed_callback_data(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        tv_deploy, "revert_panels", lambda tv_names: calls.append(tv_names) or {}
+    )
+    query = SimpleNamespace(data=f"{REVERT_CALLBACK_PREFIX}", answer=AsyncMock())
+    update = SimpleNamespace(
+        callback_query=query,
+        effective_chat=SimpleNamespace(id=42),
+        effective_user=SimpleNamespace(id=111),
+    )
+    context = SimpleNamespace(
+        application=SimpleNamespace(bot_data={"allowed_user_ids": frozenset({111})}),
+        bot=_make_bot(),
+    )
+
+    asyncio.run(revert_button_handler(update, context))
+
+    assert calls == []
+    context.bot.send_message.assert_not_awaited()

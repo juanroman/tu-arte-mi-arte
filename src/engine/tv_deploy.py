@@ -10,6 +10,12 @@ de las 43" en upload()/select_image(), así que 3.4 se limitó a invocar
 este mismo camino también para la 50 desde el flujo en vivo del agente,
 sin código de manejo especial.
 
+Reversibilidad (PRD §7.6, dev_plan §3.5): cada despliegue exitoso se
+registra en `engine.deploy_history` (un solo nivel: current + previous
+por TV). `revert_tv`/`revert_panels` reutilizan `deploy_image_to_tv` para
+volver a subir/seleccionar el image_id anterior — no hay un "undo" nativo
+en la TV, revertir es simplemente desplegar hacia atrás.
+
 No dependency on google.adk: this module is testable in isolation and
 reusable from any interface.
 """
@@ -22,7 +28,7 @@ from pathlib import Path
 from samsungtvws import exceptions
 from samsungtvws.art import SamsungTVArt
 
-from engine import generation
+from engine import deploy_history, generation
 from engine.tv_discovery import TvNotFoundError, resolve_tv_host
 
 CONFIG_PATH = (
@@ -126,6 +132,7 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
             }
 
         _delete_old_uploads(tv, keep_content_id=content_id, tv_name=tv_name)
+        deploy_history.record_deploy(tv_name, image_id)
         return {"content_id": content_id}
     except Exception as error:  # red de seguridad: corre sin supervisión
         _logger.exception("Fallo inesperado desplegando a %s", tv_name)
@@ -152,3 +159,36 @@ def deploy_set_to_panels(image_43l: str, image_43r: str, image_50: str) -> dict:
         "43R": deploy_image_to_tv("43R", image_43r),
         "50": deploy_image_to_tv("50", image_50),
     }
+
+
+def revert_tv(tv_name: str) -> dict:
+    """Revierte la TV `tv_name` a la versión que tenía desplegada justo
+    antes de la actual (PRD §7.6, dev_plan §3.5) — un solo nivel de
+    historial, no una pila: revertir dos veces seguidas alterna entre las
+    dos últimas versiones, ya que `deploy_image_to_tv` vuelve a registrar
+    historial al desplegar la anterior.
+
+    Devuelve {'error': ...} sin tocar la TV si no hay una versión anterior
+    guardada (nunca se ha desplegado, o solo se ha desplegado una vez).
+    En caso contrario, reutiliza deploy_image_to_tv tal cual —mismo shape
+    de resultado, misma independencia de fallas— para desplegar el
+    image_id anterior.
+    """
+    history = deploy_history.get_history(tv_name)
+    if history is None or history.previous_image_id is None:
+        return {
+            "error": f"No hay una versión anterior guardada para la TV {tv_name!r}."
+        }
+    return deploy_image_to_tv(tv_name, history.previous_image_id)
+
+
+def revert_panels(tv_names: list[str]) -> dict:
+    """Revierte cada TV en `tv_names` de forma independiente (PRD §7.6,
+    dev_plan §3.5) — a diferencia de deploy_set_to_panels, que siempre
+    actúa sobre las tres pantallas, esto acepta cualquier subconjunto
+    (p. ej. solo las que sí cambiaron en un despliegue parcial). La falla
+    de una TV nunca bloquea a las demás.
+
+    Devuelve {tv_name: {...}, ...} solo para los nombres pedidos.
+    """
+    return {tv_name: revert_tv(tv_name) for tv_name in tv_names}
