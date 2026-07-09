@@ -1,0 +1,20 @@
+# TVs conocidas de la casa (PRD §7.6, §7.10). La MAC es la clave estable —
+# la IP la asigna DHCP y puede cambiar; last_known_ip es solo una caché,
+# mantenida al día automáticamente por resolve_tv_host().
+#
+# Este archivo es una plantilla (mismo patrón que .env/.env.example):
+# copiarlo a config/tvs.toml y llenar con la MAC real de cada TV (obtenida
+# de GET /api/v2/ contra la IP de la TV). config/tvs.toml está en
+# .gitignore porque expone la topología de red de la casa.
+
+[tvs."43L"]
+mac = ""
+last_known_ip = ""
+
+[tvs."43R"]
+mac = ""
+last_known_ip = ""
+
+[tvs."50"]
+mac = ""
+last_known_ip = ""

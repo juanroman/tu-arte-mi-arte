@@ -14,3 +14,4 @@ data/*.sqlite3-wal
 data/*.sqlite3-shm
 data/*.spike
 data/tv_*_token.json
+config/tvs.toml
