@@ -13,7 +13,9 @@ practice. It targets one TV per invocation — run it once per screen.
 Usage:
     uv run python scripts/spike_tv_write_path.py <tv_name> [path/to/image.jpg]
 
-    tv_name: one of 43l, 43r, 50 (maps to the known IPs below).
+    tv_name: one of 43l, 43r, 50 — resolved to a live IP via
+    engine.tv_discovery.resolve_tv_host() (config/tvs.toml + mDNS fallback),
+    so this no longer hardcodes IPs or trusts DHCP reservations to hold.
 
 If no image path is given, uses the most recently generated image under
 data/images/ that hasn't already been used by a prior run of this script in
@@ -32,14 +34,11 @@ from pathlib import Path
 
 from samsungtvws.art import SamsungTVArt
 
-TV_HOSTS = {
-    "43l": "192.168.1.101",
-    "43r": "192.168.1.102",
-    # PRD Apéndice A documents .103; DHCP reassigned it to .104 as of 2026-07-08
-    # (confirmed live via GET /api/v2/, name="Frame 50") — re-verify if it
-    # drifts again, and consider a DHCP reservation per PRD §8.
-    "50": "192.168.1.104",
-}
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from engine.tv_discovery import resolve_tv_host  # noqa: E402
+
+TV_CONFIG_NAMES = {"43l": "43L", "43r": "43R", "50": "50"}
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 IMAGES_DIR = DATA_DIR / "images"
@@ -69,13 +68,13 @@ def record_used(image_path: Path) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) < 2 or sys.argv[1] not in TV_HOSTS:
+    if len(sys.argv) < 2 or sys.argv[1] not in TV_CONFIG_NAMES:
         raise SystemExit(
-            f"Usage: uv run python {sys.argv[0]} <{'|'.join(TV_HOSTS)}> "
+            f"Usage: uv run python {sys.argv[0]} <{'|'.join(TV_CONFIG_NAMES)}> "
             "[path/to/image.jpg]"
         )
     tv_name = sys.argv[1]
-    host = TV_HOSTS[tv_name]
+    host = resolve_tv_host(TV_CONFIG_NAMES[tv_name])
     token_file = DATA_DIR / f"tv_{tv_name}_token.spike"
 
     image_path = Path(sys.argv[2]) if len(sys.argv) > 2 else pick_test_image()
