@@ -30,6 +30,7 @@ from bot.telegram_bot import (  # noqa: E402
     RESET_BUTTON_TEXT,
     STALE_PREVIEW_TEXT,
     UNKNOWN_PREVIEW_TEXT,
+    UPSCALING_TEXT,
     _to_markdown_v2,
     build_application,
     confirm_handler,
@@ -782,6 +783,25 @@ def test_confirm_handler_resolves_token_and_sends_synthetic_message():
     assert "img_l" in text
     assert "img_r" in text
     assert "img_50" in text
+
+
+def test_confirm_handler_sends_upscaling_placeholder_not_generic_one():
+    """Aprobar dispara alta resolución + despliegue a las TVs (§3.3), no
+    una generación cualquiera — el placeholder debe decirlo, en vez del
+    genérico "Generando..." que confunde al usuario sobre cuánto falta."""
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [[_text_event("subido")]]
+    )
+    session_id = asyncio.run(rotate_session(session_service, 42))
+    preview_store.save_preview("tok1", 42, session_id, "img_l", "img_r", "img_50", 0.0)
+    update, context, _ = _make_callback_update_and_context(
+        runner, session_service, chat_id=42, preview_token="tok1"
+    )
+
+    asyncio.run(confirm_handler(update, context))
+
+    args, _ = context.bot.send_message.call_args_list[0]
+    assert args[1] == _to_markdown_v2(UPSCALING_TEXT)
 
 
 def test_confirm_handler_ignores_unauthorized_user():

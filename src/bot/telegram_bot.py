@@ -59,6 +59,7 @@ RESET_BUTTON_TEXT = "🔄 Empezar de cero"
 DEFAULT_SESSION_TIMEOUT_SECONDS = 10800  # 3h, sugerido por PRD §7.2
 
 GENERATING_TEXT = "🎨 Generando…"
+UPSCALING_TEXT = "🔼 Generando en 4K y subiendo a las pantallas…"
 GENERIC_ERROR_TEXT = "⚠️ Algo salió mal generando esto. ¿Lo intentamos de nuevo?"
 CONFIRM_CALLBACK_PREFIX = "deploy:"
 CONFIRM_BUTTON_TEXT = "✅ Confirmar"
@@ -523,7 +524,7 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"43L={preview.image_43l}, 43R={preview.image_43r}, 50={preview.image_50}."
     )
     progress_message = await context.bot.send_message(
-        chat_id, _to_markdown_v2(GENERATING_TEXT), parse_mode=ParseMode.MARKDOWN_V2
+        chat_id, _to_markdown_v2(UPSCALING_TEXT), parse_mode=ParseMode.MARKDOWN_V2
     )
 
     await _run_and_deliver(
