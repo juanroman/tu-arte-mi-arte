@@ -7,6 +7,7 @@ from engine.generation import generate_image as generate_image_ai
 from engine.preview import compose_preview as compose_preview_ai
 from engine.split import load_split_config
 from engine.split import split_wide_image as split_wide_image_ai
+from engine.tv_deploy import deploy_set_to_43_panels as deploy_set_to_43_panels_ai
 
 
 def generate_image(theme: str, aspect_ratio: str = "1:1") -> dict:
@@ -164,6 +165,23 @@ def compose_preview(image_43l: str, image_43r: str, image_50: str) -> dict:
     return compose_preview_ai({"43L": image_43l, "43R": image_43r, "50": image_50})
 
 
+def deploy_to_43_panels(image_43l: str, image_43r: str) -> dict:
+    """Sube y muestra en las dos TVs de 43" (43L, 43R) las piezas finales
+    ya aprobadas en alta resolución (PRD §3.3).
+
+    Llámala automáticamente, sin que el usuario lo pida aparte, en el
+    momento en que tengas los image_id finales en 4K de AMBAS 43" — ya sea
+    por dos llamadas independientes a finalize_high_res en modo díptico, o
+    por una sola llamada con is_split_wide=True que ya da las dos de un
+    jalón. No la llames con el image_id de un panel cuyo finalize_high_res
+    todavía no haya tenido éxito, ni para el panel 50 (fuera de alcance por
+    ahora). Devuelve {'43L': {...}, '43R': {...}}; cada valor trae
+    'content_id' (éxito) o 'error' (esa TV en particular falló) — ambas
+    pantallas se intentan siempre, una no bloquea a la otra.
+    """
+    return deploy_set_to_43_panels_ai(image_43l=image_43l, image_43r=image_43r)
+
+
 root_agent = Agent(
     model="gemini-flash-latest",
     name="root_agent",
@@ -228,6 +246,20 @@ root_agent = Agent(
         "nada tú) y otra vez sobre el image_id de 50 con "
         "is_split_wide=False. Confirma al usuario los image_id finales de "
         "cada pieza.\n\n"
+        "ETAPA 4 — DESPLIEGUE (automático, sin que el usuario lo pida "
+        'aparte). En cuanto tengas los image_id finales en 4K de AMBAS 43" '
+        "(43L y 43R) —por dos llamadas de finalize_high_res en modo "
+        "díptico, o por una sola con is_split_wide=True que ya las da "
+        "juntas— llama deploy_to_43_panels con esos dos image_id en el "
+        "mismo turno. Si algún panel de 43L/43R falló en finalize_high_res, "
+        "resuelve ese fallo primero (reintento o pivote) y no llames "
+        "deploy_to_43_panels hasta tener ambos finales listos. El panel 50 "
+        "no se despliega automáticamente todavía (queda pendiente de carga "
+        "manual). Reporta el resultado por pantalla (p. ej. '43L subida y "
+        "mostrada', '43R: no se pudo conectar, queda pendiente de carga "
+        "manual') — una falla de deploy_to_43_panels es de red/TV, no de "
+        "generación o política, y nunca debe reportarse con el mismo "
+        "lenguaje que un rechazo o fallo de finalize_high_res.\n\n"
         "MANEJO DE ERRORES. Si una tool devuelve un dict con 'error': "
         "distingue por la clave 'policy_rejection'. Si "
         "'policy_rejection' es true (rechazo real de política o derechos, "
@@ -273,5 +305,6 @@ root_agent = Agent(
         generate_set_split,
         compose_preview,
         finalize_high_res,
+        deploy_to_43_panels,
     ],
 )

@@ -1,0 +1,4 @@
+# Matte fijo para el despliegue automático (PRD §7.6): "none" = arte a
+# sangre completa, sin marco de color. Un solo valor para las tres TVs,
+# no configurable por pantalla — si eso cambia, ampliar aquí.
+matte = "none"

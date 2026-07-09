@@ -282,3 +282,29 @@ def test_finalize_high_res_stops_if_split_fails(monkeypatch):
     result = agent.finalize_high_res("img_draft_wide", is_split_wide=True)
 
     assert "error" in result
+
+
+def test_root_agent_has_deploy_to_43_panels_tool():
+    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    assert "deploy_to_43_panels" in tool_names
+
+
+def test_deploy_to_43_panels_forwards_image_ids(monkeypatch):
+    captured = {}
+
+    def fake_deploy_set_to_43_panels_ai(image_43l, image_43r):
+        captured["image_43l"] = image_43l
+        captured["image_43r"] = image_43r
+        return {"43L": {"content_id": "MY_43L"}, "43R": {"content_id": "MY_43R"}}
+
+    monkeypatch.setattr(
+        agent, "deploy_set_to_43_panels_ai", fake_deploy_set_to_43_panels_ai
+    )
+
+    result = agent.deploy_to_43_panels("img_final_43l", "img_final_43r")
+
+    assert captured == {"image_43l": "img_final_43l", "image_43r": "img_final_43r"}
+    assert result == {
+        "43L": {"content_id": "MY_43L"},
+        "43R": {"content_id": "MY_43R"},
+    }
