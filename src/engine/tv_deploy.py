@@ -4,9 +4,11 @@ viejas para no llenar la memoria de la TV. Construido sobre el spike de
 3.1/3.2 (`scripts/spike_tv_write_path.py`), que ya validó `upload()`/
 `select_image()` contra las tres TVs reales sin diferencias de protocolo.
 
-Agnóstico de TV por diseño (funciona por nombre, "43L"/"43R"/"50"), aunque
-solo 43L/43R se invocan desde el flujo en vivo del agente por ahora — la 50
-es la iteración 3.4.
+Agnóstico de TV por diseño (funciona por nombre, "43L"/"43R"/"50") — el
+spike de 3.1 ya validó que la Frame 50 (protocolo legacy 2.03) no difiere
+de las 43" en upload()/select_image(), así que 3.4 se limitó a invocar
+este mismo camino también para la 50 desde el flujo en vivo del agente,
+sin código de manejo especial.
 
 No dependency on google.adk: this module is testable in isolation and
 reusable from any interface.
@@ -132,19 +134,21 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
         tv.close()
 
 
-def deploy_set_to_43_panels(image_43l: str, image_43r: str) -> dict:
-    """Despliega el conjunto aprobado a las dos TVs de 43" (PRD §3.3).
+def deploy_set_to_panels(image_43l: str, image_43r: str, image_50: str) -> dict:
+    """Despliega el conjunto aprobado a las tres TVs de la casa (PRD §3.3,
+    §3.4).
 
     A diferencia de generate_set_diptico/generate_set_split (que se
     detienen en el primer error porque son un pipeline secuencial de
-    generación), 43L y 43R son dos dispositivos físicos independientes:
-    la falla de uno nunca debe impedir que el otro reciba su arte. Ambos
-    despliegues se intentan siempre.
+    generación), las tres TVs son dispositivos físicos independientes:
+    la falla de una nunca debe impedir que las demás reciban su arte.
+    Los tres despliegues se intentan siempre.
 
-    Devuelve {'43L': {...}, '43R': {...}}, cada valor el resultado de
-    deploy_image_to_tv para esa pantalla.
+    Devuelve {'43L': {...}, '43R': {...}, '50': {...}}, cada valor el
+    resultado de deploy_image_to_tv para esa pantalla.
     """
     return {
         "43L": deploy_image_to_tv("43L", image_43l),
         "43R": deploy_image_to_tv("43R", image_43r),
+        "50": deploy_image_to_tv("50", image_50),
     }

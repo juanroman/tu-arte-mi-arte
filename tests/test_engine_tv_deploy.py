@@ -11,7 +11,7 @@ from engine import generation, tv_deploy
 from engine.tv_deploy import (
     TvDeployConfig,
     deploy_image_to_tv,
-    deploy_set_to_43_panels,
+    deploy_set_to_panels,
     load_tv_deploy_config,
 )
 from engine.tv_discovery import TvNotFoundError
@@ -260,7 +260,7 @@ def test_deploy_image_to_tv_uses_per_tv_token_file_path(tmp_path, monkeypatch):
     assert captured["token_file"] == str(tmp_path / "tv_43l_token.json")
 
 
-def test_deploy_set_to_43_panels_deploys_both_independently_on_success(monkeypatch):
+def test_deploy_set_to_panels_deploys_all_three_independently_on_success(monkeypatch):
     calls = []
 
     def _fake_deploy(tv_name, image_id):
@@ -269,26 +269,32 @@ def test_deploy_set_to_43_panels_deploys_both_independently_on_success(monkeypat
 
     monkeypatch.setattr(tv_deploy, "deploy_image_to_tv", _fake_deploy)
 
-    result = deploy_set_to_43_panels("img_left", "img_right")
+    result = deploy_set_to_panels("img_left", "img_right", "img_wide")
 
     assert result == {
         "43L": {"content_id": "MY_43L"},
         "43R": {"content_id": "MY_43R"},
+        "50": {"content_id": "MY_50"},
     }
-    assert calls == [("43L", "img_left"), ("43R", "img_right")]
+    assert calls == [
+        ("43L", "img_left"),
+        ("43R", "img_right"),
+        ("50", "img_wide"),
+    ]
 
 
-def test_deploy_set_to_43_panels_one_tv_failure_does_not_block_the_other(monkeypatch):
+def test_deploy_set_to_panels_one_tv_failure_does_not_block_the_others(monkeypatch):
     def _fake_deploy(tv_name, image_id):
-        if tv_name == "43L":
+        if tv_name == "50":
             return {"error": "no se pudo conectar"}
-        return {"content_id": "MY_43R"}
+        return {"content_id": f"MY_{tv_name}"}
 
     monkeypatch.setattr(tv_deploy, "deploy_image_to_tv", _fake_deploy)
 
-    result = deploy_set_to_43_panels("img_left", "img_right")
+    result = deploy_set_to_panels("img_left", "img_right", "img_wide")
 
-    assert "error" in result["43L"]
+    assert "error" in result["50"]
+    assert result["43L"] == {"content_id": "MY_43L"}
     assert result["43R"] == {"content_id": "MY_43R"}
 
 
