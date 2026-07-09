@@ -11,6 +11,7 @@ dependencies = [
     "pillow>=12.3.0",
     "python-telegram-bot~=22.8",
     "telegramify-markdown>=1.2.0",
+    "samsungtvws==3.0.5",
 ]
 
 [dependency-groups]

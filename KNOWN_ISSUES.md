@@ -45,3 +45,19 @@ Con estos tres casos (monocromo vs. pastel, alto contraste vs. pastel, saturado 
 **Posibles arreglos (sin decidir):** ninguno evaluado todavía; requiere más repros para saber si es consistente con ciertos sujetos/escenas o fue un caso aislado.
 
 **Estado:** sin resolver, v1 no bloqueada por esto — un solo caso observado, no confirmado como patrón.
+
+---
+
+## 3. Elección de matte (marco de color) sin decidir
+
+**Encontrado:** 2026-07-08, spike de write path (`docs/dev_plan.md` §3.1, `scripts/spike_tv_write_path.py`).
+
+**Qué pasa:** `samsungtvws` (`SamsungTVArt.upload()`) acepta `matte`/`portrait_matte` para elegir el marco de color que Art Mode dibuja alrededor de la pieza (también expone `get_matte_list()`/`change_matte()` para listar opciones y cambiarlo después de subir). El spike de 3.1 hardcodeó `matte="none", portrait_matte="none"` únicamente para tener una subida de prueba limpia — no es una decisión de producto, fue la opción más simple para validar que `upload()`/`select_image()` funcionan.
+
+**Por qué importa:** ni el PRD (§7.6 Despliegue a las TVs) ni `docs/dev_plan.md` tienen una iteración que decida qué matte usar por TV (o si debe ser configurable). Sin decisión, 3.3 (despliegue completo a las dos 43") heredaría el `"none"` del spike por inercia, no por elección.
+
+**Posibles arreglos (sin decidir):**
+- Definir un matte fijo por instalación (o "none") como parte de `config/room.toml` o un nuevo `config/tv.toml`, mismo patrón editable que el resto de la config de casa.
+- Exponerlo como parámetro configurable por TV si el usuario quiere distinto marco en 43L/43R vs. 50.
+
+**Estado:** sin resolver, v1 no bloqueada por esto — el default `"none"` del spike es un placeholder de prueba, no una decisión tomada. Retomar en 3.3.
