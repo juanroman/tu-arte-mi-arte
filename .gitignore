@@ -15,3 +15,5 @@ data/*.sqlite3-shm
 data/*.spike
 data/tv_*_token.json
 config/tvs.toml
+docs/prd.md
+docs/dev_plan.md
