@@ -1,5 +1,8 @@
 # tu-arte-mi-arte
 
+[![CI](https://github.com/juanroman/tu-arte-mi-arte/actions/workflows/ci.yml/badge.svg)](https://github.com/juanroman/tu-arte-mi-arte/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Direct, by conversation, the AI-generated art shown on three Samsung Frame TVs (two 43" verticals + one 50" horizontal) in a house — over Telegram, no manual exporting or uploading.
 
 Ask for a theme, get a coherent three-piece set generated with [Nano Banana 2](https://ai.google.dev) via the Gemini API, preview it composited over a real photo of the room, refine it conversationally, then confirm to deploy it straight to the TVs' Art Mode.
