@@ -7,10 +7,16 @@ import pytest
 
 from engine import tv_discovery
 from engine.tv_discovery import (
+    CONFIG_PATH,
     TvConfig,
     TvNotFoundError,
     load_tv_configs,
     resolve_tv_host,
+)
+
+requires_house_config = pytest.mark.skipif(
+    not CONFIG_PATH.exists(),
+    reason="config/tvs.toml no está versionado (datos reales de la casa)",
 )
 
 
@@ -25,6 +31,7 @@ def _write_config(path: Path) -> None:
     )
 
 
+@requires_house_config
 def test_load_tv_configs_reads_house_config():
     configs = load_tv_configs()
 
