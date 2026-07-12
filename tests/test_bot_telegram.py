@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,12 +12,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from google.adk.runners import Runner  # noqa: E402
 from google.adk.sessions import InMemorySessionService  # noqa: E402
 from google.genai import types  # noqa: E402
+from telegram import Chat, Message, MessageEntity, Update, User  # noqa: E402
 from telegram.ext import (  # noqa: E402
     CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
 )
-from telegram.ext import filters as tg_filters  # noqa: E402
 
 from bot import (  # noqa: E402
     preview_store,
@@ -396,7 +397,52 @@ def test_no_text_at_all_falls_back_to_a_non_empty_message():
 def test_non_text_messages_are_excluded_by_the_registered_filter():
     app = build_application("123:fake-token-for-tests", [111])
     generic_handler = app.handlers[1][0]
-    assert isinstance(generic_handler.filters.and_filter, type(tg_filters.TEXT))
+    assert generic_handler.filters.check_update(_make_text_update(111, "hola")) is True
+
+
+def _make_text_update(user_id, text, *, with_command_entity=False):
+    entities = (
+        [MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=len(text))]
+        if with_command_entity
+        else []
+    )
+    message = Message(
+        message_id=1,
+        date=datetime.datetime.now(datetime.UTC),
+        chat=Chat(id=user_id, type="private"),
+        text=text,
+        entities=entities,
+        from_user=User(id=user_id, is_bot=False, first_name="Test"),
+    )
+    return Update(update_id=1, message=message)
+
+
+def test_generic_handler_does_not_match_reset_command():
+    """Regression test (2026-07-12): `/nuevo` was falling through to the
+    generic handle_message handler alongside reset_handler, because
+    filters.TEXT accepts command messages too and PTB evaluates handler
+    groups independently — a match in group 0 never stopped group 1 from
+    also matching. This burned a real Gemini call and polluted a
+    freshly-reset session with an unwanted turn, found in manual testing
+    of dev_plan §3.7."""
+    app = build_application("123:fake-token-for-tests", [111])
+    generic_handler = app.handlers[1][0]
+    update = _make_text_update(111, "/nuevo", with_command_entity=True)
+    assert generic_handler.filters.check_update(update) is False
+
+
+def test_generic_handler_does_not_match_revert_command():
+    app = build_application("123:fake-token-for-tests", [111])
+    generic_handler = app.handlers[1][0]
+    update = _make_text_update(111, "/revertir", with_command_entity=True)
+    assert generic_handler.filters.check_update(update) is False
+
+
+def test_generic_handler_does_not_match_reset_button_text():
+    app = build_application("123:fake-token-for-tests", [111])
+    generic_handler = app.handlers[1][0]
+    update = _make_text_update(111, RESET_BUTTON_TEXT)
+    assert generic_handler.filters.check_update(update) is False
 
 
 def test_exception_in_run_async_propagates():

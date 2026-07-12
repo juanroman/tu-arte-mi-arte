@@ -745,11 +745,18 @@ def build_application(token: str, allowed_user_ids: list[int]) -> Application:
     whitelist (§7.1): unauthorized messages never reach any callback, so
     they get no reply at all.
 
-    Reset (command `/nuevo` and the persistent button) and the confirm
-    inline button are registered in group 0, the generic text handler in
-    group 1 — PTB evaluates groups independently, stopping at the first
-    match per group, so the button's literal text never falls through to
-    the generic handler without needing to manually exclude it there.
+    Reset (command `/nuevo` and the persistent button), `/revertir`, and
+    the confirm inline button are registered in group 0, the generic text
+    handler in group 1. PTB evaluates every group independently per
+    update — a match in group 0 does NOT stop group 1 from also matching
+    and firing (`Application.process_update` only stops later groups on
+    `ApplicationHandlerStop`). `filters.TEXT` explicitly accepts command
+    messages too (PTB's own docs), so without an exclusion, `/nuevo` and
+    `/revertir` were falling through to `handle_message` as if their
+    literal text were a theme — a real bug found in manual testing
+    (2026-07-12) that burned a Gemini call and polluted a freshly-reset
+    session. The generic handler's filter excludes `filters.COMMAND` and
+    the reset button's own text to prevent this double-fire.
     `CallbackQueryHandler` has no `filters=` parameter, so the whitelist
     check for the confirm button happens manually inside `confirm_handler`
     against `allowed_user_ids` stashed in `bot_data`.
@@ -786,8 +793,14 @@ def build_application(token: str, allowed_user_ids: list[int]) -> Application:
         CallbackQueryHandler(confirm_handler, pattern=f"^{CONFIRM_CALLBACK_PREFIX}"),
         group=0,
     )
+    not_a_reset_command = tg_filters.TEXT & ~tg_filters.COMMAND
+    not_the_reset_button = ~tg_filters.Text([RESET_BUTTON_TEXT])
     application.add_handler(
-        MessageHandler(whitelist & tg_filters.TEXT, handle_message), group=1
+        MessageHandler(
+            whitelist & (not_a_reset_command & not_the_reset_button),
+            handle_message,
+        ),
+        group=1,
     )
     return application
 
