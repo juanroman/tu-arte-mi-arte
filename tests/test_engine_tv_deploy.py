@@ -169,6 +169,29 @@ def test_deploy_image_to_tv_reports_connection_failure_on_open(tmp_path, monkeyp
     assert fake.closed is True
 
 
+def test_deploy_image_to_tv_logs_warning_on_connection_failure(
+    tmp_path, monkeypatch, caplog
+):
+    """A deploy failure must not just come back as an error dict — it
+    should also leave a WARNING in journalctl, since the returned dict is
+    only visible to whoever handles the tool call, not to someone reading
+    logs remotely.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    _install_fake(
+        monkeypatch, tmp_path, open_error=exceptions.ConnectionFailure("no conecta")
+    )
+
+    with caplog.at_level(logging.WARNING, logger="engine.tv_deploy"):
+        result = deploy_image_to_tv("43L", "img_0001")
+
+    assert "error" in result
+    assert any(
+        record.levelno == logging.WARNING and "43L" in record.message
+        for record in caplog.records
+    )
+
+
 def test_deploy_image_to_tv_reports_unsupported_tv(tmp_path, monkeypatch):
     _write_fixture_image(tmp_path, "img_0001")
     fake = _install_fake(monkeypatch, tmp_path, supported=False)
@@ -331,6 +354,28 @@ def test_deploy_image_to_tv_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
 
     assert "error" in result
     assert "no respondió" in result["error"]
+
+
+def test_deploy_image_to_tv_logs_error_when_watchdog_times_out(
+    tmp_path, monkeypatch, caplog
+):
+    """The deploy watchdog (§ docs/matte_investigation.md) is the symptom
+    of a TV possibly left in an inconsistent state — it must log at ERROR
+    (not just return an error dict), since this is exactly the kind of
+    hang someone away from home would need journalctl to explain.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=0.2)
+
+    with caplog.at_level(logging.ERROR, logger="engine.tv_deploy"):
+        result = deploy_image_to_tv("43L", "img_0001")
+
+    assert "error" in result
+    assert any(
+        record.levelno == logging.ERROR and "43L" in record.message
+        for record in caplog.records
+    )
 
 
 def test_deploy_set_to_panels_deploys_all_three_independently_on_success(monkeypatch):
