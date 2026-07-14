@@ -114,7 +114,7 @@ def _browse_mdns(timeout: float) -> list[str]:
     try:
         listener = _CollectNames()
         ServiceBrowser(zc, MDNS_SERVICE_TYPE, listener)
-        time.sleep(min(2.5, timeout))
+        time.sleep(timeout)
     finally:
         zc.close()
 

@@ -103,3 +103,33 @@ def test_resolve_tv_host_raises_for_unknown_tv_name(tmp_path):
 
     with pytest.raises(TvNotFoundError):
         resolve_tv_host("does-not-exist", path=config_path)
+
+
+def test_browse_mdns_listens_for_the_full_timeout_budget(monkeypatch):
+    """resolve_tv_host passes its whole timeout budget down expecting
+    _browse_mdns to spend it listening for mDNS announcements — a TV that's
+    slow to announce itself (e.g. just woken up) needs that full window.
+    _browse_mdns silently discarded most of it by hardcoding
+    `min(2.5, timeout)`, so a caller asking for timeout=5.0 only ever got
+    2.5s of real listening time (confirmed live 2026-07-13: the 50" TV
+    intermittently failed discovery under exactly this kind of timing
+    pressure). Assert the full budget is actually used, not silently capped.
+    """
+    monkeypatch.setattr(tv_discovery, "Zeroconf", lambda: _FakeZeroconf())
+    monkeypatch.setattr(
+        tv_discovery, "ServiceBrowser", lambda zc, service_type, listener: None
+    )
+
+    slept = {}
+    monkeypatch.setattr(
+        tv_discovery.time, "sleep", lambda seconds: slept.setdefault("seconds", seconds)
+    )
+
+    tv_discovery._browse_mdns(timeout=5.0)
+
+    assert slept["seconds"] == 5.0
+
+
+class _FakeZeroconf:
+    def close(self):
+        pass
