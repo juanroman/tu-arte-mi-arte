@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A system that lets you direct, by conversation, the AI-generated art shown on three Samsung Frame TVs (two 43" verticals + one 50" horizontal) in a house. Full spec lives in `docs/prd.md`; the iteration-by-iteration build plan (what's done, what's next, and why) lives in `docs/dev_plan.md` — **read `docs/dev_plan.md` before starting new work** to see current status and avoid re-doing decisions already made. Both are local-only (gitignored, not part of the public repo) — they exist on disk here but won't be present in a fresh clone. `KNOWN_ISSUES.md` tracks real defects found in manual testing that aren't blocking but need a product decision later.
 
-**This is a personal project, not FINDEP enterprise work.** If your global/user-level CLAUDE.md carries FINDEP enterprise rules (mandatory planning workflow, `feature/WI-[ID]` branches, Work Item commit references, PR-only delivery, Azure DevOps integration, etc.), none of that applies here — this repo's conventions override those for any work done in this directory. Commit directly to `main`, no feature-branch/PR workflow, no Work Item IDs in commit messages, no Azure DevOps.
+## Workflow
+
+Branch off `main` as `feature/description` or `fix/description`, push the branch, and open a GitHub PR — CI (lint, format, types, audit, tests) runs on every PR. Never push directly to `main`. No Work Item IDs or other ticket references in commit messages.
 
 ## Commands
 
