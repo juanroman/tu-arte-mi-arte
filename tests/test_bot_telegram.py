@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,8 +37,10 @@ from bot.telegram_bot import (  # noqa: E402
     _to_markdown_v2,
     build_application,
     confirm_handler,
+    global_error_handler,
     handle_message,
     load_allowed_user_ids,
+    load_log_level,
     load_session_timeout_seconds,
     reset_handler,
     revert_button_handler,
@@ -83,6 +86,23 @@ def test_load_session_timeout_seconds_defaults_when_missing():
 
 def test_load_session_timeout_seconds_defaults_when_invalid():
     assert load_session_timeout_seconds("not-a-number") == DEFAULT_TIMEOUT
+
+
+def test_load_log_level_parses_known_levels_case_insensitive():
+    assert load_log_level("DEBUG") == logging.DEBUG
+    assert load_log_level("info") == logging.INFO
+    assert load_log_level("Warning") == logging.WARNING
+    assert load_log_level("ERROR") == logging.ERROR
+
+
+def test_load_log_level_defaults_to_info_when_missing():
+    assert load_log_level(None) == logging.INFO
+    assert load_log_level("") == logging.INFO
+    assert load_log_level("   ") == logging.INFO
+
+
+def test_load_log_level_defaults_to_info_when_invalid():
+    assert load_log_level("not-a-level") == logging.INFO
 
 
 def test_to_markdown_v2_escapes_underscores_in_image_ids():
@@ -479,7 +499,7 @@ def test_handle_message_edits_placeholder_to_error_on_exception():
     assert args[0] == _to_markdown_v2(GENERIC_ERROR_TEXT)
 
 
-def test_delivery_crash_edits_placeholder_to_error_instead_of_hanging():
+def test_delivery_crash_edits_placeholder_to_error_instead_of_hanging(caplog):
     """A crash while delivering the result (album/photo, not the agent run
     itself) must not leave the '🎨 Generando…' placeholder stuck forever —
     same failure mode the keyboard-attachment bug caused in 2.4, here
@@ -500,12 +520,23 @@ def test_delivery_crash_edits_placeholder_to_error_instead_of_hanging():
     update, context = _make_update_and_context(runner, session_service, chat_id=42)
     context.bot.send_media_group.side_effect = RuntimeError("telegram API hiccup")
 
-    with pytest.raises(RuntimeError, match="telegram API hiccup"):
-        asyncio.run(handle_message(update, context))
+    with caplog.at_level(logging.ERROR, logger="bot.telegram_bot"):
+        with pytest.raises(RuntimeError, match="telegram API hiccup"):
+            asyncio.run(handle_message(update, context))
 
     _final_reply(update).assert_awaited_once()
     args, _ = _final_reply(update).call_args
     assert args[0] == _to_markdown_v2(GENERIC_ERROR_TEXT)
+    assert any("Turno falló" in record.message for record in caplog.records)
+
+
+def test_global_error_handler_logs_unhandled_exception(caplog):
+    context = SimpleNamespace(error=RuntimeError("boom outside _run_and_deliver"))
+
+    with caplog.at_level(logging.ERROR, logger="bot.telegram_bot"):
+        asyncio.run(global_error_handler(None, context))
+
+    assert any("Excepción no manejada" in record.message for record in caplog.records)
 
 
 def test_handle_message_sends_generating_placeholder_then_edits_with_final_text():

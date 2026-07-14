@@ -27,6 +27,7 @@ creativas.
 
 import asyncio
 import contextlib
+import logging
 import os
 import sys
 import time
@@ -62,9 +63,25 @@ from bot import preview_store, session_store
 from engine import tv_deploy
 from engine.generation import IMAGES_DIR
 
+_logger = logging.getLogger(__name__)
+
 APP_NAME = "tu_arte_mi_arte"
 RESET_BUTTON_TEXT = "🔄 Empezar de cero"
 DEFAULT_SESSION_TIMEOUT_SECONDS = 10800  # 3h, sugerido por PRD §7.2
+DEFAULT_LOG_LEVEL = logging.INFO
+_LOG_LEVEL_NAMES = {"DEBUG", "INFO", "WARNING", "ERROR"}
+# Librerías de terceros son muy verbosas a INFO/DEBUG (cada request HTTP,
+# cada evento interno de PTB/ADK) — se fijan a WARNING sin importar
+# LOG_LEVEL, para que subir la verbosidad propia no ahogue el log en ruido
+# ajeno.
+_QUIET_THIRD_PARTY_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "google_genai",
+    "google.adk",
+    "telegram",
+    "apscheduler",
+)
 
 GENERATING_TEXT = "🎨 Generando…"
 UPSCALING_TEXT = "🔼 Generando en 4K y subiendo a las pantallas…"
@@ -116,6 +133,37 @@ def load_session_timeout_seconds(raw: str | None) -> int:
         return int(raw.strip())
     except ValueError:
         return DEFAULT_SESSION_TIMEOUT_SECONDS
+
+
+def load_log_level(raw: str | None) -> int:
+    """Parses LOG_LEVEL ("DEBUG"/"INFO"/"WARNING"/"ERROR", case-insensitive),
+    falling back to INFO when unset or invalid — mismo patrón de default
+    seguro que load_session_timeout_seconds. DEBUG habilita detalle
+    completo (prompts crudos, resolución mDNS candidato por candidato) para
+    troubleshooting activo; el default INFO da una narrativa legible sin
+    texto libre del usuario (§ diseño de logging, dev_plan §3.7).
+    """
+    if not raw or not raw.strip():
+        return DEFAULT_LOG_LEVEL
+    name = raw.strip().upper()
+    if name not in _LOG_LEVEL_NAMES:
+        return DEFAULT_LOG_LEVEL
+    return logging.getLevelNamesMapping()[name]
+
+
+def configure_logging(level: int) -> None:
+    """Configura el logging raíz para que llegue a journalctl vía
+    StandardOutput=journal (docs/DEPLOY.md) — sin esto, INFO/DEBUG nunca
+    salen del proceso porque el logger raíz por default está en WARNING sin
+    handler. Silencia librerías de terceros a WARNING para que subir a
+    DEBUG amplifique nuestro propio código, no el ruido de httpx/PTB/ADK.
+    """
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    for logger_name in _QUIET_THIRD_PARTY_LOGGERS:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def build_session_service() -> DatabaseSessionService:
@@ -459,16 +507,19 @@ async def _run_and_deliver(
         )
         await _deliver_turn_result(bot, chat_id, session_id, progress_message, events)
     except Exception:
+        _logger.exception("Turno falló para chat_id=%s", chat_id)
         await progress_message.edit_text(  # type: ignore[attr-defined]
             _to_markdown_v2(GENERIC_ERROR_TEXT), parse_mode=ParseMode.MARKDOWN_V2
         )
         raise
 
     if _finalize_high_res_all_succeeded(events):
-        await rotate_session(session_service, chat_id)
+        await rotate_session(session_service, chat_id, reason="aprobacion_exitosa")
 
 
-async def rotate_session(session_service: DatabaseSessionService, chat_id: int) -> str:
+async def rotate_session(
+    session_service: DatabaseSessionService, chat_id: int, reason: str = "manual"
+) -> str:
     """Creates a fresh ADK session for `chat_id` and makes it the current
     one in the store. Returns the new session_id.
     """
@@ -478,6 +529,12 @@ async def rotate_session(session_service: DatabaseSessionService, chat_id: int) 
         app_name=APP_NAME, user_id=user_id, session_id=new_id
     )
     session_store.set_current_session(chat_id, new_id, time.time())
+    _logger.info(
+        "Sesión rotada: chat_id=%s reason=%s new_session_id=%s",
+        chat_id,
+        reason,
+        new_id,
+    )
     return new_id
 
 
@@ -496,18 +553,26 @@ async def get_or_rotate_session(
     now = time.time()
 
     if current is None:
-        session_id = await rotate_session(session_service, chat_id)
+        session_id = await rotate_session(session_service, chat_id, reason="sin_sesion")
         return session_id, False
 
     if now - current.last_activity > timeout_seconds:
-        session_id = await rotate_session(session_service, chat_id)
+        session_id = await rotate_session(session_service, chat_id, reason="timeout")
         return session_id, True
 
     session = await session_service.get_session(
         app_name=APP_NAME, user_id=user_id, session_id=current.session_id
     )
     if session is None:
-        session_id = await rotate_session(session_service, chat_id)
+        _logger.warning(
+            "Puntero de sesión desincronizado con el store de ADK: "
+            "chat_id=%s session_id=%s",
+            chat_id,
+            current.session_id,
+        )
+        session_id = await rotate_session(
+            session_service, chat_id, reason="desincronizada"
+        )
         return session_id, False
 
     session_store.set_current_session(chat_id, current.session_id, now)
@@ -529,6 +594,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     session_id, expired = await get_or_rotate_session(
         session_service, chat_id, timeout_seconds
     )
+    _logger.info(
+        "Mensaje recibido: chat_id=%s len=%d session_id=%s expired=%s",
+        chat_id,
+        len(update.message.text),
+        session_id,
+        expired,
+    )
+    _logger.debug("Texto del mensaje: chat_id=%s text=%r", chat_id, update.message.text)
     if expired:
         await update.message.reply_text(
             _to_markdown_v2(
@@ -587,6 +660,7 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     token = query.data[len(CONFIRM_CALLBACK_PREFIX) :]
     preview = preview_store.get_preview(token)
     if preview is None:
+        _logger.info("Confirmar: token desconocido chat_id=%s token=%s", chat_id, token)
         await context.bot.send_message(
             chat_id,
             _to_markdown_v2(UNKNOWN_PREVIEW_TEXT),
@@ -602,6 +676,14 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         session_service, chat_id, timeout_seconds
     )
     if expired or session_id != preview.session_id:
+        _logger.info(
+            "Confirmar: preview obsoleto chat_id=%s expired=%s "
+            "session_id=%s preview_session_id=%s",
+            chat_id,
+            expired,
+            session_id,
+            preview.session_id,
+        )
         await context.bot.send_message(
             chat_id,
             _to_markdown_v2(STALE_PREVIEW_TEXT),
@@ -641,6 +723,17 @@ def _format_revert_report(results: dict) -> str:
     return "\n".join(lines)
 
 
+def _log_revert_results(tv_names: list[str], results: dict) -> None:
+    succeeded = [name for name in tv_names if "error" not in results.get(name, {})]
+    failed = [name for name in tv_names if "error" in results.get(name, {})]
+    _logger.info(
+        "Revert solicitado: tv_names=%s succeeded=%s failed=%s",
+        tv_names,
+        succeeded,
+        failed,
+    )
+
+
 async def revert_command_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -671,6 +764,7 @@ async def revert_command_handler(
         tv_names = [requested]
 
     results = tv_deploy.revert_panels(tv_names)
+    _log_revert_results(tv_names, results)
     await update.message.reply_text(
         _to_markdown_v2(_format_revert_report(results)),
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -716,11 +810,25 @@ async def revert_button_handler(
         return
 
     results = tv_deploy.revert_panels(tv_names)
+    _log_revert_results(tv_names, results)
     await context.bot.send_message(
         chat_id,
         _to_markdown_v2(_format_revert_report(results)),
         parse_mode=ParseMode.MARKDOWN_V2,
     )
+
+
+async def global_error_handler(
+    _update: object, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Red de seguridad final de PTB (§2.5): cualquier excepción que escape
+    de un handler *fuera* del try/except propio de `_run_and_deliver` (p.
+    ej. en `confirm_handler`/`revert_button_handler` antes de llegar ahí)
+    llegaría aquí sin dejar rastro alguno en journalctl si no se registra
+    explícitamente — PTB por si solo la traga en su propio logger interno,
+    que nunca se configuró con basicConfig.
+    """
+    _logger.error("Excepción no manejada en un handler de PTB", exc_info=context.error)
 
 
 async def reset_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -802,11 +910,13 @@ def build_application(token: str, allowed_user_ids: list[int]) -> Application:
         ),
         group=1,
     )
+    application.add_error_handler(global_error_handler)
     return application
 
 
 def main() -> None:
     load_dotenv()
+    configure_logging(load_log_level(os.environ.get("LOG_LEVEL")))
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -820,6 +930,17 @@ def main() -> None:
             "TELEGRAM_ALLOWED_USER_IDS está vacía: el bot no respondería a "
             "nadie (revisa tu .env)."
         )
+
+    timeout_seconds = load_session_timeout_seconds(
+        os.environ.get("SESSION_INACTIVITY_TIMEOUT_SECONDS")
+    )
+    _logger.info(
+        "Arrancando bot: allowed_users=%d session_timeout_seconds=%d " "log_level=%s",
+        len(allowed_user_ids),
+        timeout_seconds,
+        logging.getLevelName(_logger.getEffectiveLevel()),
+    )
+    _logger.debug("Allowed user ids: %s", allowed_user_ids)
 
     application = build_application(token, allowed_user_ids)
     application.run_polling()

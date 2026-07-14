@@ -16,6 +16,7 @@ No dependency on google.adk: this module is testable in isolation and
 reusable from any interface.
 """
 
+import logging
 import socket
 import time
 import tomllib
@@ -24,6 +25,8 @@ from pathlib import Path
 
 import requests
 from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+
+_logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "tvs.toml"
 MDNS_SERVICE_TYPE = "_samsungmsf._tcp.local."
@@ -143,13 +146,33 @@ def resolve_tv_host(name: str, path: Path | None = None, timeout: float = 5.0) -
     config = configs[name]
 
     if config.last_known_ip and _mac_at(config.last_known_ip, timeout) == config.mac:
+        _logger.debug(
+            "Resolución rápida (caché) para %s: ip=%s", name, config.last_known_ip
+        )
         return config.last_known_ip
 
+    _logger.info(
+        "Caché de IP inválida/ausente para %s (ip=%s), cayendo a mDNS",
+        name,
+        config.last_known_ip,
+    )
     for candidate_ip in _browse_mdns(timeout):
         if _mac_at(candidate_ip, timeout) == config.mac:
+            _logger.info(
+                "TV %s confirmada por mDNS en ip=%s (antes: %s), config actualizada",
+                name,
+                candidate_ip,
+                config.last_known_ip,
+            )
             _save_last_known_ip(name, candidate_ip, path)
             return candidate_ip
 
+    _logger.error(
+        "No se pudo alcanzar la TV %s (mac=%s) ni por su última IP conocida "
+        "ni por mDNS",
+        name,
+        config.mac,
+    )
     raise TvNotFoundError(
         f"No se pudo alcanzar la TV {name!r} (mac={config.mac}) ni por su "
         f"última IP conocida ni por mDNS."

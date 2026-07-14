@@ -4,6 +4,7 @@ No dependency on google.adk: these functions are testable in isolation and
 reusable from any interface (adk web today, Telegram in Etapa 2).
 """
 
+import logging
 import uuid
 from pathlib import Path
 
@@ -11,7 +12,11 @@ import httpx
 from google import genai
 from google.genai import errors, types
 
+_logger = logging.getLogger(__name__)
+
 IMAGES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "images"
+
+_MODEL_NAME = "gemini-3.1-flash-image"
 
 # Reintentos silenciosos (§7.9) para fallas transitorias reales (rate limit,
 # 5xx). El backoff exponencial lo maneja el propio SDK.
@@ -74,10 +79,18 @@ def _save_response_image(response: types.GenerateContentResponse) -> dict:
         error: dict = {"error": "El modelo bloqueó la solicitud antes de generar."}
         if block_reason in _POLICY_BLOCK_REASONS:
             error["policy_rejection"] = True
+        _logger.warning(
+            "Respuesta sin candidates: block_reason=%s policy_rejection=%s",
+            block_reason,
+            error.get("policy_rejection", False),
+        )
         return error
 
     candidate = response.candidates[0]
     if candidate.finish_reason in _POLICY_FINISH_REASONS:
+        _logger.warning(
+            "Rechazo de política: finish_reason=%s", candidate.finish_reason
+        )
         return {
             "error": "El modelo rechazó la solicitud (política o derechos).",
             "policy_rejection": True,
@@ -86,15 +99,25 @@ def _save_response_image(response: types.GenerateContentResponse) -> dict:
     content = candidate.content
     parts = content.parts if content else None
     if not parts:
+        _logger.error(
+            "Respuesta sin partes de contenido (finish_reason=%s)",
+            candidate.finish_reason,
+        )
         return {"error": "El modelo no devolvió contenido."}
 
     part = parts[0]
     if not part.inline_data or not part.inline_data.data:
+        _logger.error(
+            "Respuesta sin inline_data de imagen (finish_reason=%s)",
+            candidate.finish_reason,
+        )
         return {"error": "El modelo no devolvió una imagen."}
 
-    return _save_image_bytes(
+    result = _save_image_bytes(
         part.inline_data.data, part.inline_data.mime_type or "image/jpeg"
     )
+    _logger.debug("Imagen guardada: image_id=%s", result["image_id"])
+    return result
 
 
 def _load_reference(image_id: str) -> types.Part | dict:
@@ -103,6 +126,7 @@ def _load_reference(image_id: str) -> types.Part | dict:
     """
     reference_path = IMAGES_DIR / f"{image_id}.jpg"
     if not reference_path.exists():
+        _logger.warning("Referencia no encontrada: image_id=%s", image_id)
         return {"error": f"No existe una imagen con image_id={image_id!r}."}
     return types.Part.from_bytes(
         data=reference_path.read_bytes(), mime_type="image/jpeg"
@@ -117,18 +141,28 @@ def _call_model(contents, image_config: types.ImageConfig) -> dict:
     que persiste tras los reintentos del SDK, nunca debe propagarse cruda,
     siempre vuelve como {'error': ...}.
     """
+    _logger.debug(
+        "Llamando al modelo: model=%s aspect_ratio=%s image_size=%s",
+        _MODEL_NAME,
+        image_config.aspect_ratio,
+        image_config.image_size,
+    )
     client = genai.Client(http_options=_RETRY_HTTP_OPTIONS)
     try:
         response = client.models.generate_content(
-            model="gemini-3.1-flash-image",
+            model=_MODEL_NAME,
             contents=contents,
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"], image_config=image_config
             ),
         )
     except (errors.ClientError, errors.ServerError) as e:
+        _logger.warning(
+            "Fallo al llamar al modelo (tras reintentos): %s", e.message or e
+        )
         return {"error": f"Fallo al llamar al modelo: {e.message or e}"}
     except httpx.RequestError as e:
+        _logger.warning("Fallo de red al llamar al modelo (tras reintentos): %s", e)
         return {"error": f"Fallo de red al llamar al modelo: {e}"}
     return _save_response_image(response)
 

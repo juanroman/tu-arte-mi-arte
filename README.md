@@ -44,6 +44,7 @@ GEMINI_API_KEY=...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_ALLOWED_USER_IDS=...          # comma-separated Telegram user IDs allowed to use the bot
 SESSION_INACTIVITY_TIMEOUT_SECONDS=... # optional; how long an idle conversation stays alive
+LOG_LEVEL=...                          # optional; DEBUG/INFO/WARNING/ERROR, defaults to INFO
 ```
 
 **3. (Optional) Configure your TVs**
@@ -68,7 +69,7 @@ uv run adk web src/agents
 uv run python -m bot.telegram_bot
 ```
 
-See [`docs/DEPLOY.md`](docs/DEPLOY.md) for running the bot as an always-on systemd service on a Raspberry Pi.
+See [`docs/DEPLOY.md`](docs/DEPLOY.md) for running the bot as an always-on systemd service on a Raspberry Pi, including how to raise `LOG_LEVEL` to `DEBUG` for troubleshooting via `journalctl`.
 
 ## Running tests
 

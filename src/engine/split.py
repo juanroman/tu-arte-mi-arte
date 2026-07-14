@@ -6,6 +6,7 @@ reusable from any interface.
 """
 
 import io
+import logging
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,8 @@ from PIL import Image
 
 from engine import generation
 from engine.generation import _save_image_bytes
+
+_logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "split.toml"
 
@@ -49,6 +52,7 @@ def split_wide_image(image_id: str, gap_fraction: float) -> dict:
     """
     source_path = generation.IMAGES_DIR / f"{image_id}.jpg"
     if not source_path.exists():
+        _logger.warning("Imagen fuente no encontrada para split: image_id=%s", image_id)
         return {"error": f"No existe una imagen con image_id={image_id!r}."}
 
     with Image.open(source_path) as source:
