@@ -1,4 +1,10 @@
-# Matte fijo para el despliegue automático (PRD §7.6): "none" = arte a
-# sangre completa, sin marco de color. Un solo valor para las tres TVs,
-# no configurable por pantalla — si eso cambia, ampliar aquí.
-matte = "none"
+# Matte por TV para el despliegue automático (PRD §7.6). Decidido en vivo
+# 2026-07-13 (docs/matte_investigation.md): "shadowbox_warm" en las tres
+# TVs, confirmado dos veces contra hardware real. Estructura per-TV (no un
+# solo valor para la casa) para poder diferenciar 43L/43R vs. 50 si algún
+# día se quiere — hoy comparten valor por elección, no por límite del
+# formato.
+[matte]
+"43L" = "shadowbox_warm"
+"43R" = "shadowbox_warm"
+"50" = "shadowbox_warm"

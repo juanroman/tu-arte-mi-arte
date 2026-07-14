@@ -21,6 +21,7 @@ reusable from any interface.
 """
 
 import logging
+import threading
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,17 +54,29 @@ _CONNECTION_ERRORS = (
 
 _logger = logging.getLogger(__name__)
 
+# SamsungTVArt defaults to no timeout at all, so an unresponsive TV would
+# block deploy_image_to_tv forever. _TV_TIMEOUT_SECONDS bounds each
+# individual recv(); _DEPLOY_DEADLINE_SECONDS is an additional wall-clock
+# cap on the whole open+upload+select+cleanup sequence, because the
+# library's own _wait_for_d2d loop can keep spinning past the per-call
+# timeout if the TV emits frames that never match our request (confirmed
+# live 2026-07-13 against the 50" TV — see docs/matte_investigation.md and
+# upstream samsung-tv-ws-api issue #106). Module-level so tests can shrink
+# them instead of waiting the real deadline.
+_TV_TIMEOUT_SECONDS = 15
+_DEPLOY_DEADLINE_SECONDS = 30
+
 
 @dataclass
 class TvDeployConfig:
-    matte: str
+    matte: dict[str, str]
 
 
 def load_tv_deploy_config(path: Path | None = None) -> TvDeployConfig:
-    """Reads the fixed house matte setting from an editable TOML file."""
+    """Reads the per-TV matte setting from an editable TOML file."""
     with (path or CONFIG_PATH).open("rb") as f:
         data = tomllib.load(f)
-    return TvDeployConfig(**data)
+    return TvDeployConfig(matte=data["matte"])
 
 
 def _delete_old_uploads(tv: SamsungTVArt, keep_content_id: str, tv_name: str) -> None:
@@ -90,6 +103,12 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
     'Mis Fotos' (PRD §7.6). Nunca borra antes de que la subida nueva haya
     tenido éxito, para que una falla a medias nunca deje la TV sin arte.
 
+    Corre bajo un watchdog de reloj (_DEPLOY_DEADLINE_SECONDS): la propia
+    librería samsungtvws puede quedarse esperando una respuesta
+    indefinidamente incluso con timeout= puesto (bug upstream, ver
+    docs/matte_investigation.md) — sin este tope, una TV que no responde
+    colgaría este llamado para siempre.
+
     Devuelve {'content_id': ...} o {'error': '<mensaje>'} — nunca lanza.
     """
     image_path = generation.IMAGES_DIR / f"{image_id}.jpg"
@@ -102,43 +121,99 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
         return {"error": str(error)}
 
     config = load_tv_deploy_config()
-    token_file = DATA_DIR / f"tv_{tv_name.lower()}_token.json"
-    tv = SamsungTVArt(host=host, token_file=str(token_file))
-
     try:
-        try:
-            tv.open()
-        except _CONNECTION_ERRORS as error:
-            return {"error": f"No se pudo conectar con la TV {tv_name!r}: {error}"}
+        matte = config.matte[tv_name]
+    except KeyError:
+        return {"error": f"No hay matte configurado para la TV {tv_name!r}."}
 
-        if not tv.supported():
-            return {"error": f"La TV {tv_name!r} no soporta Art Mode."}
+    token_file = DATA_DIR / f"tv_{tv_name.lower()}_token.json"
+    tv = SamsungTVArt(
+        host=host, token_file=str(token_file), timeout=_TV_TIMEOUT_SECONDS
+    )
 
-        try:
-            content_id = tv.upload(
-                str(image_path), matte=config.matte, portrait_matte=config.matte
-            )
-        except (*_CONNECTION_ERRORS, OSError, ValueError) as error:
-            return {"error": f"Falló la subida a la TV {tv_name!r}: {error}"}
+    outcome: dict = {}
 
+    def work() -> None:
         try:
-            tv.select_image(content_id, show=True)
-        except _CONNECTION_ERRORS as error:
-            return {
-                "error": (
-                    f"La imagen subió pero no se pudo mostrar en "
-                    f"{tv_name!r}: {error}"
+            try:
+                tv.open()
+            except _CONNECTION_ERRORS as error:
+                outcome["result"] = {
+                    "error": f"No se pudo conectar con la TV {tv_name!r}: {error}"
+                }
+                return
+
+            if not tv.supported():
+                outcome["result"] = {"error": f"La TV {tv_name!r} no soporta Art Mode."}
+                return
+
+            try:
+                content_id = tv.upload(
+                    str(image_path), matte=matte, portrait_matte=matte
                 )
-            }
+            except (*_CONNECTION_ERRORS, OSError, ValueError) as error:
+                outcome["result"] = {
+                    "error": f"Falló la subida a la TV {tv_name!r}: {error}"
+                }
+                return
 
-        _delete_old_uploads(tv, keep_content_id=content_id, tv_name=tv_name)
-        deploy_history.record_deploy(tv_name, image_id)
-        return {"content_id": content_id}
-    except Exception as error:  # red de seguridad: corre sin supervisión
-        _logger.exception("Fallo inesperado desplegando a %s", tv_name)
-        return {"error": f"Fallo inesperado desplegando a la TV {tv_name!r}: {error}"}
-    finally:
-        tv.close()
+            try:
+                tv.select_image(content_id, show=True)
+            except _CONNECTION_ERRORS as error:
+                outcome["result"] = {
+                    "error": (
+                        f"La imagen subió pero no se pudo mostrar en "
+                        f"{tv_name!r}: {error}"
+                    )
+                }
+                return
+
+            _delete_old_uploads(tv, keep_content_id=content_id, tv_name=tv_name)
+            deploy_history.record_deploy(tv_name, image_id)
+            outcome["result"] = {"content_id": content_id}
+        except Exception as error:  # red de seguridad: corre sin supervisión
+            _logger.exception("Fallo inesperado desplegando a %s", tv_name)
+            outcome["result"] = {
+                "error": f"Fallo inesperado desplegando a la TV {tv_name!r}: {error}"
+            }
+        finally:
+            try:
+                tv.close()
+            except Exception as error:
+                _logger.debug("Cierre de conexión falló para %s: %s", tv_name, error)
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(_DEPLOY_DEADLINE_SECONDS)
+
+    if worker.is_alive():
+        # Bloqueado dentro de recv() (bug upstream, ver
+        # docs/matte_investigation.md): forzar el cierre del socket crudo
+        # desde afuera es la única forma de destrabarlo.
+        sock = getattr(getattr(tv, "connection", None), "sock", None)
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        worker.join(5)
+        _logger.warning(
+            "Sin respuesta de la TV %s tras %ss, conexión forzada a cerrar",
+            tv_name,
+            _DEPLOY_DEADLINE_SECONDS,
+        )
+        return {
+            "error": (
+                f"La TV {tv_name!r} no respondió a tiempo "
+                f"({_DEPLOY_DEADLINE_SECONDS}s); puede haber quedado en un "
+                f"estado inconsistente."
+            )
+        }
+
+    return outcome.get(
+        "result",
+        {"error": f"Fallo inesperado desplegando a la TV {tv_name!r} (sin resultado)."},
+    )
 
 
 def deploy_set_to_panels(image_43l: str, image_43r: str, image_50: str) -> dict:
