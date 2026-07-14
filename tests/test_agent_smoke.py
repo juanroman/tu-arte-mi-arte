@@ -14,6 +14,32 @@ def test_root_agent_is_well_formed():
     assert agent.root_agent.instruction
 
 
+def test_root_agent_instruction_macro_archetype_uses_verbose_camera_language():
+    """KNOWN_ISSUES.md #2: bare 'macro/detalle' keyword phrasing didn't
+    reliably get the model to produce tight macro shots. Guards that the
+    macro archetype entry keeps verbose lens/perspective language instead
+    of regressing to the old bare-keyword form, without constraining the
+    other archetype entries or the 'guía, no lista cerrada' framing.
+    """
+    instruction = agent.root_agent.instruction
+
+    assert "macro/detalle (" in instruction
+    assert "lente" in instruction
+    assert "macro/detalle, plano general" not in instruction
+
+    # the other archetypes and the "guide, not closed list" framing must
+    # be untouched by this change.
+    assert "como guía (no como lista cerrada)" in instruction
+    assert "plano general abierto/paisaje" in instruction
+    assert "figura humana en la escena" in instruction
+    assert "silueta" in instruction
+    assert "textura/abstracto en close-up" in instruction
+    assert "aéreo/elevado" in instruction
+    assert "reflejo/agua" in instruction
+    assert "líneas que guían la mirada" in instruction
+    assert "luz dorada/contraluz" in instruction
+
+
 def test_root_agent_has_generar_imagen_tool():
     tool_names = {tool.__name__ for tool in agent.root_agent.tools}
     assert "generate_image" in tool_names
