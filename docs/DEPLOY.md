@@ -37,9 +37,12 @@ GEMINI_API_KEY=...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_ALLOWED_USER_IDS=...
 SESSION_INACTIVITY_TIMEOUT_SECONDS=...
+LOG_LEVEL=...
 ```
 
 `TELEGRAM_ALLOWED_USER_IDS` es la lista blanca (§7.1/§9 del PRD) — sin esto el bot rehúsa arrancar (`main()` hace `sys.exit` si falta o viene vacía).
+
+`LOG_LEVEL` controla la verbosidad de todo el bot (`DEBUG`/`INFO`/`WARNING`/`ERROR`, default `INFO` si se deja vacío o con un valor inválido). `INFO` da una narrativa legible en `journalctl` (mensajes recibidos, tools llamadas, despliegues, rotación de sesión) sin texto libre del usuario; `DEBUG` agrega el contenido completo de temas/escenas/correcciones y detalle de llamadas al modelo/mDNS — solo para troubleshooting activo, ya que deja las conversaciones del usuario en texto plano en el log del sistema.
 
 ## 3. Datos persistentes
 
@@ -98,6 +101,8 @@ systemctl status spotify-sync.timer
 ```
 
 Mandar un mensaje al bot desde Telegram y confirmar respuesta.
+
+Para subir la verbosidad al troubleshootear un problema remoto: editar `LOG_LEVEL=DEBUG` en `.env` y `sudo systemctl restart tu-arte-mi-arte.service` — no hay forma de cambiarlo sin reiniciar. Regresar a `LOG_LEVEL=INFO` (o dejarlo vacío) y reiniciar de nuevo una vez resuelto, ya que `DEBUG` deja el texto completo de los pedidos del usuario en `journalctl`.
 
 ## 6. Actualizaciones futuras
 

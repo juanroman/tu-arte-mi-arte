@@ -111,6 +111,8 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
 
     Devuelve {'content_id': ...} o {'error': '<mensaje>'} — nunca lanza.
     """
+    _logger.info("Desplegando a %s: image_id=%s", tv_name, image_id)
+
     image_path = generation.IMAGES_DIR / f"{image_id}.jpg"
     if not image_path.exists():
         return {"error": f"No existe una imagen con image_id={image_id!r}."}
@@ -118,6 +120,7 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
     try:
         host = resolve_tv_host(tv_name)
     except TvNotFoundError as error:
+        _logger.error("No se pudo resolver la TV %s: %s", tv_name, error)
         return {"error": str(error)}
 
     config = load_tv_deploy_config()
@@ -138,12 +141,14 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
             try:
                 tv.open()
             except _CONNECTION_ERRORS as error:
+                _logger.warning("No se pudo conectar con la TV %s: %s", tv_name, error)
                 outcome["result"] = {
                     "error": f"No se pudo conectar con la TV {tv_name!r}: {error}"
                 }
                 return
 
             if not tv.supported():
+                _logger.warning("La TV %s no soporta Art Mode", tv_name)
                 outcome["result"] = {"error": f"La TV {tv_name!r} no soporta Art Mode."}
                 return
 
@@ -152,6 +157,7 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
                     str(image_path), matte=matte, portrait_matte=matte
                 )
             except (*_CONNECTION_ERRORS, OSError, ValueError) as error:
+                _logger.warning("Falló la subida a la TV %s: %s", tv_name, error)
                 outcome["result"] = {
                     "error": f"Falló la subida a la TV {tv_name!r}: {error}"
                 }
@@ -160,6 +166,11 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
             try:
                 tv.select_image(content_id, show=True)
             except _CONNECTION_ERRORS as error:
+                _logger.warning(
+                    "La imagen subió pero no se pudo mostrar en %s: %s",
+                    tv_name,
+                    error,
+                )
                 outcome["result"] = {
                     "error": (
                         f"La imagen subió pero no se pudo mostrar en "
@@ -170,6 +181,12 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
 
             _delete_old_uploads(tv, keep_content_id=content_id, tv_name=tv_name)
             deploy_history.record_deploy(tv_name, image_id)
+            _logger.info(
+                "Desplegado con éxito en %s: image_id=%s content_id=%s",
+                tv_name,
+                image_id,
+                content_id,
+            )
             outcome["result"] = {"content_id": content_id}
         except Exception as error:  # red de seguridad: corre sin supervisión
             _logger.exception("Fallo inesperado desplegando a %s", tv_name)
@@ -197,7 +214,7 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
             except OSError:
                 pass
         worker.join(5)
-        _logger.warning(
+        _logger.error(
             "Sin respuesta de la TV %s tras %ss, conexión forzada a cerrar",
             tv_name,
             _DEPLOY_DEADLINE_SECONDS,
@@ -229,11 +246,17 @@ def deploy_set_to_panels(image_43l: str, image_43r: str, image_50: str) -> dict:
     Devuelve {'43L': {...}, '43R': {...}, '50': {...}}, cada valor el
     resultado de deploy_image_to_tv para esa pantalla.
     """
-    return {
+    results = {
         "43L": deploy_image_to_tv("43L", image_43l),
         "43R": deploy_image_to_tv("43R", image_43r),
         "50": deploy_image_to_tv("50", image_50),
     }
+    summary = {
+        tv_name: ("error" if "error" in result else "ok")
+        for tv_name, result in results.items()
+    }
+    _logger.info("Despliegue de conjunto completo: %s", summary)
+    return results
 
 
 def revert_tv(tv_name: str) -> dict:
@@ -251,6 +274,7 @@ def revert_tv(tv_name: str) -> dict:
     """
     history = deploy_history.get_history(tv_name)
     if history is None or history.previous_image_id is None:
+        _logger.info("Revert sin historial previo para %s", tv_name)
         return {
             "error": f"No hay una versión anterior guardada para la TV {tv_name!r}."
         }

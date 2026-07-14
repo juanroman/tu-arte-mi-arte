@@ -6,6 +6,7 @@ reusable from any interface.
 """
 
 import io
+import logging
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,8 @@ from PIL import Image
 
 from engine import generation
 from engine.generation import _save_image_bytes
+
+_logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "room.toml"
 REFERENCE_PHOTO_PATH = (
@@ -73,6 +76,7 @@ def compose_preview(image_ids: dict[str, str]) -> dict:
     panel images doesn't exist on disk.
     """
     if not REFERENCE_PHOTO_PATH.exists():
+        _logger.error("Foto de referencia no encontrada: %s", REFERENCE_PHOTO_PATH)
         return {
             "error": (
                 "No existe la foto de referencia de la sala en "
@@ -89,10 +93,16 @@ def compose_preview(image_ids: dict[str, str]) -> dict:
     for panel_name, image_id in image_ids.items():
         rect = room_config.panels.get(panel_name)
         if rect is None:
+            _logger.warning("Panel desconocido en config/room.toml: %s", panel_name)
             return {"error": f"Panel desconocido en config/room.toml: {panel_name!r}."}
 
         panel_path = generation.IMAGES_DIR / f"{image_id}.jpg"
         if not panel_path.exists():
+            _logger.warning(
+                "Imagen de panel no encontrada: panel=%s image_id=%s",
+                panel_name,
+                image_id,
+            )
             return {"error": f"No existe una imagen con image_id={image_id!r}."}
 
         box = (

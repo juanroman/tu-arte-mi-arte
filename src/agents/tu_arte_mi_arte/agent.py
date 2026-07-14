@@ -1,3 +1,5 @@
+import logging
+
 from google.adk.agents.llm_agent import Agent
 
 from engine.art_direction import build_prompt, load_art_direction
@@ -10,6 +12,39 @@ from engine.split import split_wide_image as split_wide_image_ai
 from engine.tv_deploy import deploy_set_to_panels as deploy_set_to_panels_ai
 from engine.tv_deploy import revert_tv as revert_tv_ai
 
+_logger = logging.getLogger(__name__)
+
+
+def _log_tool_result(tool_name: str, result: dict) -> None:
+    """Log de salida uniforme para tools de un solo resultado (dict plano
+    con 'error' o los campos de éxito): INFO con éxito/error (nunca el
+    texto libre del usuario, solo image_ids/errores), ya que esta es la
+    única visibilidad de "qué decidió llamar el LLM" que existe hoy en
+    journalctl (§ diseño de logging).
+    """
+    if "error" in result:
+        _logger.info("%s -> error: %s", tool_name, result["error"])
+    else:
+        _logger.info("%s -> ok: %s", tool_name, result)
+
+
+def _log_set_result(tool_name: str, results: dict) -> None:
+    """Log de salida para generate_set_diptico/generate_set_split: el dict
+    trae un resultado por panel (43L/43R/50/wide), cada uno con su propio
+    'error' posible — a diferencia de _log_tool_result, aquí no hay un
+    único 'error' de nivel superior que decida éxito/fallo global (salvo el
+    caso de split_wide_image_ai fallando, que sí agrega un 'error' de
+    nivel superior directo al dict).
+    """
+    summary = {
+        panel: ("error" if "error" in value else "ok")
+        for panel, value in results.items()
+        if isinstance(value, dict)
+    }
+    if "error" in results:
+        summary["error"] = results["error"]
+    _logger.info("%s -> %s", tool_name, summary)
+
 
 def generate_image(theme: str, aspect_ratio: str = "1:1") -> dict:
     """Genera una única imagen suelta con IA a partir de una descripción y la
@@ -20,9 +55,13 @@ def generate_image(theme: str, aspect_ratio: str = "1:1") -> dict:
     solo cuando el usuario pida explícitamente una sola pieza suelta o un
     panel específico; para un tema nuevo sin esa aclaración, usa generate_set.
     """
+    _logger.info("generate_image: aspect_ratio=%s", aspect_ratio)
+    _logger.debug("generate_image: theme=%r", theme)
     direction = load_art_direction()
     prompt = build_prompt(theme, direction)
-    return generate_image_ai(prompt=prompt, aspect_ratio=aspect_ratio)
+    result = generate_image_ai(prompt=prompt, aspect_ratio=aspect_ratio)
+    _log_tool_result("generate_image", result)
+    return result
 
 
 def refine_image(image_id: str, change: str) -> dict:
@@ -33,7 +72,11 @@ def refine_image(image_id: str, change: str) -> dict:
     describir qué cambia, y opcionalmente qué se conserva. La imagen resultante
     mantiene la composición pero aplica el ajuste pedido.
     """
-    return edit_image_ai(instruction=change, image_id=image_id)
+    _logger.info("refine_image: image_id=%s", image_id)
+    _logger.debug("refine_image: change=%r", change)
+    result = edit_image_ai(instruction=change, image_id=image_id)
+    _log_tool_result("refine_image", result)
+    return result
 
 
 def generate_set_diptico(scene_43l: str, scene_43r: str, scene_50: str) -> dict:
@@ -59,6 +102,13 @@ def generate_set_diptico(scene_43l: str, scene_43r: str, scene_50: str) -> dict:
     sueltas. Devuelve un dict con el resultado de cada panel; si algún paso
     falla, detiene la cadena y devuelve lo generado hasta ahí más el error.
     """
+    _logger.info("generate_set_diptico: iniciando conjunto de 3 paneles")
+    _logger.debug(
+        "generate_set_diptico: scene_43l=%r scene_43r=%r scene_50=%r",
+        scene_43l,
+        scene_43r,
+        scene_50,
+    )
     direction = load_art_direction()
 
     results: dict = {}
@@ -67,17 +117,20 @@ def generate_set_diptico(scene_43l: str, scene_43r: str, scene_50: str) -> dict:
         prompt=build_prompt(scene_43l, direction), aspect_ratio="9:16"
     )
     if "error" in results["43L"]:
+        _log_set_result("generate_set_diptico", results)
         return results
 
     results["43R"] = generate_image_ai(
         prompt=build_prompt(scene_43r, direction), aspect_ratio="9:16"
     )
     if "error" in results["43R"]:
+        _log_set_result("generate_set_diptico", results)
         return results
 
     results["50"] = generate_image_ai(
         prompt=build_prompt(scene_50, direction), aspect_ratio="16:9"
     )
+    _log_set_result("generate_set_diptico", results)
     return results
 
 
@@ -102,6 +155,8 @@ def generate_set_split(scene_wide: str, scene_50: str) -> dict:
     Devuelve un dict con 'wide', '43L', '43R' y '50'; si algún paso falla,
     detiene la cadena y devuelve lo generado hasta ahí más el error.
     """
+    _logger.info("generate_set_split: iniciando conjunto (wide + 50)")
+    _logger.debug("generate_set_split: scene_wide=%r scene_50=%r", scene_wide, scene_50)
     direction = load_art_direction()
     split_config = load_split_config()
 
@@ -112,6 +167,7 @@ def generate_set_split(scene_wide: str, scene_50: str) -> dict:
         aspect_ratio=split_config.wide_aspect_ratio,
     )
     if "error" in results["wide"]:
+        _log_set_result("generate_set_split", results)
         return results
 
     split_result = split_wide_image_ai(
@@ -119,6 +175,7 @@ def generate_set_split(scene_wide: str, scene_50: str) -> dict:
     )
     if "error" in split_result:
         results["error"] = split_result["error"]
+        _log_set_result("generate_set_split", results)
         return results
     results["43L"] = split_result["left"]
     results["43R"] = split_result["right"]
@@ -126,6 +183,7 @@ def generate_set_split(scene_wide: str, scene_50: str) -> dict:
     results["50"] = generate_image_ai(
         prompt=build_prompt(scene_50, direction), aspect_ratio="16:9"
     )
+    _log_set_result("generate_set_split", results)
     return results
 
 
@@ -144,15 +202,22 @@ def finalize_high_res(image_id: str, is_split_wide: bool = False) -> dict:
     is_split_wide=False (default) y pasa el image_id de ese panel
     individual.
     """
+    _logger.info(
+        "finalize_high_res: image_id=%s is_split_wide=%s", image_id, is_split_wide
+    )
     result = generate_final_high_res_ai(image_id)
     if "error" in result or not is_split_wide:
+        _log_tool_result("finalize_high_res", result)
         return result
 
     split_config = load_split_config()
     split_result = split_wide_image_ai(result["image_id"], split_config.gap_fraction)
     if "error" in split_result:
+        _log_tool_result("finalize_high_res", split_result)
         return split_result
-    return {"43L": split_result["left"], "43R": split_result["right"]}
+    final_result = {"43L": split_result["left"], "43R": split_result["right"]}
+    _log_set_result("finalize_high_res", final_result)
+    return final_result
 
 
 def compose_preview(image_43l: str, image_43r: str, image_50: str) -> dict:
@@ -163,7 +228,15 @@ def compose_preview(image_43l: str, image_43r: str, image_50: str) -> dict:
     pasando los image_id más recientes de cada panel. Muestra las tres
     pantallas juntas para poder juzgar el conjunto como un todo.
     """
-    return compose_preview_ai({"43L": image_43l, "43R": image_43r, "50": image_50})
+    _logger.info(
+        "compose_preview: image_43l=%s image_43r=%s image_50=%s",
+        image_43l,
+        image_43r,
+        image_50,
+    )
+    result = compose_preview_ai({"43L": image_43l, "43R": image_43r, "50": image_50})
+    _log_tool_result("compose_preview", result)
+    return result
 
 
 def deploy_to_panels(image_43l: str, image_43r: str, image_50: str) -> dict:
@@ -180,9 +253,17 @@ def deploy_to_panels(image_43l: str, image_43r: str, image_50: str) -> dict:
     'error' (esa TV en particular falló) — las tres pantallas se intentan
     siempre, una no bloquea a las demás.
     """
-    return deploy_set_to_panels_ai(
+    _logger.info(
+        "deploy_to_panels: image_43l=%s image_43r=%s image_50=%s",
+        image_43l,
+        image_43r,
+        image_50,
+    )
+    result = deploy_set_to_panels_ai(
         image_43l=image_43l, image_43r=image_43r, image_50=image_50
     )
+    _log_set_result("deploy_to_panels", result)
+    return result
 
 
 def revert_tv(tv_name: str) -> dict:
@@ -201,7 +282,10 @@ def revert_tv(tv_name: str) -> dict:
     más de una vez (no hay versión anterior que restaurar) o si falla la
     reconexión/subida.
     """
-    return revert_tv_ai(tv_name)
+    _logger.info("revert_tv: tv_name=%s", tv_name)
+    result = revert_tv_ai(tv_name)
+    _log_tool_result("revert_tv", result)
+    return result
 
 
 root_agent = Agent(
