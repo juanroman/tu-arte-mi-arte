@@ -1,5 +1,6 @@
 import logging
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -24,6 +25,7 @@ class _FakeSamsungTVArt:
         self,
         host,
         token_file=None,
+        timeout=None,
         open_error=None,
         supported=True,
         upload_error=None,
@@ -31,9 +33,11 @@ class _FakeSamsungTVArt:
         available_error=None,
         existing_content=None,
         content_id="MY_F0001",
+        hang_seconds=None,
     ):
         self.host = host
         self.token_file = token_file
+        self.timeout = timeout
         self._open_error = open_error
         self._supported = supported
         self._upload_error = upload_error
@@ -43,6 +47,7 @@ class _FakeSamsungTVArt:
             existing_content if existing_content is not None else []
         )
         self._content_id = content_id
+        self._hang_seconds = hang_seconds
 
         self.closed = False
         self.uploaded: list[tuple[str, str, str]] = []
@@ -60,6 +65,8 @@ class _FakeSamsungTVArt:
         return self._supported
 
     def upload(self, path, matte=None, portrait_matte=None):
+        if self._hang_seconds is not None:
+            time.sleep(self._hang_seconds)
         if self._upload_error is not None:
             raise self._upload_error
         self.uploaded.append((path, matte, portrait_matte))
@@ -265,6 +272,67 @@ def test_deploy_image_to_tv_uses_per_tv_token_file_path(tmp_path, monkeypatch):
     assert captured["token_file"] == str(tmp_path / "tv_43l_token.json")
 
 
+def test_deploy_image_to_tv_uses_the_matte_configured_for_that_tv(
+    tmp_path, monkeypatch
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    config_path = tmp_path / "tv_deploy.toml"
+    config_path.write_text(
+        '[matte]\n"43L" = "shadowbox_warm"\n"43R" = "modern_warm"\n'
+        '"50" = "flexible"\n'
+    )
+    monkeypatch.setattr(tv_deploy, "CONFIG_PATH", config_path)
+    fake = _install_fake(monkeypatch, tmp_path)
+
+    deploy_image_to_tv("50", "img_0001")
+
+    assert fake.uploaded[-1][1] == "flexible"
+    assert fake.uploaded[-1][2] == "flexible"
+
+
+def test_deploy_image_to_tv_reports_missing_matte_for_unknown_tv(tmp_path, monkeypatch):
+    _write_fixture_image(tmp_path, "img_0001")
+    config_path = tmp_path / "tv_deploy.toml"
+    config_path.write_text('[matte]\n"43L" = "shadowbox_warm"\n')
+    monkeypatch.setattr(tv_deploy, "CONFIG_PATH", config_path)
+    fake = _install_fake(monkeypatch, tmp_path)
+
+    result = deploy_image_to_tv("50", "img_0001")
+
+    assert "error" in result
+    assert fake.uploaded == []
+
+
+def test_deploy_image_to_tv_passes_timeout_to_samsungtvart(tmp_path, monkeypatch):
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+    monkeypatch.setattr(tv_deploy, "resolve_tv_host", lambda name: "10.0.0.1")
+    monkeypatch.setattr(tv_deploy, "DATA_DIR", tmp_path)
+
+    captured = {}
+
+    def _fake_factory(**kwargs):
+        captured.update(kwargs)
+        return _FakeSamsungTVArt(host=kwargs["host"])
+
+    monkeypatch.setattr(tv_deploy, "SamsungTVArt", _fake_factory)
+
+    deploy_image_to_tv("43L", "img_0001")
+
+    assert captured["timeout"] == tv_deploy._TV_TIMEOUT_SECONDS
+
+
+def test_deploy_image_to_tv_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=0.2)
+
+    result = deploy_image_to_tv("43L", "img_0001")
+
+    assert "error" in result
+    assert "no respondió" in result["error"]
+
+
 def test_deploy_set_to_panels_deploys_all_three_independently_on_success(monkeypatch):
     calls = []
 
@@ -306,16 +374,23 @@ def test_deploy_set_to_panels_one_tv_failure_does_not_block_the_others(monkeypat
 def test_load_tv_deploy_config_reads_house_config():
     config = load_tv_deploy_config()
 
-    assert config.matte
+    assert config.matte["43L"] == "shadowbox_warm"
+    assert config.matte["43R"] == "shadowbox_warm"
+    assert config.matte["50"] == "shadowbox_warm"
 
 
 def test_load_tv_deploy_config_reads_custom_path(tmp_path):
     config_path = tmp_path / "tv_deploy.toml"
-    config_path.write_text('matte = "shadowbox_polar"\n')
+    config_path.write_text(
+        '[matte]\n"43L" = "shadowbox_polar"\n"43R" = "shadowbox_polar"\n'
+        '"50" = "modern_warm"\n'
+    )
 
     config = load_tv_deploy_config(path=config_path)
 
-    assert config == TvDeployConfig(matte="shadowbox_polar")
+    assert config == TvDeployConfig(
+        matte={"43L": "shadowbox_polar", "43R": "shadowbox_polar", "50": "modern_warm"}
+    )
 
 
 def test_successful_deploy_records_history(tmp_path, monkeypatch):

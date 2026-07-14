@@ -56,8 +56,4 @@ Con estos tres casos (monocromo vs. pastel, alto contraste vs. pastel, saturado 
 
 **Por qué importa:** ni el PRD (§7.6 Despliegue a las TVs) ni `docs/dev_plan.md` tienen una iteración que decida qué matte usar por TV (o si debe ser configurable). Sin decisión, 3.3 (despliegue completo a las dos 43") heredaría el `"none"` del spike por inercia, no por elección.
 
-**Posibles arreglos (sin decidir):**
-- Definir un matte fijo por instalación (o "none") como parte de `config/room.toml` o un nuevo `config/tv.toml`, mismo patrón editable que el resto de la config de casa.
-- Exponerlo como parámetro configurable por TV si el usuario quiere distinto marco en 43L/43R vs. 50.
-
-**Estado:** sin resolver, v1 no bloqueada por esto — el default `"none"` del spike es un placeholder de prueba, no una decisión tomada. Retomar en 3.3.
+**Resuelto (2026-07-13):** decisión tomada en vivo contra las tres TVs reales — `matte = "shadowbox_warm"`, confirmado dos veces (ver `docs/matte_investigation.md` para la sesión completa, incluyendo el descubrimiento de que los ids de matte deben ser strings compuestos `style_color`, no el nombre de estilo suelto que devuelve `get_matte_list()`). Configurado por TV (no un solo valor de casa) en `[matte]` dentro de `config/tv_deploy.toml`, mismo patrón que `config/tvs.toml`/`config/room.toml` — las tres TVs comparten hoy el mismo valor por elección, no por limitación del formato. `deploy_image_to_tv` (`src/engine/tv_deploy.py`) también incorporó en el mismo cambio el timeout de conexión y el watchdog de reloj descritos en la sección "What's left for production" de `docs/matte_investigation.md`.
