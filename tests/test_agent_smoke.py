@@ -73,6 +73,23 @@ def test_root_agent_has_skill_toolset_for_batch_gallery():
     assert any(isinstance(tool, SkillToolset) for tool in agent.root_agent.tools)
 
 
+def test_root_agent_instruction_disambiguates_temporal_scope_before_concepto():
+    """Enmienda post-1.1 (docs/dev_plan_phase_2.md): una conversación real
+    (intención de "varios días" revelada gradualmente en 4 turnos, con una
+    respuesta ambigua tipo "mas bien un conjunto" en medio) mostró que
+    depender solo de la description de la skill no basta — root_agent debe
+    preguntar explícitamente el alcance temporal (hoy vs. varios días)
+    cuando no sea ya claro, antes de entrar a ETAPA 1 — CONCEPTO.
+    """
+    instruction = agent.root_agent.instruction
+
+    assert "ALCANCE TEMPORAL" in instruction
+    assert "más bien un conjunto" in instruction
+    assert instruction.index("ALCANCE TEMPORAL") < instruction.index(
+        "ETAPA 1 — CONCEPTO"
+    )
+
+
 def test_root_agent_instruction_and_default_tools_unchanged_by_batch_skill():
     """Requisito duro #10 (dev_plan_phase_2.md): registrar la skill de
     galería por lotes no debe cambiar el comportamiento por defecto de
