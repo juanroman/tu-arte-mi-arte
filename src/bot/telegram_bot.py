@@ -452,7 +452,7 @@ async def _deliver_turn_result(
         succeeded = _partially_failed_tvs(deploy_results)
         if succeeded:
             failed = [
-                tv_name
+                f"{tv_name} ({deploy_results[tv_name]['error']})"
                 for tv_name in KNOWN_TV_NAMES
                 if tv_name in deploy_results and "error" in deploy_results[tv_name]
             ]

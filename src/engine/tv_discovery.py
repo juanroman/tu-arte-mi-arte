@@ -31,6 +31,17 @@ _logger = logging.getLogger(__name__)
 CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "tvs.toml"
 MDNS_SERVICE_TYPE = "_samsungmsf._tcp.local."
 
+# 5.0s (the original default) proved too tight in a real deploy
+# (2026-07-14): the 50" TV's mDNS announcement simply hadn't landed by the
+# time _browse_mdns's listen window closed, so the browse came back empty
+# and TvNotFoundError fired even though the TV was on and reachable
+# moments later (confirmed by config/tvs.toml self-correcting to a fresh
+# IP for the 50 on a subsequent call). 12.0s gives real mDNS timing more
+# room without meaningfully slowing deploys — the three panels resolve
+# and deploy in parallel (deploy_set_to_panels), so a slower 50 never
+# blocks 43L/43R.
+DEFAULT_DISCOVERY_TIMEOUT_SECONDS = 12.0
+
 
 class TvNotFoundError(Exception):
     """No TV matching the configured MAC could be reached, neither at its
@@ -131,7 +142,11 @@ def _browse_mdns(timeout: float) -> list[str]:
     return ips
 
 
-def resolve_tv_host(name: str, path: Path | None = None, timeout: float = 5.0) -> str:
+def resolve_tv_host(
+    name: str,
+    path: Path | None = None,
+    timeout: float = DEFAULT_DISCOVERY_TIMEOUT_SECONDS,
+) -> str:
     """Returns a reachable IP for the TV `name` ("43L"/"43R"/"50"),
     confirmed live by matching its wifiMac against config/tvs.toml.
 

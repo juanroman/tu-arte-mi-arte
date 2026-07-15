@@ -68,6 +68,33 @@ def test_resolve_tv_host_uses_cached_ip_when_mac_matches(tmp_path, monkeypatch):
     assert resolve_tv_host("43L", path=config_path) == "10.0.0.1"
 
 
+def test_resolve_tv_host_uses_default_discovery_timeout_for_mdns_browse(
+    tmp_path, monkeypatch
+):
+    """A stale cache should fall back to mDNS with the module's full
+    DEFAULT_DISCOVERY_TIMEOUT_SECONDS window, not some other value —
+    regression for the real 2026-07-14 failure where a 5.0s window was too
+    tight for the 50" TV's mDNS announcement to land in time.
+    """
+    config_path = tmp_path / "tvs.toml"
+    _write_config(config_path)
+
+    monkeypatch.setattr(tv_discovery, "_mac_at", lambda ip, timeout: None)
+
+    seen_timeouts = []
+
+    def _browse_mdns(timeout):
+        seen_timeouts.append(timeout)
+        return []
+
+    monkeypatch.setattr(tv_discovery, "_browse_mdns", _browse_mdns)
+
+    with pytest.raises(TvNotFoundError):
+        resolve_tv_host("43L", path=config_path)
+
+    assert seen_timeouts == [tv_discovery.DEFAULT_DISCOVERY_TIMEOUT_SECONDS]
+
+
 def test_resolve_tv_host_falls_back_to_mdns_and_persists_new_ip(tmp_path, monkeypatch):
     config_path = tmp_path / "tvs.toml"
     _write_config(config_path)
