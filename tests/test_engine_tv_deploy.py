@@ -34,6 +34,7 @@ class _FakeSamsungTVArt:
         existing_content=None,
         content_id="MY_F0001",
         hang_seconds=None,
+        open_hang_seconds=None,
     ):
         self.host = host
         self.token_file = token_file
@@ -48,13 +49,20 @@ class _FakeSamsungTVArt:
         )
         self._content_id = content_id
         self._hang_seconds = hang_seconds
+        self._open_hang_seconds = open_hang_seconds
 
+        self.connection = None
         self.closed = False
         self.uploaded: list[tuple[str, str, str]] = []
         self.selected: list[str] = []
         self.deleted: list[str] = []
 
     def open(self):
+        if self._open_hang_seconds is not None:
+            # Mirrors samsungtvws's own handshake loop: self.connection is
+            # only assigned once the (possibly hanging) recv loop returns —
+            # never mid-hang.
+            time.sleep(self._open_hang_seconds)
         if self._open_error is not None:
             raise self._open_error
 
@@ -326,6 +334,44 @@ def test_deploy_image_to_tv_reports_missing_matte_for_unknown_tv(tmp_path, monke
     assert fake.uploaded == []
 
 
+def test_deploy_image_to_tv_returns_error_instead_of_raising_when_matte_table_missing(
+    tmp_path, monkeypatch
+):
+    """A tv_deploy.toml with no [matte] table at all (e.g. mid-edit, or a
+    merge conflict) must surface as {'error': ...}, not crash the caller —
+    deploy_image_to_tv's docstring promises it 'nunca lanza'.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    config_path = tmp_path / "tv_deploy.toml"
+    config_path.write_text("# sin sección [matte]\n")
+    monkeypatch.setattr(tv_deploy, "CONFIG_PATH", config_path)
+    fake = _install_fake(monkeypatch, tmp_path)
+
+    result = deploy_image_to_tv("43L", "img_0001")
+
+    assert "error" in result
+    assert fake.uploaded == []
+
+
+def test_deploy_image_to_tv_returns_error_instead_of_raising_for_legacy_matte_config(
+    tmp_path, monkeypatch
+):
+    """A tv_deploy.toml still in the old pre-per-TV format (a bare string,
+    not a table) must also surface as {'error': ...} instead of raising a
+    TypeError when indexed by tv_name.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    config_path = tmp_path / "tv_deploy.toml"
+    config_path.write_text('matte = "shadowbox_warm"\n')
+    monkeypatch.setattr(tv_deploy, "CONFIG_PATH", config_path)
+    fake = _install_fake(monkeypatch, tmp_path)
+
+    result = deploy_image_to_tv("43L", "img_0001")
+
+    assert "error" in result
+    assert fake.uploaded == []
+
+
 def test_deploy_image_to_tv_passes_timeout_to_samsungtvart(tmp_path, monkeypatch):
     _write_fixture_image(tmp_path, "img_0001")
     monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
@@ -348,6 +394,7 @@ def test_deploy_image_to_tv_passes_timeout_to_samsungtvart(tmp_path, monkeypatch
 def test_deploy_image_to_tv_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
     _write_fixture_image(tmp_path, "img_0001")
     monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.05)
     _install_fake(monkeypatch, tmp_path, hang_seconds=0.2)
 
     result = deploy_image_to_tv("43L", "img_0001")
@@ -366,6 +413,7 @@ def test_deploy_image_to_tv_logs_error_when_watchdog_times_out(
     """
     _write_fixture_image(tmp_path, "img_0001")
     monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.05)
     _install_fake(monkeypatch, tmp_path, hang_seconds=0.2)
 
     with caplog.at_level(logging.ERROR, logger="engine.tv_deploy"):
@@ -376,6 +424,97 @@ def test_deploy_image_to_tv_logs_error_when_watchdog_times_out(
         record.levelno == logging.ERROR and "43L" in record.message
         for record in caplog.records
     )
+
+
+def test_deploy_image_to_tv_returns_success_when_worker_finishes_during_grace_period(
+    tmp_path, monkeypatch
+):
+    """If the forced socket-close unblocks the worker before the grace
+    period (_FORCE_CLOSE_GRACE_SECONDS) elapses, and the worker actually
+    completed the deploy successfully, that success must not be discarded
+    in favor of the generic timeout error — a caller (e.g. the Telegram
+    bot's revert-button flow) must not be told a deploy failed when it
+    actually succeeded.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.3)
+    fake = _install_fake(monkeypatch, tmp_path, content_id="MY_late", hang_seconds=0.1)
+
+    result = deploy_image_to_tv("43L", "img_0001")
+
+    assert result == {"content_id": "MY_late"}
+    assert fake.selected == ["MY_late"]
+
+
+def test_deploy_image_to_tv_abandoned_worker_does_not_record_history_after_timeout(
+    tmp_path, monkeypatch
+):
+    """Once the watchdog gives up and reports a timeout, a worker that
+    later finishes in the background must not mutate shared state (deploy
+    history, cleanup) behind the caller's back — the caller has already
+    moved on and may have retried.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.05)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=0.3)
+
+    result = deploy_image_to_tv("43L", "img_0001")
+    assert "error" in result
+
+    time.sleep(0.35)
+
+    history = deploy_history.get_history(
+        "43L", path=tmp_path / "tv_deploy_history.sqlite3"
+    )
+    assert history is None
+
+
+def test_deploy_image_to_tv_logs_distinct_message_when_hang_precedes_connection(
+    tmp_path, monkeypatch, caplog
+):
+    """If the hang happens inside open()'s own handshake (before
+    tv.connection is ever assigned, mirroring samsungtvws's real
+    behavior), there is no socket to force-close — the log must say so
+    distinctly instead of claiming a connection was forced closed when
+    nothing was.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.05)
+    _install_fake(monkeypatch, tmp_path, open_hang_seconds=0.3)
+
+    with caplog.at_level(logging.ERROR, logger="engine.tv_deploy"):
+        result = deploy_image_to_tv("43L", "img_0001")
+
+    assert "error" in result
+    assert any(
+        record.levelno == logging.ERROR
+        and "43L" in record.message
+        and "forzada a cerrar" not in record.message
+        for record in caplog.records
+    )
+
+
+def test_deploy_image_to_tv_worst_case_wait_is_deadline_plus_grace_constant(
+    tmp_path, monkeypatch
+):
+    """The real worst-case block time is _DEPLOY_DEADLINE_SECONDS plus a
+    named, overridable _FORCE_CLOSE_GRACE_SECONDS constant, not a hidden
+    inline literal — a hang that exceeds their sum must still time out.
+    """
+    assert hasattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS")
+
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.05)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=0.15)
+
+    result = deploy_image_to_tv("43L", "img_0001")
+
+    assert "error" in result
+    assert "no respondió" in result["error"]
 
 
 def test_deploy_set_to_panels_deploys_all_three_independently_on_success(monkeypatch):
@@ -394,11 +533,15 @@ def test_deploy_set_to_panels_deploys_all_three_independently_on_success(monkeyp
         "43R": {"content_id": "MY_43R"},
         "50": {"content_id": "MY_50"},
     }
-    assert calls == [
-        ("43L", "img_left"),
-        ("43R", "img_right"),
-        ("50", "img_wide"),
-    ]
+    # No se garantiza el orden de finalización una vez que los tres
+    # despliegues corren concurrentemente — solo que los tres ocurrieron.
+    assert sorted(calls) == sorted(
+        [
+            ("43L", "img_left"),
+            ("43R", "img_right"),
+            ("50", "img_wide"),
+        ]
+    )
 
 
 def test_deploy_set_to_panels_one_tv_failure_does_not_block_the_others(monkeypatch):
@@ -414,6 +557,26 @@ def test_deploy_set_to_panels_one_tv_failure_does_not_block_the_others(monkeypat
     assert "error" in result["50"]
     assert result["43L"] == {"content_id": "MY_43L"}
     assert result["43R"] == {"content_id": "MY_43R"}
+
+
+def test_deploy_set_to_panels_runs_deploys_concurrently(monkeypatch):
+    """The three TVs are independent physical devices (per this function's
+    own docstring) — the three deploys must overlap, not run one after the
+    other, or a single unresponsive TV triples the worst-case latency of
+    the whole set.
+    """
+
+    def _fake_deploy(tv_name, image_id):
+        time.sleep(0.1)
+        return {"content_id": f"MY_{tv_name}"}
+
+    monkeypatch.setattr(tv_deploy, "deploy_image_to_tv", _fake_deploy)
+
+    start = time.monotonic()
+    deploy_set_to_panels("img_left", "img_right", "img_wide")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.2
 
 
 def test_load_tv_deploy_config_reads_house_config():

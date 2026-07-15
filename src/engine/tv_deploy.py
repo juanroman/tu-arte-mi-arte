@@ -20,6 +20,7 @@ No dependency on google.adk: this module is testable in isolation and
 reusable from any interface.
 """
 
+import concurrent.futures
 import logging
 import threading
 import tomllib
@@ -65,6 +66,13 @@ _logger = logging.getLogger(__name__)
 # them instead of waiting the real deadline.
 _TV_TIMEOUT_SECONDS = 15
 _DEPLOY_DEADLINE_SECONDS = 30
+
+# Extra wait after forcing the stuck socket closed, to give the worker
+# thread a chance to actually unblock and finish (successfully or not)
+# before giving up on it entirely. The real worst-case block time for
+# deploy_image_to_tv is _DEPLOY_DEADLINE_SECONDS + _FORCE_CLOSE_GRACE_SECONDS,
+# not just _DEPLOY_DEADLINE_SECONDS.
+_FORCE_CLOSE_GRACE_SECONDS = 5
 
 
 @dataclass
@@ -123,11 +131,15 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
         _logger.error("No se pudo resolver la TV %s: %s", tv_name, error)
         return {"error": str(error)}
 
-    config = load_tv_deploy_config()
     try:
+        config = load_tv_deploy_config()
         matte = config.matte[tv_name]
-    except KeyError:
-        return {"error": f"No hay matte configurado para la TV {tv_name!r}."}
+    except (KeyError, TypeError) as error:
+        return {
+            "error": (
+                f"Configuración de matte inválida para la TV {tv_name!r}: {error}"
+            )
+        }
 
     token_file = DATA_DIR / f"tv_{tv_name.lower()}_token.json"
     tv = SamsungTVArt(
@@ -135,6 +147,7 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
     )
 
     outcome: dict = {}
+    abandoned = threading.Event()
 
     def work() -> None:
         try:
@@ -179,6 +192,22 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
                 }
                 return
 
+            if abandoned.is_set():
+                # El watchdog ya reportó timeout y el caller siguió su
+                # curso (posiblemente reintentando) — mutar deploy_history
+                # o borrar subidas viejas ahora correría contra ese
+                # reintento en paralelo, así que este resultado tardío se
+                # descarta sin tocar estado compartido.
+                _logger.warning(
+                    "La TV %s terminó tarde, después del timeout del "
+                    "watchdog; se descarta el resultado sin registrar "
+                    "historial (image_id=%s content_id=%s)",
+                    tv_name,
+                    image_id,
+                    content_id,
+                )
+                return
+
             _delete_old_uploads(tv, keep_content_id=content_id, tv_name=tv_name)
             deploy_history.record_deploy(tv_name, image_id)
             _logger.info(
@@ -206,19 +235,50 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
     if worker.is_alive():
         # Bloqueado dentro de recv() (bug upstream, ver
         # docs/matte_investigation.md): forzar el cierre del socket crudo
-        # desde afuera es la única forma de destrabarlo.
+        # desde afuera es la única forma de destrabarlo. Si el hang ocurre
+        # durante el propio handshake de open() (antes de que
+        # samsungtvws asigne tv.connection), no hay socket que forzar —
+        # se distingue en el log para no reportar un cierre que nunca
+        # ocurrió.
         sock = getattr(getattr(tv, "connection", None), "sock", None)
+        forced_close = False
         if sock is not None:
+            forced_close = True
             try:
                 sock.close()
             except OSError:
                 pass
-        worker.join(5)
-        _logger.error(
-            "Sin respuesta de la TV %s tras %ss, conexión forzada a cerrar",
-            tv_name,
-            _DEPLOY_DEADLINE_SECONDS,
-        )
+        worker.join(_FORCE_CLOSE_GRACE_SECONDS)
+
+        if not worker.is_alive():
+            # El cierre forzado (o el propio trabajo) destrabó al worker
+            # dentro del período de gracia — si terminó con éxito, ese
+            # resultado real no debe descartarse a favor de un timeout
+            # genérico.
+            return outcome.get(
+                "result",
+                {
+                    "error": (
+                        f"Fallo inesperado desplegando a la TV {tv_name!r} "
+                        "(sin resultado)."
+                    )
+                },
+            )
+
+        abandoned.set()
+        if forced_close:
+            _logger.error(
+                "Sin respuesta de la TV %s tras %ss, conexión forzada a cerrar",
+                tv_name,
+                _DEPLOY_DEADLINE_SECONDS,
+            )
+        else:
+            _logger.error(
+                "Sin respuesta de la TV %s tras %ss; la conexión nunca "
+                "llegó a establecerse, no hay socket que forzar a cerrar",
+                tv_name,
+                _DEPLOY_DEADLINE_SECONDS,
+            )
         return {
             "error": (
                 f"La TV {tv_name!r} no respondió a tiempo "
@@ -244,13 +304,19 @@ def deploy_set_to_panels(image_43l: str, image_43r: str, image_50: str) -> dict:
     Los tres despliegues se intentan siempre.
 
     Devuelve {'43L': {...}, '43R': {...}, '50': {...}}, cada valor el
-    resultado de deploy_image_to_tv para esa pantalla.
+    resultado de deploy_image_to_tv para esa pantalla. Los tres despliegues
+    corren en paralelo (no secuencialmente) — cada uno ya tiene su propio
+    watchdog interno (_DEPLOY_DEADLINE_SECONDS), así que encadenarlos uno
+    tras otro solo multiplicaría por tres el peor caso de latencia sin
+    ninguna razón, dado que son dispositivos físicos independientes.
     """
-    results = {
-        "43L": deploy_image_to_tv("43L", image_43l),
-        "43R": deploy_image_to_tv("43R", image_43r),
-        "50": deploy_image_to_tv("50", image_50),
-    }
+    images = {"43L": image_43l, "43R": image_43r, "50": image_50}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(images)) as executor:
+        futures = {
+            tv_name: executor.submit(deploy_image_to_tv, tv_name, image_id)
+            for tv_name, image_id in images.items()
+        }
+        results = {tv_name: future.result() for tv_name, future in futures.items()}
     summary = {
         tv_name: ("error" if "error" in result else "ok")
         for tv_name, result in results.items()
