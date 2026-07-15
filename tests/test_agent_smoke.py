@@ -78,8 +78,10 @@ def test_root_agent_instruction_disambiguates_temporal_scope_before_concepto():
     (intención de "varios días" revelada gradualmente en 4 turnos, con una
     respuesta ambigua tipo "mas bien un conjunto" en medio) mostró que
     depender solo de la description de la skill no basta — root_agent debe
-    preguntar explícitamente el alcance temporal (hoy vs. varios días)
-    cuando no sea ya claro, antes de entrar a ETAPA 1 — CONCEPTO.
+    preguntar explícitamente el alcance temporal (fijo/permanente vs.
+    cambia cada día) cuando no sea ya claro, antes de entrar a ETAPA 1 —
+    CONCEPTO. Se evita el fraseo "hoy"/"ahora" para la opción fija porque
+    confunde plazo con permanencia.
     """
     instruction = agent.root_agent.instruction
 
