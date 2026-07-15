@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import logging
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -1159,6 +1160,45 @@ def test_revert_button_handler_ignores_unauthorized_user(monkeypatch):
 
     query.answer.assert_awaited_once()
     assert calls == []
+
+
+@pytest.mark.parametrize("handler_name", ["command", "button"])
+def test_revert_handlers_do_not_block_the_event_loop(monkeypatch, handler_name):
+    """revert_panels can block for up to ~35s per TV against an
+    unresponsive TV (tv_deploy's own watchdog deadline + grace period) —
+    calling it synchronously inside these async handlers would freeze the
+    bot's single event loop for every other concurrent chat during that
+    window. It must be offloaded to a thread.
+    """
+
+    def slow_revert_panels(tv_names):
+        time.sleep(0.2)
+        return {name: {"content_id": f"MY_{name}"} for name in tv_names}
+
+    monkeypatch.setattr(tv_deploy, "revert_panels", slow_revert_panels)
+
+    if handler_name == "command":
+        update, context = _make_command_update_and_context(chat_id=42)
+        coro = revert_command_handler(update, context)
+    else:
+        update, context, _query = _make_revert_callback_update_and_context(
+            chat_id=42, tv_names=["43L"]
+        )
+        coro = revert_button_handler(update, context)
+
+    start = time.monotonic()
+    first_tick_at = []
+
+    async def ticker():
+        await asyncio.sleep(0.01)
+        first_tick_at.append(time.monotonic() - start)
+
+    async def run_both():
+        await asyncio.gather(coro, ticker())
+
+    asyncio.run(run_both())
+
+    assert first_tick_at[0] < 0.1
 
 
 def test_revert_button_handler_ignores_malformed_callback_data(monkeypatch):

@@ -763,7 +763,7 @@ async def revert_command_handler(
             return
         tv_names = [requested]
 
-    results = tv_deploy.revert_panels(tv_names)
+    results = await asyncio.to_thread(tv_deploy.revert_panels, tv_names)
     _log_revert_results(tv_names, results)
     await update.message.reply_text(
         _to_markdown_v2(_format_revert_report(results)),
@@ -809,7 +809,7 @@ async def revert_button_handler(
     if not tv_names:
         return
 
-    results = tv_deploy.revert_panels(tv_names)
+    results = await asyncio.to_thread(tv_deploy.revert_panels, tv_names)
     _log_revert_results(tv_names, results)
     await context.bot.send_message(
         chat_id,
