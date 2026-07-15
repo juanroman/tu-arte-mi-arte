@@ -1064,6 +1064,9 @@ def test_partial_deploy_sends_warning_with_revert_button_for_succeeded_tvs():
     keyboard = kwargs["reply_markup"]
     button = keyboard.inline_keyboard[0][0]
     assert button.callback_data == f"{REVERT_CALLBACK_PREFIX}43L,50"
+    sent_text = args[1]
+    assert "43R" in sent_text
+    assert "no se pudo conectar" in sent_text
 
 
 def test_full_success_deploy_sends_no_revert_button():
