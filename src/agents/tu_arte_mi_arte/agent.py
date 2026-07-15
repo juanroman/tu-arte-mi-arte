@@ -1,6 +1,9 @@
 import logging
+from pathlib import Path
 
 from google.adk.agents.llm_agent import Agent
+from google.adk.skills import load_skill_from_dir
+from google.adk.tools.skill_toolset import SkillToolset
 
 from engine.art_direction import build_prompt, load_art_direction
 from engine.generation import edit_image as edit_image_ai
@@ -13,6 +16,9 @@ from engine.tv_deploy import deploy_set_to_panels as deploy_set_to_panels_ai
 from engine.tv_deploy import revert_tv as revert_tv_ai
 
 _logger = logging.getLogger(__name__)
+
+_GALERIA_POR_LOTES_SKILL_DIR = Path(__file__).parent / "skills" / "galeria-por-lotes"
+_galeria_por_lotes_skill = load_skill_from_dir(_GALERIA_POR_LOTES_SKILL_DIR)
 
 
 def _log_tool_result(tool_name: str, result: dict) -> None:
@@ -428,5 +434,6 @@ root_agent = Agent(
         finalize_high_res,
         deploy_to_panels,
         revert_tv,
+        SkillToolset(skills=[_galeria_por_lotes_skill]),
     ],
 )

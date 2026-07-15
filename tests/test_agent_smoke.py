@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "agents"))
 
 from google.adk.agents.llm_agent import Agent
+from google.adk.tools.skill_toolset import SkillToolset
 from tu_arte_mi_arte import agent
 
 
@@ -41,28 +42,57 @@ def test_root_agent_instruction_macro_archetype_uses_verbose_camera_language():
 
 
 def test_root_agent_has_generar_imagen_tool():
-    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
     assert "generate_image" in tool_names
 
 
 def test_root_agent_has_refine_image_tool():
-    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
     assert "refine_image" in tool_names
 
 
 def test_root_agent_has_generate_set_diptico_tool():
-    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
     assert "generate_set_diptico" in tool_names
 
 
 def test_root_agent_has_generate_set_split_tool():
-    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
     assert "generate_set_split" in tool_names
 
 
 def test_root_agent_has_compose_preview_tool():
-    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
     assert "compose_preview" in tool_names
+
+
+def test_root_agent_has_skill_toolset_for_batch_gallery():
+    """dev_plan_phase_2.md 1.1: la skill de galería por lotes se registra
+    como un SkillToolset, sin agregar tools de lote sueltas todavía.
+    """
+    assert any(isinstance(tool, SkillToolset) for tool in agent.root_agent.tools)
+
+
+def test_root_agent_instruction_and_default_tools_unchanged_by_batch_skill():
+    """Requisito duro #10 (dev_plan_phase_2.md): registrar la skill de
+    galería por lotes no debe cambiar el comportamiento por defecto de
+    root_agent fuera de ese caso de uso — mismo set de tools sueltas, misma
+    instrucción, solo se agrega el SkillToolset nuevo encima.
+    """
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
+    pre_existing_tool_names = {
+        "generate_image",
+        "refine_image",
+        "generate_set_diptico",
+        "generate_set_split",
+        "compose_preview",
+        "finalize_high_res",
+        "deploy_to_panels",
+        "revert_tv",
+    }
+    assert pre_existing_tool_names <= tool_names
+    assert "ETAPA 1 — CONCEPTO" in agent.root_agent.instruction
+    assert "ETAPA 4 — DESPLIEGUE" in agent.root_agent.instruction
 
 
 def test_generate_set_diptico_produces_the_three_house_panels(monkeypatch):
@@ -216,7 +246,7 @@ def test_compose_preview_forwards_the_three_panel_image_ids(monkeypatch):
 
 
 def test_root_agent_has_finalize_high_res_tool():
-    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
     assert "finalize_high_res" in tool_names
 
 
@@ -311,7 +341,7 @@ def test_finalize_high_res_stops_if_split_fails(monkeypatch):
 
 
 def test_root_agent_has_deploy_to_panels_tool():
-    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
     assert "deploy_to_panels" in tool_names
 
 
@@ -345,7 +375,7 @@ def test_deploy_to_panels_forwards_image_ids(monkeypatch):
 
 
 def test_root_agent_has_revert_tv_tool():
-    tool_names = {tool.__name__ for tool in agent.root_agent.tools}
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
     assert "revert_tv" in tool_names
 
 
