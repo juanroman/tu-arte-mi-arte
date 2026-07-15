@@ -393,9 +393,9 @@ def test_deploy_image_to_tv_passes_timeout_to_samsungtvart(tmp_path, monkeypatch
 
 def test_deploy_image_to_tv_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
     _write_fixture_image(tmp_path, "img_0001")
-    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
-    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.05)
-    _install_fake(monkeypatch, tmp_path, hang_seconds=0.2)
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=2)
 
     result = deploy_image_to_tv("43L", "img_0001")
 
@@ -412,9 +412,9 @@ def test_deploy_image_to_tv_logs_error_when_watchdog_times_out(
     hang someone away from home would need journalctl to explain.
     """
     _write_fixture_image(tmp_path, "img_0001")
-    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
-    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.05)
-    _install_fake(monkeypatch, tmp_path, hang_seconds=0.2)
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=2)
 
     with caplog.at_level(logging.ERROR, logger="engine.tv_deploy"):
         result = deploy_image_to_tv("43L", "img_0001")
@@ -437,9 +437,9 @@ def test_deploy_image_to_tv_returns_success_when_worker_finishes_during_grace_pe
     actually succeeded.
     """
     _write_fixture_image(tmp_path, "img_0001")
-    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
-    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.3)
-    fake = _install_fake(monkeypatch, tmp_path, content_id="MY_late", hang_seconds=0.1)
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 3)
+    fake = _install_fake(monkeypatch, tmp_path, content_id="MY_late", hang_seconds=0.3)
 
     result = deploy_image_to_tv("43L", "img_0001")
 
@@ -456,14 +456,14 @@ def test_deploy_image_to_tv_abandoned_worker_does_not_record_history_after_timeo
     moved on and may have retried.
     """
     _write_fixture_image(tmp_path, "img_0001")
-    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
-    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.05)
-    _install_fake(monkeypatch, tmp_path, hang_seconds=0.3)
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=2)
 
     result = deploy_image_to_tv("43L", "img_0001")
     assert "error" in result
 
-    time.sleep(0.35)
+    time.sleep(2.5)
 
     history = deploy_history.get_history(
         "43L", path=tmp_path / "tv_deploy_history.sqlite3"
@@ -481,9 +481,9 @@ def test_deploy_image_to_tv_logs_distinct_message_when_hang_precedes_connection(
     nothing was.
     """
     _write_fixture_image(tmp_path, "img_0001")
-    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
-    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.05)
-    _install_fake(monkeypatch, tmp_path, open_hang_seconds=0.3)
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, open_hang_seconds=2)
 
     with caplog.at_level(logging.ERROR, logger="engine.tv_deploy"):
         result = deploy_image_to_tv("43L", "img_0001")
@@ -507,9 +507,9 @@ def test_deploy_image_to_tv_worst_case_wait_is_deadline_plus_grace_constant(
     assert hasattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS")
 
     _write_fixture_image(tmp_path, "img_0001")
-    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.05)
-    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.05)
-    _install_fake(monkeypatch, tmp_path, hang_seconds=0.15)
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=2)
 
     result = deploy_image_to_tv("43L", "img_0001")
 
@@ -567,7 +567,7 @@ def test_deploy_set_to_panels_runs_deploys_concurrently(monkeypatch):
     """
 
     def _fake_deploy(tv_name, image_id):
-        time.sleep(0.1)
+        time.sleep(0.3)
         return {"content_id": f"MY_{tv_name}"}
 
     monkeypatch.setattr(tv_deploy, "deploy_image_to_tv", _fake_deploy)
@@ -576,7 +576,7 @@ def test_deploy_set_to_panels_runs_deploys_concurrently(monkeypatch):
     deploy_set_to_panels("img_left", "img_right", "img_wide")
     elapsed = time.monotonic() - start
 
-    assert elapsed < 0.2
+    assert elapsed < 0.6
 
 
 def test_load_tv_deploy_config_reads_house_config():
