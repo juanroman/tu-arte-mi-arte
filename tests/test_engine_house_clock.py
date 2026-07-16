@@ -37,7 +37,7 @@ def test_current_datetime_uses_the_configured_timezone():
     assert now.utcoffset() == datetime.now(ZoneInfo("America/Mexico_City")).utcoffset()
 
 
-def test_describe_now_renders_a_spanish_sentence_with_weekday_date_and_time(
+def test_describe_now_renders_a_spanish_sentence_with_weekday_and_date(
     monkeypatch,
 ):
     import engine.house_clock as house_clock
@@ -49,5 +49,30 @@ def test_describe_now_renders_a_spanish_sentence_with_weekday_date_and_time(
 
     assert "miércoles" in sentence
     assert "15 de julio de 2026" in sentence
-    assert "17:10" in sentence
     assert "America/Mexico_City" in sentence
+
+
+def test_describe_now_omits_time_of_day_to_keep_the_instruction_cache_stable(
+    monkeypatch,
+):
+    """describe_now feeds root_agent's InstructionProvider, re-evaluated on
+    every model call — a time-of-day component would change every minute
+    and break Gemini's context-cache prefix match on nearly every turn
+    (confirmed against a real session transcript: only 1 of 4 model calls
+    hit cache). Two calls a minute apart must render identically.
+    """
+    import engine.house_clock as house_clock
+
+    config = HouseClockConfig(timezone="America/Mexico_City")
+    first_minute = datetime(2026, 7, 15, 17, 10, tzinfo=ZoneInfo("America/Mexico_City"))
+    second_minute = datetime(
+        2026, 7, 15, 17, 11, tzinfo=ZoneInfo("America/Mexico_City")
+    )
+
+    monkeypatch.setattr(house_clock, "current_datetime", lambda config: first_minute)
+    first_sentence = describe_now(config)
+    monkeypatch.setattr(house_clock, "current_datetime", lambda config: second_minute)
+    second_sentence = describe_now(config)
+
+    assert first_sentence == second_sentence
+    assert ":" not in first_sentence

@@ -58,15 +58,24 @@ def current_datetime(config: HouseClockConfig) -> datetime:
 
 
 def describe_now(config: HouseClockConfig) -> str:
-    """Renders the current house date/time as a Spanish sentence, e.g.
-    'Hoy es miércoles 15 de julio de 2026, 17:10 (hora de
-    America/Mexico_City)' — for grounding relative-time phrases in
-    root_agent's instruction, not for display to the user verbatim.
+    """Renders the current house date as a Spanish sentence, e.g. 'Hoy es
+    miércoles 15 de julio de 2026 (hora de America/Mexico_City)' — for
+    grounding relative-time phrases in root_agent's instruction, not for
+    display to the user verbatim.
+
+    Date only, deliberately no time-of-day: every consumer of this string
+    (ALCANCE TEMPORAL, the batch skill's weekend/next-week resolution)
+    only ever needs day-level granularity, and root_agent's instruction is
+    an InstructionProvider re-evaluated on every model call — a `HH:MM`
+    component would flip this string (and invalidate Gemini's context
+    cache, which requires the system-instruction prefix to be
+    byte-identical) every single minute, causing a full-price cache miss
+    on nearly every turn instead of one per day.
     """
     now = current_datetime(config)
     weekday = _WEEKDAYS_ES[now.weekday()]
     month = _MONTHS_ES[now.month - 1]
     return (
-        f"Hoy es {weekday} {now.day} de {month} de {now.year}, "
-        f"{now.strftime('%H:%M')} (hora de {config.timezone})"
+        f"Hoy es {weekday} {now.day} de {month} de {now.year} "
+        f"(hora de {config.timezone})"
     )
