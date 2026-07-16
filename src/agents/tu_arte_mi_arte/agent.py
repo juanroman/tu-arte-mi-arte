@@ -195,6 +195,52 @@ def generate_set_split(scene_wide: str, scene_50: str) -> dict:
     return results
 
 
+def preview_batch_day(
+    mode: str,
+    scene_43l: str | None = None,
+    scene_43r: str | None = None,
+    scene_50: str | None = None,
+    scene_wide: str | None = None,
+) -> dict:
+    """Genera el draft de preview (1K) de UN día de un sub-grupo de galería
+    por lotes ya aprobado (PRD §15.3 paso 6) — sin finalización 4K, sin
+    subida a TV, sin persistencia de estado de lote (eso llega con el
+    motor de lote en la Etapa 2).
+
+    Llámala una vez por cada día que se quiera previsualizar: por
+    defecto, solo el primer día del sub-grupo recién aprobado; si el
+    usuario pide explícitamente el preview del sub-grupo completo,
+    llámala una vez por cada día de ese sub-grupo, en el mismo turno.
+    Usa siempre las escenas ya redactadas y aprobadas en el paso 4 para
+    ese día exacto — nunca inventes ni reescribas una escena nueva aquí.
+
+    `mode` debe ser 'independiente' o 'split', la misma decisión ya
+    tomada para ese día en el paso 4:
+    - 'independiente': pasa scene_43l, scene_43r y scene_50; genera las
+      tres piezas por separado, igual que generate_set_diptico.
+    - 'split': pasa scene_wide y scene_50; genera la imagen ancha y la
+      parte en 43L/43R con la compensación de marco de la casa, igual
+      que generate_set_split.
+
+    Devuelve el mismo shape que generate_set_diptico/generate_set_split
+    ({'43L', '43R', '50'} o {'wide', '43L', '43R', '50'}), con la misma
+    semántica de fallas parciales (se detiene en el primer panel con
+    error y devuelve lo generado hasta ahí más el error).
+    """
+    _logger.info("preview_batch_day: mode=%s", mode)
+    if mode == "split":
+        if scene_wide is None or scene_50 is None:
+            return {"error": "modo 'split' requiere scene_wide y scene_50."}
+        return generate_set_split(scene_wide=scene_wide, scene_50=scene_50)
+    if scene_43l is None or scene_43r is None or scene_50 is None:
+        return {
+            "error": "modo 'independiente' requiere scene_43l, scene_43r y scene_50."
+        }
+    return generate_set_diptico(
+        scene_43l=scene_43l, scene_43r=scene_43r, scene_50=scene_50
+    )
+
+
 def finalize_high_res(image_id: str, is_split_wide: bool = False) -> dict:
     """Produce la versión final en alta resolución (4K) de un draft aprobado
     (PRD §7.7), re-generándolo vía image-to-image con una instrucción
@@ -489,6 +535,9 @@ root_agent = Agent(
         finalize_high_res,
         deploy_to_panels,
         revert_tv,
-        SkillToolset(skills=[_galeria_por_lotes_skill]),
+        SkillToolset(
+            skills=[_galeria_por_lotes_skill],
+            additional_tools=[preview_batch_day],
+        ),
     ],
 )

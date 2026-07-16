@@ -179,6 +179,102 @@ def test_batch_skill_has_per_day_prompt_instructions():
     assert "reescribe solo ese día" in instructions
 
 
+def test_batch_skill_declares_preview_tool_in_additional_tools():
+    """dev_plan_phase_2.md 1.4: la skill de galería por lotes debe declarar
+    preview_batch_day en metadata.adk_additional_tools de su frontmatter —
+    sin esa entrada, SkillToolset nunca resuelve la tool para el modelo
+    (PRD §15.4, google/adk/tools/skill_toolset.py
+    _resolve_additional_tools_from_state).
+    """
+    skill = agent._galeria_por_lotes_skill
+
+    assert skill.frontmatter.metadata.get("adk_additional_tools") == [
+        "preview_batch_day"
+    ]
+
+
+def test_root_agent_skill_toolset_registers_preview_batch_day():
+    """dev_plan_phase_2.md 1.4: preview_batch_day se pasa como
+    additional_tools del SkillToolset, no directo en root_agent.tools —
+    permanece invisible para el modelo hasta que la skill se activa.
+    """
+    skill_toolset = next(
+        tool for tool in agent.root_agent.tools if isinstance(tool, SkillToolset)
+    )
+
+    assert "preview_batch_day" in skill_toolset._provided_tools_by_name
+
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
+    assert "preview_batch_day" not in tool_names
+
+
+def test_batch_skill_has_preview_instructions():
+    """dev_plan_phase_2.md 1.4: la skill trae las instrucciones del paso 6
+    de PRD §15.3 (preview del primer día del sub-grupo por defecto, del
+    sub-grupo completo bajo pedido explícito, llamando preview_batch_day).
+    """
+    skill = agent._galeria_por_lotes_skill
+    instructions = skill.instructions
+
+    assert "preview_batch_day" in instructions
+    assert "primer día" in instructions
+    assert "sub-grupo completo" in instructions
+
+
+def test_preview_batch_day_dispatches_to_diptico_for_independiente_mode(monkeypatch):
+    captured = {}
+
+    def fake_generate_set_diptico(scene_43l, scene_43r, scene_50):
+        captured["args"] = (scene_43l, scene_43r, scene_50)
+        return {
+            "43L": {"image_id": "a"},
+            "43R": {"image_id": "b"},
+            "50": {"image_id": "c"},
+        }
+
+    def unexpected_generate_set_split(scene_wide, scene_50):
+        raise AssertionError("no debería llamarse en modo independiente")
+
+    monkeypatch.setattr(agent, "generate_set_diptico", fake_generate_set_diptico)
+    monkeypatch.setattr(agent, "generate_set_split", unexpected_generate_set_split)
+
+    result = agent.preview_batch_day(
+        mode="independiente",
+        scene_43l="escena l",
+        scene_43r="escena r",
+        scene_50="escena 50",
+    )
+
+    assert captured["args"] == ("escena l", "escena r", "escena 50")
+    assert result["43L"]["image_id"] == "a"
+
+
+def test_preview_batch_day_dispatches_to_split_for_split_mode(monkeypatch):
+    captured = {}
+
+    def fake_generate_set_split(scene_wide, scene_50):
+        captured["args"] = (scene_wide, scene_50)
+        return {
+            "wide": {"image_id": "w"},
+            "43L": {"image_id": "a"},
+            "43R": {"image_id": "b"},
+            "50": {"image_id": "c"},
+        }
+
+    def unexpected_generate_set_diptico(scene_43l, scene_43r, scene_50):
+        raise AssertionError("no debería llamarse en modo split")
+
+    monkeypatch.setattr(agent, "generate_set_split", fake_generate_set_split)
+    monkeypatch.setattr(agent, "generate_set_diptico", unexpected_generate_set_diptico)
+
+    result = agent.preview_batch_day(
+        mode="split", scene_wide="escena ancha", scene_50="escena 50"
+    )
+
+    assert captured["args"] == ("escena ancha", "escena 50")
+    assert result["wide"]["image_id"] == "w"
+
+
 def test_batch_skill_resolves_weekend_requests_against_the_real_date():
     """Hallazgo de weekend.json: pedir 'el fin de semana' llevó al modelo a
     adivinar los días sin ninguna fecha real de referencia. La skill ahora

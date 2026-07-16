@@ -15,6 +15,8 @@ description: >
   día (una sola pieza o el conjunto normal de las tres pantallas), aunque
   el usuario lo llame "colección" o "conjunto" — ese sigue siendo el flujo
   por defecto sin esta skill.
+metadata:
+  adk_additional_tools: ["preview_batch_day"]
 ---
 
 Estás en modo de arte para varios días.
@@ -150,7 +152,36 @@ demás tal como estaban — mismo principio que la aprobación de
 agrupación (paso 3): nunca reinicies ni redactes de cero el sub-grupo
 completo por un ajuste puntual.
 
-Al aprobarse el último sub-grupo, no avances todavía a preview o
-generación real (eso llega en una iteración posterior de este plan) —
-cierra el turno confirmando que todos los sub-grupos quedaron
-aprobados.
+## Paso 6 — Preview (PRD §15.3 paso 6)
+
+En cuanto se apruebe un sub-grupo (paso 5), sin esperar un disparador
+nuevo del usuario, genera el preview del **primer día de ese sub-grupo**
+llamando `preview_batch_day` una sola vez, con el `mode` y las escenas
+exactas ya redactadas y aprobadas en el paso 4 para ese día — nunca
+inventes ni reescribas una escena nueva aquí, ni adelantes días
+posteriores del mismo sub-grupo.
+
+Si el usuario pide explícitamente el preview del sub-grupo completo
+(p. ej. "preview del sub-grupo completo", "muéstrame todos los días"),
+llama `preview_batch_day` una vez por cada día de ese sub-grupo, en el
+mismo turno, cada llamada con el `mode` y las escenas de su día
+correspondiente.
+
+`preview_batch_day` devuelve el mismo tipo de resultado que
+`generate_set_diptico`/`generate_set_split`: puede traer algunos
+paneles ya completados junto con, como máximo, un panel con error.
+Aplica el mismo criterio ya usado para conjuntos sueltos (RESULTADOS
+MIXTOS, instrucción de `root_agent`) — nunca descartes ni dejes de
+confirmar un `image_id` generado, nunca generalices el fallo de un
+panel/día a todo el sub-grupo, y sé preciso sobre cuál día/panel
+específico falló.
+
+Esta iteración solo produce drafts en baja resolución (1K), en disco —
+no incluye finalización 4K, subida a TV, ni el estimado de tiempo
+(llegan con el motor de lote, iteraciones posteriores de este plan).
+
+Después del preview: si quedan sub-grupos sin redactar/aprobar, continúa
+con el paso 4 del siguiente sub-grupo. Si el sub-grupo recién
+previsualizado era el último, cierra el turno confirmando que todos los
+sub-grupos del lote quedaron con prompts aprobados y sus previews
+disponibles.
