@@ -179,6 +179,23 @@ def test_batch_skill_resolves_weekend_requests_against_the_real_date():
     assert "la próxima semana" in instructions
 
 
+def test_root_agent_instruction_forbids_empty_text_after_a_tool_call():
+    """Hallazgo de una conversación real (weekend2.json): tras llamar
+    list_skills -> load_skill correctamente en el mismo turno, el modelo
+    a veces devuelve un texto final vacío (finishReason=STOP, sin ningún
+    token de salida) y el usuario se queda sin respuesta visible hasta
+    que manda un mensaje de seguimiento. Es un comportamiento estocástico
+    del modelo/API (no reproducible a voluntad ni interceptable sin
+    reescribir la respuesta del modelo, que se descartó explícitamente
+    como solución) — este párrafo es una mitigación de mejor esfuerzo,
+    documentada como riesgo aceptado en KNOWN_ISSUES.md, no una garantía.
+    """
+    instruction = _resolved_instruction()
+
+    assert "Nunca termines un turno sin texto visible" in instruction
+    assert "después de llamar una tool" in instruction
+
+
 def test_generate_set_diptico_produces_the_three_house_panels(monkeypatch):
     calls = []
 

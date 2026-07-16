@@ -78,3 +78,21 @@ evidencia de n pequeño sugiere una mejora modesta con fraseo verboso, pero
 no garantiza encuadre macro consistente. V1 sigue sin bloquearse por esto;
 requeriría más repros con temas variados para confirmar si el problema de
 fondo persiste con la nueva redacción.
+
+---
+
+## 3. El modelo a veces termina un turno con texto vacío justo después de llamar una tool
+
+**Encontrado:** 2026-07-15, conversación real exportada de `adk web` (`weekend2.json`), mensaje "quiero diseñar un lote nuevo para el fin de semana" (ya sin ambigüedad de intención, un solo mensaje claro).
+
+**Repro:** `root_agent` llamó correctamente `list_skills` → `load_skill("galeria-por-lotes")` en el mismo turno, pero la respuesta final del modelo trajo `finishReason: "STOP"` con un texto vacío (`""`) y **sin `candidatesTokenCount` en `usageMetadata`** — el modelo devolvió cero tokens de salida, no un error retornado por la SDK ni una excepción capturable. El usuario se quedó sin ninguna respuesta visible hasta que mandó un mensaje de seguimiento ("estas ahí?") en un turno posterior, momento en el que el modelo sí produjo la pregunta de disambiguación esperada (sábado 18/domingo 19 vs. miércoles 15-domingo 19).
+
+**Por qué importa:** es indistinguible, desde la UI, de que el bot se haya colgado — nada en el chat indica que el turno "terminó bien" sin decir nada.
+
+**Intentos de reproducir a voluntad (TDD, 2026-07-15):** se escribió `scripts/eval_batch_load_skill_followup.py`, que repite el mensaje exacto del repro contra el agente real y verifica que el texto final del turno no quede vacío. Corrido 50 veces contra la API real (fuera de esta conversación), **nunca reprodujo el texto vacío** — confirma que es un evento estocástico de baja probabilidad a nivel de API/modelo, no algo que un cambio de prompt o de frecuencia de repetición pueda forzar de forma determinística.
+
+**Por qué no se resolvió con reintento de código:** la opción más robusta (detectar la respuesta vacía vía `after_model_callback` y reintentar automáticamente la llamada al modelo) se descartó explícitamente — decisión del usuario de no interceptar/reescribir las respuestas del modelo ("no quiero jugar a ser dios con los mensajes"). Queda fuera de alcance mientras esa postura no cambie.
+
+**Mitigación aplicada:** párrafo nuevo al inicio de `_BASE_INSTRUCTION` en `agent.py` — "Nunca termines un turno sin texto visible para el usuario, especialmente justo después de llamar una tool... una llamada de tool nunca es, por sí sola, una respuesta completa." Es una instrucción de mejor esfuerzo: puede reducir los casos en que el modelo *elige* terminar el turno tras solo la llamada a la tool, pero no puede prevenir una respuesta de la API con cero tokens de salida — esa causa está fuera del control de cualquier prompt. Cubierto solo por un test estructural (`test_root_agent_instruction_forbids_empty_text_after_a_tool_call` en `tests/test_agent_smoke.py`: el párrafo existe en la instrucción), no por un test de comportamiento real — no hay forma barata y determinística de forzar una respuesta vacía real del modelo bajo pytest.
+
+**Estado:** sin resolver de raíz — riesgo aceptado y documentado, mismo tratamiento que los issues #1 y #2 de este archivo. Si se observa que ocurre con más frecuencia de la esperada, reconsiderar la opción de reintento por código (`after_model_callback`) descartada arriba.
