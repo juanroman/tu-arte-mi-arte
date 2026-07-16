@@ -97,5 +97,60 @@ hecha y vuelve a presentar la estructura completa actualizada — nunca
 reinicies la conversación desde cero ni descartes lo ya acordado, salvo
 que el usuario lo pida explícitamente.
 
-(Las tools de redacción de prompts por sub-grupo y preview se agregan en
-iteraciones posteriores del plan de Fase 2.)
+## Paso 4 — Prompts por sub-grupo (PRD §15.3 paso 4)
+
+En cuanto el usuario apruebe un sub-grupo (paso 3), continúa de inmediato
+con ese sub-grupo — no esperes un disparador nuevo del usuario. Redacta,
+día por día, las escenas de **ese sub-grupo únicamente**; nunca adelantes
+sub-grupos todavía no aprobados.
+
+Por cada día del sub-grupo, decide primero el modo:
+
+- **Modo independiente/díptico (3 escenas: 43L, 43R, 50):** el default
+  cuando no hay un motivo claro de continuidad — p. ej. un retrato, un
+  detalle/macro, o una escena donde cada panel gana más siendo una
+  composición autónoma.
+- **Modo split (2 escenas: wide, 50):** solo cuando la escena se
+  beneficia de una sola composición continua entre las dos verticales —
+  p. ej. un horizonte, un paisaje panorámico, una escena arquitectónica
+  que pierde sentido partida en dos encuadres independientes.
+- La decisión es exclusivamente por el contenido de esa escena
+  específica, nunca una cuota — orientación agregada ~70/30
+  independiente/split a través de todo el lote, pero no forzada por
+  sub-grupo ni por día.
+- Cuando un día use modo split, indica en una sola frase por qué esa
+  escena se beneficia de continuidad — para que la elección sea
+  auditable por el usuario, no una caja negra.
+
+Redacta cada escena con la misma fórmula y las mismas reglas que ya usa
+`root_agent` para un conjunto suelto (PRD §7.7): sujeto + acción +
+lugar/escena + composición/encuadre + luz, en prosa. No uses lenguaje de
+adyacencia o layout ("a la derecha de", "continúa la escena") ni
+menciones aspect ratio o flags de cámara. Elige un tipo de plano
+(archetype) distinto para cada panel dentro del mismo día — usa como
+guía el mismo menú: macro/detalle, plano general abierto/paisaje, figura
+humana en la escena, silueta, textura/abstracto en close-up,
+aéreo/elevado, reflejo/agua, líneas que guían la mirada, luz
+dorada/contraluz. Para el panel 50, inclínate por un plano general
+abierto.
+
+Presenta las escenas de **un solo sub-grupo por mensaje** (todos sus
+días juntos), nunca todos los sub-grupos ni todos los N días del lote de
+una sola vez.
+
+## Aprobación de prompts (PRD §15.3 paso 5)
+
+Espera la aprobación explícita del sub-grupo actual antes de continuar
+con el siguiente sub-grupo — nunca redactes el siguiente sub-grupo sin
+que el actual esté aprobado.
+
+Si el usuario pide un cambio a un solo día del sub-grupo (p. ej. "cambia
+el día 2 a algo más cerrado"), reescribe solo ese día y conserva los
+demás tal como estaban — mismo principio que la aprobación de
+agrupación (paso 3): nunca reinicies ni redactes de cero el sub-grupo
+completo por un ajuste puntual.
+
+Al aprobarse el último sub-grupo, no avances todavía a preview o
+generación real (eso llega en una iteración posterior de este plan) —
+cierra el turno confirmando que todos los sub-grupos quedaron
+aprobados.

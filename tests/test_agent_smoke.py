@@ -161,6 +161,24 @@ def test_batch_skill_has_grouping_proposal_instructions():
     assert "reinicies la conversación desde cero" in instructions
 
 
+def test_batch_skill_has_per_day_prompt_instructions():
+    """dev_plan_phase_2.md 1.3: la skill de galería por lotes debe traer
+    las instrucciones del paso 4 de PRD §15.3 (redacción de escenas día
+    por día dentro de un sub-grupo aprobado, decidiendo por día entre modo
+    independiente/díptico de 3 escenas y modo split de 2 escenas según si
+    la composición se beneficia de continuidad, sin cuota forzada) y del
+    paso 5 (aprobación/corrección por día sin reescribir los demás).
+    """
+    skill = agent._galeria_por_lotes_skill
+    instructions = skill.instructions
+
+    assert "43L, 43R, 50" in instructions
+    assert "wide, 50" in instructions
+    assert "~70/30" in instructions
+    assert "un solo sub-grupo por mensaje" in instructions
+    assert "reescribe solo ese día" in instructions
+
+
 def test_batch_skill_resolves_weekend_requests_against_the_real_date():
     """Hallazgo de weekend.json: pedir 'el fin de semana' llevó al modelo a
     adivinar los días sin ninguna fecha real de referencia. La skill ahora
