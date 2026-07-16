@@ -8,11 +8,21 @@ from google.adk.tools.skill_toolset import SkillToolset
 from tu_arte_mi_arte import agent
 
 
+def _resolved_instruction() -> str:
+    """root_agent.instruction is a dynamic InstructionProvider (PRD §15:
+    prepends the current house date/time on every turn), not a plain
+    string — tests need the resolved text, not the callable itself. The
+    provider ignores its context argument, so None is a safe stand-in.
+    """
+    return agent.root_agent.instruction(None)
+
+
 def test_root_agent_is_well_formed():
     assert isinstance(agent.root_agent, Agent)
     assert agent.root_agent.name
     assert agent.root_agent.model
-    assert agent.root_agent.instruction
+    assert callable(agent.root_agent.instruction)
+    assert _resolved_instruction()
 
 
 def test_root_agent_instruction_macro_archetype_uses_verbose_camera_language():
@@ -22,7 +32,7 @@ def test_root_agent_instruction_macro_archetype_uses_verbose_camera_language():
     of regressing to the old bare-keyword form, without constraining the
     other archetype entries or the 'guía, no lista cerrada' framing.
     """
-    instruction = agent.root_agent.instruction
+    instruction = _resolved_instruction()
 
     assert "macro/detalle (" in instruction
     assert "lente" in instruction
@@ -83,13 +93,33 @@ def test_root_agent_instruction_disambiguates_temporal_scope_before_concepto():
     CONCEPTO. Se evita el fraseo "hoy"/"ahora" para la opción fija porque
     confunde plazo con permanencia.
     """
-    instruction = agent.root_agent.instruction
+    instruction = _resolved_instruction()
 
     assert "ALCANCE TEMPORAL" in instruction
     assert "más bien un conjunto" in instruction
     assert instruction.index("ALCANCE TEMPORAL") < instruction.index(
         "ETAPA 1 — CONCEPTO"
     )
+
+
+def test_root_agent_instruction_grounds_relative_time_in_current_house_date():
+    """Hallazgo de una conversación real (weekend.json): pedir 'el fin de
+    semana' llevó al modelo a adivinar qué días eran sábado/domingo, sin
+    ninguna señal de la fecha real — y encima el reloj del sistema (2026)
+    es posterior al corte de entrenamiento del modelo. root_agent ahora
+    antepone la fecha/hora real de la casa (engine.house_clock,
+    PRD §15) en cada turno, antes de ALCANCE TEMPORAL, para que 'hoy'/
+    'este fin de semana'/'la próxima semana' se resuelvan contra un hecho,
+    no una suposición.
+    """
+    instruction = _resolved_instruction()
+
+    assert "FECHA Y HORA ACTUAL" in instruction
+    assert instruction.index("FECHA Y HORA ACTUAL") < instruction.index(
+        "ALCANCE TEMPORAL"
+    )
+    # se recalcula en cada turno, no es un timestamp fijo horneado al importar
+    assert callable(agent.root_agent.instruction)
 
 
 def test_root_agent_instruction_and_default_tools_unchanged_by_batch_skill():
@@ -110,8 +140,43 @@ def test_root_agent_instruction_and_default_tools_unchanged_by_batch_skill():
         "revert_tv",
     }
     assert pre_existing_tool_names <= tool_names
-    assert "ETAPA 1 — CONCEPTO" in agent.root_agent.instruction
-    assert "ETAPA 4 — DESPLIEGUE" in agent.root_agent.instruction
+    instruction = _resolved_instruction()
+    assert "ETAPA 1 — CONCEPTO" in instruction
+    assert "ETAPA 4 — DESPLIEGUE" in instruction
+
+
+def test_batch_skill_has_grouping_proposal_instructions():
+    """dev_plan_phase_2.md 1.2: la skill de galería por lotes debe traer
+    las instrucciones del paso 2 de PRD §15.3 (propuesta de agrupación en
+    2-4 sub-grupos de 2-4 días, default 7 días si no se especifica, y
+    aplicar ajustes sin reiniciar la conversación) en el cuerpo cargado
+    por load_skill, no solo el placeholder de activación de 1.1.
+    """
+    skill = agent._galeria_por_lotes_skill
+    instructions = skill.instructions
+
+    assert "sub-grupos" in instructions
+    assert "2 y 4 sub-grupos" in instructions
+    assert "asume 7" in instructions
+    assert "reinicies la conversación desde cero" in instructions
+
+
+def test_batch_skill_resolves_weekend_requests_against_the_real_date():
+    """Hallazgo de weekend.json: pedir 'el fin de semana' llevó al modelo a
+    adivinar los días sin ninguna fecha real de referencia. La skill ahora
+    debe: (a) resolver directo sin preguntar si hoy ya cae viernes-domingo,
+    (b) preguntar explícitamente con fechas concretas cuando hoy es
+    lunes-jueves, en vez de asumir en silencio una de las dos lecturas
+    posibles ('solo sábado y domingo' vs. 'desde hoy hasta el domingo').
+    """
+    skill = agent._galeria_por_lotes_skill
+    instructions = skill.instructions
+
+    assert "fecha actual" in instructions
+    assert "viernes, sábado o domingo" in instructions
+    assert "lunes a jueves" in instructions
+    assert "pregunta explícitamente" in instructions
+    assert "la próxima semana" in instructions
 
 
 def test_generate_set_diptico_produces_the_three_house_panels(monkeypatch):

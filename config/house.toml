@@ -1,0 +1,5 @@
+# House location (used to resolve relative time references like "hoy",
+# "este fin de semana", PRD §15). Confirmed 2026-07-15: matches the
+# Raspberry Pi's system clock.
+
+timezone = "America/Mexico_City"
