@@ -137,3 +137,101 @@ def test_batch_day_wide_stage_is_pending_for_split_and_none_for_independiente(
     assert batch_days[2].wide_stage == "pending"
     assert batch_days[1].wide_image_id is None
     assert batch_days[2].wide_image_id is None
+
+
+def test_record_item_attempt_updates_only_the_targeted_item(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+    days = [
+        ApprovedDay(
+            day_index=1,
+            mode="independiente",
+            sub_group="Sub-grupo A",
+            prompts={"43L": "a", "43R": "b", "50": "c"},
+        )
+    ]
+    batch_id = batch_store.materialize_batch("Tema", days, path=db_path)
+
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43L",
+        attempts=1,
+        stage="drafted",
+        image_id="img_abc123",
+        error=None,
+        path=db_path,
+    )
+
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    assert items["43L"].attempts == 1
+    assert items["43L"].stage == "drafted"
+    assert items["43L"].image_id == "img_abc123"
+    assert items["43L"].error is None
+    assert items["43L"].updated_at is not None
+    assert items["43L"].prompt == "a"
+    # Los demás paneles del mismo batch quedan intactos.
+    assert items["43R"].stage == "pending"
+    assert items["43R"].attempts == 0
+    assert items["50"].stage == "pending"
+
+
+def test_record_item_attempt_persists_error_and_needs_attention(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+    days = [
+        ApprovedDay(
+            day_index=1,
+            mode="independiente",
+            sub_group="Sub-grupo A",
+            prompts={"43L": "a", "43R": "b", "50": "c"},
+        )
+    ]
+    batch_id = batch_store.materialize_batch("Tema", days, path=db_path)
+
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43L",
+        attempts=2,
+        stage="needs_attention",
+        image_id=None,
+        error="rechazo de política",
+        path=db_path,
+    )
+
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    assert items["43L"].stage == "needs_attention"
+    assert items["43L"].attempts == 2
+    assert items["43L"].image_id is None
+    assert items["43L"].error == "rechazo de política"
+
+
+def test_record_wide_image_updates_batch_day_without_touching_batch_item(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+    days = [
+        ApprovedDay(
+            day_index=1,
+            mode="split",
+            sub_group="Sub-grupo A",
+            prompts={"wide": "un horizonte compartido", "50": "otra escena"},
+        )
+    ]
+    batch_id = batch_store.materialize_batch("Tema", days, path=db_path)
+
+    batch_store.record_wide_image(
+        batch_id, 1, wide_image_id="img_wide001", wide_stage="drafted", path=db_path
+    )
+
+    batch_day = batch_store.get_batch_days(batch_id, path=db_path)[0]
+    assert batch_day.wide_image_id == "img_wide001"
+    assert batch_day.wide_stage == "drafted"
+
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    assert items["43L"].stage == "pending"
+    assert items["43R"].stage == "pending"
+    assert items["43L"].image_id is None

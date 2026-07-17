@@ -226,3 +226,49 @@ def get_batch_items(batch_id: str, path: Path | None = None) -> list[BatchItemRe
             (batch_id,),
         ).fetchall()
     return [BatchItemRecord(*row) for row in rows]
+
+
+def record_item_attempt(
+    batch_id: str,
+    day_index: int,
+    panel: str,
+    *,
+    attempts: int,
+    stage: str,
+    image_id: str | None = None,
+    error: str | None = None,
+    path: Path | None = None,
+) -> None:
+    """Persiste el resultado de un intento de generación/finalización sobre
+    un `batch_item` (corredor, Etapa 2). Siempre escribe el estado completo
+    resultante del intento -- no una actualización parcial -- para que un
+    reinicio a medias del corredor pueda reanudar leyendo `attempts` sin
+    ambigüedad sobre qué campos quedaron a medio escribir.
+    """
+    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
+        conn.execute(
+            "UPDATE batch_item SET attempts = ?, stage = ?, image_id = ?, "
+            "error = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE batch_id = ? AND day_index = ? AND panel = ?",
+            (attempts, stage, image_id, error, batch_id, day_index, panel),
+        )
+
+
+def record_wide_image(
+    batch_id: str,
+    day_index: int,
+    *,
+    wide_image_id: str | None,
+    wide_stage: str,
+    path: Path | None = None,
+) -> None:
+    """Persiste el resultado de un intento sobre la imagen ancha compartida
+    de un día split (`batch_day.wide_image_id`/`wide_stage`) -- mismo
+    principio de escritura completa que `record_item_attempt`.
+    """
+    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
+        conn.execute(
+            "UPDATE batch_day SET wide_image_id = ?, wide_stage = ? "
+            "WHERE batch_id = ? AND day_index = ?",
+            (wide_image_id, wide_stage, batch_id, day_index),
+        )
