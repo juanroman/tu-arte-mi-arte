@@ -16,7 +16,8 @@ description: >
   el usuario lo llame "colección" o "conjunto" — ese sigue siendo el flujo
   por defecto sin esta skill.
 metadata:
-  adk_additional_tools: ["preview_batch_day", "materialize_batch_gallery"]
+  adk_additional_tools:
+    ["preview_batch_day", "materialize_batch_gallery", "estimate_batch_duration"]
 ---
 
 Estás en modo de arte para varios días.
@@ -184,17 +185,30 @@ Después del preview: si quedan sub-grupos sin redactar/aprobar, continúa
 con el paso 4 del siguiente sub-grupo. Si el sub-grupo recién
 previsualizado era el último, confirma que todos los sub-grupos del
 lote quedaron con prompts aprobados y sus previews disponibles, y
-continúa con el paso 8 (confirmación y materialización) — el estimado
-de tiempo del paso 7 (PRD §15.3) todavía no está implementado en esta
-iteración, sáltalo sin mencionarlo como pendiente al usuario.
+continúa con el paso 7 (estimado de tiempo).
 
-## Paso 8 — Confirmación y materialización del lote (PRD §15.3 paso 8, parcial)
+## Paso 7 — Estimado de tiempo (PRD §15.3 paso 7)
 
 Una vez que TODOS los sub-grupos del lote tienen sus prompts aprobados
 (paso 5) — sin importar si se pidió o no el preview de cada uno —,
-pregunta al usuario si confirma el lote completo para que el motor de
-lote lo procese (p. ej. "¿confirmas este lote de N días para
-generarlo?"). Espera su aprobación explícita antes de continuar.
+llama `estimate_batch_duration` **una sola vez**, pasando `day_modes`
+como una lista con el `mode` ('independiente' o 'split') de cada uno de
+los N días del lote, en el orden del lote (día 1 primero) — el mismo
+valor ya decidido para cada día en el paso 4, nunca inventado aquí.
+
+Comunica el resultado (`estimated_minutes`) al usuario en una frase
+breve, en lenguaje natural (p. ej. "esto tomará aproximadamente 25
+minutos"), antes de pedir la confirmación del paso 8 — nunca como
+promesa exacta, es un estimado. Si `estimate_batch_duration` devuelve
+`'error'`, no bloquees el flujo por eso: informa al usuario que no se
+pudo calcular el estimado y continúa igual con el paso 8.
+
+## Paso 8 — Confirmación y materialización del lote (PRD §15.3 paso 8, parcial)
+
+Una vez comunicado el estimado de tiempo (paso 7), pregunta al usuario
+si confirma el lote completo para que el motor de lote lo procese
+(p. ej. "¿confirmas este lote de N días para generarlo?"). Espera su
+aprobación explícita antes de continuar.
 
 Al confirmar, llama `materialize_batch_gallery` **una sola vez** con
 `theme` (el tema general del lote) y `days`: una lista con un dict por

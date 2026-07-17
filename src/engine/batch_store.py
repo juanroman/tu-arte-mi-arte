@@ -24,6 +24,15 @@ prompt de la imagen "wide" compartida por 43L/43R antes de partirse —
 filas físicas (43L y 43R), ya que describen la misma composición antes
 del split; el corredor puede leer cualquiera de las dos para generar la
 imagen ancha compartida una sola vez.
+
+Nota de migración (dev_plan_phase_2.md §2.4): `batch_item.policy_rejection`
+se agregó después de que ya existían bases de datos reales en disco
+(`data/batch.sqlite3`, gitignored, con lotes materializados/finalizados de
+2.1-2.3) -- `_connect` aplica un `ALTER TABLE` guardado tras el `CREATE
+TABLE IF NOT EXISTS` para que esas bases existentes ganen la columna
+nueva sin perder sus filas, en vez de exigir borrar y re-crear el archivo.
+Primer caso de migración de este módulo; el mismo patrón aplica si un
+campo futuro necesita agregarse a una tabla ya poblada.
 """
 
 import contextlib
@@ -41,6 +50,10 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "batch.
 class BatchConfig:
     generation_max_attempts: int
     tv_deploy_max_attempts: int
+    draft_seconds_per_call: int
+    finalize_seconds_per_call: int
+    deploy_seconds_per_day: int
+    eta_safety_margin: float
 
 
 def load_batch_config(path: Path | None = None) -> BatchConfig:
@@ -90,6 +103,7 @@ class BatchItemRecord:
     attempts: int
     error: str | None
     updated_at: str | None
+    policy_rejection: bool
 
 
 def _new_batch_id() -> str:
@@ -135,6 +149,11 @@ def _connect(path: Path) -> sqlite3.Connection:
         "PRIMARY KEY (batch_id, day_index, panel)"
         ")"
     )
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute(
+            "ALTER TABLE batch_item "
+            "ADD COLUMN policy_rejection INTEGER NOT NULL DEFAULT 0"
+        )
     return conn
 
 
@@ -221,11 +240,25 @@ def get_batch_items(batch_id: str, path: Path | None = None) -> list[BatchItemRe
     with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
         rows = conn.execute(
             "SELECT batch_id, day_index, panel, prompt, stage, image_id, "
-            "attempts, error, updated_at "
+            "attempts, error, updated_at, policy_rejection "
             "FROM batch_item WHERE batch_id = ? ORDER BY day_index, panel",
             (batch_id,),
         ).fetchall()
-    return [BatchItemRecord(*row) for row in rows]
+    return [
+        BatchItemRecord(
+            batch_id=row[0],
+            day_index=row[1],
+            panel=row[2],
+            prompt=row[3],
+            stage=row[4],
+            image_id=row[5],
+            attempts=row[6],
+            error=row[7],
+            updated_at=row[8],
+            policy_rejection=bool(row[9]),
+        )
+        for row in rows
+    ]
 
 
 def record_item_attempt(
@@ -237,20 +270,34 @@ def record_item_attempt(
     stage: str,
     image_id: str | None = None,
     error: str | None = None,
+    policy_rejection: bool = False,
     path: Path | None = None,
 ) -> None:
     """Persiste el resultado de un intento de generación/finalización sobre
     un `batch_item` (corredor, Etapa 2). Siempre escribe el estado completo
     resultante del intento -- no una actualización parcial -- para que un
     reinicio a medias del corredor pueda reanudar leyendo `attempts` sin
-    ambigüedad sobre qué campos quedaron a medio escribir.
+    ambigüedad sobre qué campos quedaron a medio escribir. `policy_rejection`
+    persiste tal cual la clave homónima de `engine.generation` (§7.9) para
+    que un reporte de lote (dev_plan_phase_2.md §2.4) distinga un rechazo de
+    política de una falla técnica agotada sin tener que inferirlo del texto
+    de `error`.
     """
     with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
         conn.execute(
             "UPDATE batch_item SET attempts = ?, stage = ?, image_id = ?, "
-            "error = ?, updated_at = CURRENT_TIMESTAMP "
+            "error = ?, policy_rejection = ?, updated_at = CURRENT_TIMESTAMP "
             "WHERE batch_id = ? AND day_index = ? AND panel = ?",
-            (attempts, stage, image_id, error, batch_id, day_index, panel),
+            (
+                attempts,
+                stage,
+                image_id,
+                error,
+                int(policy_rejection),
+                batch_id,
+                day_index,
+                panel,
+            ),
         )
 
 

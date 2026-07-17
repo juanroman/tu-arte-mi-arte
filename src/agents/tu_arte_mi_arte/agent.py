@@ -7,6 +7,7 @@ from google.adk.skills import load_skill_from_dir
 from google.adk.tools.skill_toolset import SkillToolset
 
 from engine.art_direction import build_prompt, load_art_direction
+from engine.batch import estimate_batch_duration as estimate_batch_duration_ai
 from engine.batch_store import ApprovedDay
 from engine.batch_store import materialize_batch as materialize_batch_ai
 from engine.generation import edit_image as edit_image_ai
@@ -324,6 +325,46 @@ def materialize_batch_gallery(theme: str, days: list[dict]) -> dict:
     return result
 
 
+_VALID_BATCH_DAY_MODES = {"independiente", "split"}
+
+
+def estimate_batch_duration(day_modes: list[str]) -> dict:
+    """Calcula el estimado de duración de un lote (PRD §15.3 paso 7,
+    dev_plan_phase_2.md §2.4) a partir de los modos ya decididos para
+    todos los N días del lote (paso 4/5), ANTES de materializarlo — no
+    requiere que el lote ya exista en SQLite.
+
+    Llámala una sola vez, después de que TODOS los sub-grupos del lote
+    tengan sus prompts aprobados (mismo momento en el que se apoya el
+    paso 8 de confirmación/materialización), pasando `day_modes` como una
+    lista con el `mode` ('independiente' o 'split') de cada día del lote,
+    en orden (día 1 primero) — el mismo valor ya decidido en el paso 4
+    para cada día, nunca inventado aquí.
+
+    Devuelve {'day_count', 'independent_days', 'split_days',
+    'total_model_calls', 'estimated_seconds', 'estimated_minutes'} en
+    éxito, o {'error': ...} si `day_modes` está vacío o trae un valor que
+    no sea 'independiente'/'split'.
+    """
+    _logger.info("estimate_batch_duration: day_count=%d", len(day_modes))
+    if not day_modes:
+        return {"error": "El lote no puede tener cero días."}
+    invalid_modes = sorted(
+        {mode for mode in day_modes if mode not in _VALID_BATCH_DAY_MODES}
+    )
+    if invalid_modes:
+        return {
+            "error": (
+                f"day_modes trae valores inválidos: {invalid_modes} "
+                "(debe ser 'independiente' o 'split')."
+            )
+        }
+
+    result = estimate_batch_duration_ai(day_modes)
+    _log_tool_result("estimate_batch_duration", result)
+    return result
+
+
 def finalize_high_res(image_id: str, is_split_wide: bool = False) -> dict:
     """Produce la versión final en alta resolución (4K) de un draft aprobado
     (PRD §7.7), re-generándolo vía image-to-image con una instrucción
@@ -620,7 +661,11 @@ root_agent = Agent(
         revert_tv,
         SkillToolset(
             skills=[_galeria_por_lotes_skill],
-            additional_tools=[preview_batch_day, materialize_batch_gallery],
+            additional_tools=[
+                preview_batch_day,
+                materialize_batch_gallery,
+                estimate_batch_duration,
+            ],
         ),
     ],
 )

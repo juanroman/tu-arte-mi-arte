@@ -98,6 +98,7 @@ def test_policy_rejection_never_retries_and_goes_straight_to_needs_attention(
     assert items["43L"].attempts == 1
     assert items["43L"].error == "rechazo de política"
     assert items["43L"].image_id is None
+    assert items["43L"].policy_rejection is True
     assert len(calls) == 3  # una llamada por panel, ninguna reintentada
 
 
@@ -123,6 +124,7 @@ def test_item_exhausts_configured_retry_ceiling_before_needs_attention(
         assert items[panel].stage == "needs_attention"
         assert items[panel].attempts == max_attempts
         assert items[panel].error == "fallo técnico transitorio"
+        assert items[panel].policy_rejection is False
 
 
 def test_item_retries_generic_error_then_succeeds(tmp_path, monkeypatch):
@@ -236,6 +238,8 @@ def test_split_day_exhausting_retries_leaves_both_panels_and_wide_in_needs_atten
     assert items["43R"].stage == "needs_attention"
     assert items["43L"].attempts == max_attempts
     assert items["43R"].attempts == max_attempts
+    assert items["43L"].policy_rejection is False
+    assert items["43R"].policy_rejection is False
     assert items["50"].stage == "drafted"
 
     day = batch_store.get_batch_days(batch_id, path=db_path)[0]
@@ -338,6 +342,7 @@ def test_finalize_policy_rejection_never_retries_and_preserves_draft_image(
     assert items["43L"].stage == "needs_attention"
     assert items["43L"].attempts == 1
     assert items["43L"].error == "rechazo de política"
+    assert items["43L"].policy_rejection is True
     # El draft original se preserva -- una falla de finalización nunca lo destruye.
     assert items["43L"].image_id == draft_items["43L"].image_id
     assert len(calls) == 3  # una llamada por panel, ninguna reintentada
@@ -363,6 +368,7 @@ def test_finalize_exhausts_retry_ceiling_before_needs_attention(tmp_path, monkey
         assert items[panel].stage == "needs_attention"
         assert items[panel].attempts == max_attempts
         assert items[panel].error == "fallo técnico transitorio"
+        assert items[panel].policy_rejection is False
 
 
 def test_finalize_retries_generic_error_then_succeeds(tmp_path, monkeypatch):
@@ -563,3 +569,179 @@ def test_reinvoking_run_finalize_stage_skips_items_already_finalized(
     assert second_summary["finalized"] == []
     assert set(second_summary["skipped"]) == {"1:43L", "1:43R", "1:50"}
     assert first_summary["finalized"] != []
+
+
+def test_estimate_batch_duration_counts_model_calls_by_mode():
+    result = batch.estimate_batch_duration(["independiente", "split", "independiente"])
+
+    assert result["day_count"] == 3
+    assert result["independent_days"] == 2
+    assert result["split_days"] == 1
+    # 2 días independiente (3 llamadas c/u) + 1 día split (2 llamadas) = 8.
+    assert result["total_model_calls"] == 8
+    config = batch_store.load_batch_config()
+    expected_generation_seconds = 8 * (
+        config.draft_seconds_per_call + config.finalize_seconds_per_call
+    )
+    expected_deploy_seconds = 3 * config.deploy_seconds_per_day
+    expected_seconds = (
+        expected_generation_seconds + expected_deploy_seconds
+    ) * config.eta_safety_margin
+    assert result["estimated_seconds"] == expected_seconds
+
+
+def test_estimate_batch_duration_never_underestimates_the_real_2_3_demo_batch():
+    """Ancla de regresión (dev_plan_phase_2.md §2.4): el usuario pidió
+    explícitamente que el estimado nunca quede por debajo de la duración
+    real -- este test lo verifica contra la medición real de la demo de
+    2.3 (batch_09ab27e8: 10 días independiente + 4 split, 319.1s de draft
+    + 913.0s de finalización = 1232.1s reales, sin monkeypatch, contra la
+    API real de Gemini). El estimado incluye además un término de
+    despliegue (placeholder, Etapa 4) que la demo de 2.3 no ejerció -- solo
+    hace la cota más holgada, nunca la reduce.
+    """
+    day_modes = ["independiente"] * 10 + ["split"] * 4
+    real_measured_seconds = 319.1 + 913.0
+
+    result = batch.estimate_batch_duration(day_modes)
+
+    assert result["estimated_seconds"] >= real_measured_seconds
+
+
+def test_estimate_batch_duration_never_underestimates_the_real_2_4_verification_batch():
+    """Segunda ancla de regresión (dev_plan_phase_2.md §2.4, hallazgo
+    post-cierre): la primera versión de esta iteración SÍ subestimó un
+    lote real -- batch_86bd3e0f (3 días independiente, 9 llamadas de
+    generación) tardó 95.9s de draft + 559.2s de finalización = 655.1s
+    reales, contra un estimado inicial de solo 432.0s. Este test ancla la
+    corrección (finalize_seconds_per_call subido de 30 a 65) contra esa
+    misma medición real para que una futura baja accidental de la
+    constante no reintroduzca el mismo fallo.
+    """
+    day_modes = ["independiente"] * 3
+    real_measured_seconds = 95.9 + 559.2
+
+    result = batch.estimate_batch_duration(day_modes)
+
+    assert result["estimated_seconds"] >= real_measured_seconds
+
+
+def test_estimate_batch_duration_includes_a_deploy_time_term():
+    """PRD §15.2 objetivo 4 pide estimar 'generación final 4K +
+    despliegue', no solo generación -- este test confirma que el término
+    de despliegue (placeholder sin medición real todavía, ver docstring
+    de estimate_batch_duration) participa en el cálculo, escalando por
+    día del lote (no por panel, ya que las TVs de un día se despliegan en
+    paralelo entre sí).
+    """
+    config = batch_store.load_batch_config()
+    result_one_day = batch.estimate_batch_duration(["independiente"])
+    result_two_days = batch.estimate_batch_duration(["independiente"] * 2)
+
+    generation_seconds_per_day = 3 * (
+        config.draft_seconds_per_call + config.finalize_seconds_per_call
+    )
+    expected_delta = (
+        generation_seconds_per_day + config.deploy_seconds_per_day
+    ) * config.eta_safety_margin
+    assert (
+        result_two_days["estimated_seconds"] - result_one_day["estimated_seconds"]
+        == expected_delta
+    )
+
+
+def _materialize_two_days(db_path):
+    days = [
+        ApprovedDay(
+            day_index=1,
+            mode="independiente",
+            sub_group="Sub-grupo A",
+            prompts={"43L": "escena l", "43R": "escena r", "50": "escena 50"},
+        ),
+        ApprovedDay(
+            day_index=2,
+            mode="split",
+            sub_group="Sub-grupo B",
+            prompts={"wide": "escena ancha", "50": "escena 50 dos"},
+        ),
+    ]
+    return batch_store.materialize_batch("Tema del lote", days, path=db_path)
+
+
+def test_summarize_batch_returns_error_for_unknown_batch_id(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+
+    result = batch.summarize_batch("batch_no_existe", path=db_path)
+
+    assert "error" in result
+
+
+def test_summarize_batch_distinguishes_policy_rejection_from_technical_failure(
+    tmp_path,
+):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_two_days(db_path)
+
+    # Día 1: 43L rechazo de política, 43R falla técnica agotada, 50 finalizado.
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43L",
+        attempts=1,
+        stage="needs_attention",
+        image_id=None,
+        error="rechazo de política",
+        policy_rejection=True,
+        path=db_path,
+    )
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43R",
+        attempts=2,
+        stage="needs_attention",
+        image_id=None,
+        error="fallo técnico transitorio",
+        policy_rejection=False,
+        path=db_path,
+    )
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "50",
+        attempts=1,
+        stage="finalized",
+        image_id="img_ok",
+        error=None,
+        path=db_path,
+    )
+
+    result = batch.summarize_batch(batch_id, path=db_path)
+
+    assert result["batch_id"] == batch_id
+    assert result["theme"] == "Tema del lote"
+    assert result["day_count"] == 2
+    assert result["stage_counts"]["needs_attention"] == 2
+    assert result["stage_counts"]["finalized"] == 1
+    assert result["stage_counts"]["pending"] == 3  # día 2 (wide, 50) + 50 sin tocar
+
+    policy_rejections = result["needs_attention_policy_rejection"]
+    assert len(policy_rejections) == 1
+    assert policy_rejections[0]["day_index"] == 1
+    assert policy_rejections[0]["panel"] == "43L"
+
+    technical_failures = result["needs_attention_technical"]
+    assert len(technical_failures) == 1
+    assert technical_failures[0]["day_index"] == 1
+    assert technical_failures[0]["panel"] == "43R"
+    assert technical_failures[0]["attempts"] == 2
+
+    day_1 = next(day for day in result["days"] if day["day_index"] == 1)
+    assert day_1["mode"] == "independiente"
+    assert day_1["sub_group"] == "Sub-grupo A"
+    assert day_1["panels"]["43L"]["stage"] == "needs_attention"
+    assert day_1["panels"]["50"]["image_id"] == "img_ok"
+
+    day_2 = next(day for day in result["days"] if day["day_index"] == 2)
+    assert day_2["mode"] == "split"
+    assert day_2["sub_group"] == "Sub-grupo B"

@@ -4,3 +4,30 @@
 # Etapa 4 (despliegue a TVs por lote).
 generation_max_attempts = 2
 tv_deploy_max_attempts = 3
+
+# Constantes del estimado de tiempo (PRD §15.2 objetivo 4, §15.3 paso 7,
+# dev_plan_phase_2.md §2.4). draft_seconds_per_call se derivó de la demo
+# de 2.3 (batch_09ab27e8: 38 llamadas, 319.1s de draft => 8.4s/llamada) y
+# se sostuvo en la demo de verificación de 2.4 (9 llamadas, 95.9s =>
+# 10.7s/llamada). finalize_seconds_per_call se revisó al alza tras esa
+# misma demo de 2.4: batch_86bd3e0f (9 llamadas de finalización, 559.2s
+# => 62.1s/llamada) resultó ~2.6x más lento por llamada que la demo de
+# 2.3 (913.0s/38 => 24.0s/llamada) -- la varianza real de la finalización
+# 4K es mayor de lo que el margen por sí solo puede absorber, así que la
+# constante se subió por encima del peor caso observado hasta ahora en
+# vez de confiar en que el margen cubra 2-3x de varianza.
+draft_seconds_per_call = 10
+finalize_seconds_per_call = 65
+
+# Estimado PLACEHOLDER, sin medición real todavía (PRD §15.2 objetivo 4
+# pide estimar "generación final 4K + despliegue", pero el corredor de
+# subida por lote a las TVs no existe hasta la Etapa 4/iteración 4.1 --
+# hoy no hay ningún dato real de cuánto tarda subir una imagen 4K a una
+# Frame TV por red). Asume que el despliegue de un día (3 paneles, uno
+# por TV) corre en paralelo entre las tres TVs (mismo patrón que
+# engine.tv_deploy.deploy_set_to_panels), así que el costo escala por
+# día del lote, no por panel. Revisar con datos reales en 4.1 antes de
+# confiar en este número para lotes grandes.
+deploy_seconds_per_day = 90
+
+eta_safety_margin = 1.2

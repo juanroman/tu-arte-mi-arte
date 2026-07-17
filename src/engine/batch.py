@@ -30,6 +30,7 @@ sin ganancia real.
 """
 
 import logging
+import math
 from collections.abc import Callable
 from pathlib import Path
 
@@ -37,6 +38,7 @@ from engine.art_direction import ArtDirection, build_prompt, load_art_direction
 from engine.batch_store import (
     BatchDayRecord,
     BatchItemRecord,
+    get_batch,
     get_batch_days,
     get_batch_items,
     load_batch_config,
@@ -49,6 +51,13 @@ from engine.split import SplitConfig, load_split_config, split_wide_image
 _logger = logging.getLogger(__name__)
 
 _ASPECT_RATIO_BY_PANEL = {"43L": "9:16", "43R": "9:16", "50": "16:9"}
+
+# Cuántas llamadas al modelo implica un día según su modo (PRD §15.2
+# objetivo 2): 3 paneles independientes, o 1 imagen ancha compartida + el
+# panel 50 en modo split. Estructural (deriva de cómo funciona el
+# corredor), no una constante de instalación -- por eso vive en código, no
+# en config/batch.toml (dev_plan_phase_2.md §2.4).
+_MODEL_CALLS_PER_DAY_BY_MODE = {"independiente": 3, "split": 2}
 
 
 def _generate_with_retries(
@@ -109,6 +118,7 @@ def _draft_item(
         stage="needs_attention",
         image_id=None,
         error=result.get("error"),
+        policy_rejection=bool(result.get("policy_rejection")),
         path=path,
     )
     return "needs_attention"
@@ -167,6 +177,7 @@ def _draft_split_day(
             stage="needs_attention",
             image_id=None,
             error=result.get("error"),
+            policy_rejection=bool(result.get("policy_rejection")),
             path=path,
         )
     record_wide_image(
@@ -277,6 +288,7 @@ def _finalize_item(
         stage="needs_attention",
         image_id=item.image_id,
         error=result.get("error"),
+        policy_rejection=bool(result.get("policy_rejection")),
         path=path,
     )
     return "needs_attention"
@@ -322,6 +334,7 @@ def _finalize_split_day(
                     stage="needs_attention",
                     image_id=None,
                     error=result.get("error"),
+                    policy_rejection=bool(result.get("policy_rejection")),
                     path=path,
                 )
             record_wide_image(
@@ -360,6 +373,7 @@ def _finalize_split_day(
                 stage="needs_attention",
                 image_id=None,
                 error=split_result["error"],
+                policy_rejection=False,
                 path=path,
             )
         return "needs_attention"
@@ -433,3 +447,120 @@ def run_finalize_stage(batch_id: str, path: Path | None = None) -> dict:
         len(summary["skipped"]),
     )
     return summary
+
+
+def estimate_batch_duration(day_modes: list[str]) -> dict:
+    """Estimado determinístico de duración (PRD §15.2 objetivo 4, §15.3
+    paso 7, dev_plan_phase_2.md §2.4) -- no es juicio de LLM, es aritmética
+    sobre el conteo de llamadas al modelo que implica la mezcla real de
+    modos de un lote, más el despliegue a TV (PRD §15.2 objetivo 4 pide
+    explícitamente "generación final 4K + despliegue", no solo
+    generación). Corre ANTES de materializar el lote (recibe los modos ya
+    decididos en el paso 4/5 de la skill, no un `batch_id`) para no
+    introducir un segundo checkpoint de aprobación entre "prompts
+    aprobados" y "confirmar el lote" -- desviación deliberada de una
+    lectura literal de este documento, documentada en el cierre de 2.4.
+
+    El término de despliegue (`deploy_seconds_per_day`) es un PLACEHOLDER
+    sin medición real: el corredor de subida por lote no existe todavía
+    (Etapa 4/iteración 4.1), así que no hay datos reales de cuánto tarda
+    subir una imagen 4K por red a una Frame TV. Escala por día, no por
+    panel, asumiendo que las tres TVs de un día se despliegan en paralelo
+    entre sí (mismo patrón que `engine.tv_deploy.deploy_set_to_panels`) --
+    revisar con datos reales en 4.1.
+
+    Aplica `eta_safety_margin` de `config/batch.toml` sobre el costo base
+    (draft + finalización + despliegue) y redondea SIEMPRE hacia arriba
+    (`math.ceil`, nunca `round`) -- decisión explícita del usuario: nunca
+    subestimar, porque un estimado corto hace pensar que el lote se
+    congeló cuando en realidad sigue corriendo. `finalize_seconds_per_call`
+    ya viene calibrado por encima del peor caso observado hasta ahora
+    (batch_86bd3e0f, dev_plan_phase_2.md §2.4), no solo por el promedio --
+    el margen es una segunda capa de seguridad, no la única.
+
+    `day_modes` ya viene validado por la tool de agent.py (mismo patrón
+    que `materialize_batch_gallery`/`batch_store.materialize_batch`): una
+    lista no vacía de `'independiente'`/`'split'`, un valor por día.
+    """
+    config = load_batch_config()
+    independent_days = day_modes.count("independiente")
+    split_days = day_modes.count("split")
+    total_model_calls = (
+        independent_days * _MODEL_CALLS_PER_DAY_BY_MODE["independiente"]
+        + split_days * _MODEL_CALLS_PER_DAY_BY_MODE["split"]
+    )
+    generation_seconds = total_model_calls * (
+        config.draft_seconds_per_call + config.finalize_seconds_per_call
+    )
+    deploy_seconds = len(day_modes) * config.deploy_seconds_per_day
+    estimated_seconds = (generation_seconds + deploy_seconds) * config.eta_safety_margin
+    return {
+        "day_count": len(day_modes),
+        "independent_days": independent_days,
+        "split_days": split_days,
+        "total_model_calls": total_model_calls,
+        "estimated_seconds": estimated_seconds,
+        "estimated_minutes": math.ceil(estimated_seconds / 60),
+    }
+
+
+def summarize_batch(batch_id: str, path: Path | None = None) -> dict:
+    """Resumen de "lo que se logró" de un lote (PRD §15.3 paso 9,
+    dev_plan_phase_2.md §2.4), reutilizable por el reporte proactivo de
+    Telegram (Etapa 3): cuenta `batch_item` por `stage` final y separa
+    `needs_attention` por `policy_rejection` vs. falla técnica agotada --
+    nunca infiere esa distinción del texto de `error`, lee la columna
+    persistida tal cual (§2.4, `batch_store.record_item_attempt`).
+    """
+    batch_record = get_batch(batch_id, path=path)
+    if batch_record is None:
+        return {"error": f"No existe un lote con batch_id={batch_id!r}."}
+
+    days = {day.day_index: day for day in get_batch_days(batch_id, path=path)}
+    items = get_batch_items(batch_id, path=path)
+
+    stage_counts: dict[str, int] = {}
+    needs_attention_policy_rejection: list[dict] = []
+    needs_attention_technical: list[dict] = []
+    for item in items:
+        stage_counts[item.stage] = stage_counts.get(item.stage, 0) + 1
+        if item.stage != "needs_attention":
+            continue
+        entry = {"day_index": item.day_index, "panel": item.panel, "error": item.error}
+        if item.policy_rejection:
+            needs_attention_policy_rejection.append(entry)
+        else:
+            needs_attention_technical.append({**entry, "attempts": item.attempts})
+
+    items_by_day: dict[int, dict[str, BatchItemRecord]] = {}
+    for item in items:
+        items_by_day.setdefault(item.day_index, {})[item.panel] = item
+
+    day_summaries = []
+    for day_index, day in sorted(days.items()):
+        panels = {
+            panel: {
+                "stage": item.stage,
+                "image_id": item.image_id,
+                "error": item.error,
+            }
+            for panel, item in items_by_day.get(day_index, {}).items()
+        }
+        day_summaries.append(
+            {
+                "day_index": day_index,
+                "mode": day.mode,
+                "sub_group": day.sub_group,
+                "panels": panels,
+            }
+        )
+
+    return {
+        "batch_id": batch_record.batch_id,
+        "theme": batch_record.theme,
+        "day_count": batch_record.day_count,
+        "stage_counts": stage_counts,
+        "needs_attention_policy_rejection": needs_attention_policy_rejection,
+        "needs_attention_technical": needs_attention_technical,
+        "days": day_summaries,
+    }

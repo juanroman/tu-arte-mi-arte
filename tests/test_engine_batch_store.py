@@ -12,6 +12,10 @@ def test_load_batch_config_reads_retry_ceilings():
 
     assert config.generation_max_attempts == 2
     assert config.tv_deploy_max_attempts == 3
+    assert config.draft_seconds_per_call == 10
+    assert config.finalize_seconds_per_call == 65
+    assert config.deploy_seconds_per_day == 90
+    assert config.eta_safety_margin == 1.2
 
 
 def test_materialize_batch_creates_correct_row_counts_for_mixed_modes(tmp_path):
@@ -235,3 +239,46 @@ def test_record_wide_image_updates_batch_day_without_touching_batch_item(tmp_pat
     assert items["43L"].stage == "pending"
     assert items["43R"].stage == "pending"
     assert items["43L"].image_id is None
+
+
+def test_record_item_attempt_persists_policy_rejection_flag(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+    days = [
+        ApprovedDay(
+            day_index=1,
+            mode="independiente",
+            sub_group="Sub-grupo A",
+            prompts={"43L": "a", "43R": "b", "50": "c"},
+        )
+    ]
+    batch_id = batch_store.materialize_batch("Tema", days, path=db_path)
+
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43L",
+        attempts=1,
+        stage="needs_attention",
+        image_id=None,
+        error="rechazo de política",
+        policy_rejection=True,
+        path=db_path,
+    )
+    # Sin pasar policy_rejection explícito -- debe defaultear a False, sin
+    # perturbar el resto de los campos ya escritos por el intento anterior.
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43R",
+        attempts=1,
+        stage="needs_attention",
+        image_id=None,
+        error="fallo técnico transitorio",
+        path=db_path,
+    )
+
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    assert items["43L"].policy_rejection is True
+    assert items["43R"].policy_rejection is False
