@@ -33,6 +33,17 @@ TABLE IF NOT EXISTS` para que esas bases existentes ganen la columna
 nueva sin perder sus filas, en vez de exigir borrar y re-crear el archivo.
 Primer caso de migración de este módulo; el mismo patrón aplica si un
 campo futuro necesita agregarse a una tabla ya poblada.
+
+Nota de migración (dev_plan_phase_2.md §3.3): `batch.chat_id` (nullable)
+se agregó con el mismo patrón guardado que `policy_rejection` -- las filas
+de `batch` creadas antes de esta iteración quedan con `chat_id=NULL`
+(nunca hubo forma de saberlo, el chat vivía solo como parámetro de función
+mientras duraba la conversación de Telegram que confirmó el lote). No hay
+backfill automático que infiera un `chat_id` retroactivo: la reconciliación
+al reiniciar (`telegram_bot.reconcile_batches_on_startup`) trata un lote no
+terminal sin `chat_id` como un caso legado -- avisa por broadcast a los
+usuarios permitidos en vez de intentar reanudarlo, porque no hay a quién
+reportarle el resultado.
 """
 
 import contextlib
@@ -80,6 +91,7 @@ class BatchRecord:
     status: str
     schedule_config: str | None
     created_at: str
+    chat_id: int | None = None
 
 
 @dataclass
@@ -147,7 +159,8 @@ def _connect(path: Path) -> sqlite3.Connection:
         "day_count INTEGER NOT NULL, "
         "status TEXT NOT NULL, "
         "schedule_config TEXT, "
-        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "chat_id INTEGER"
         ")"
     )
     conn.execute(
@@ -180,6 +193,8 @@ def _connect(path: Path) -> sqlite3.Connection:
             "ALTER TABLE batch_item "
             "ADD COLUMN policy_rejection INTEGER NOT NULL DEFAULT 0"
         )
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE batch ADD COLUMN chat_id INTEGER")
     return conn
 
 
@@ -243,13 +258,58 @@ def materialize_batch(
 def get_batch(batch_id: str, path: Path | None = None) -> BatchRecord | None:
     with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
         row = conn.execute(
-            "SELECT batch_id, theme, day_count, status, schedule_config, created_at "
-            "FROM batch WHERE batch_id = ?",
+            "SELECT batch_id, theme, day_count, status, schedule_config, "
+            "created_at, chat_id FROM batch WHERE batch_id = ?",
             (batch_id,),
         ).fetchone()
     if row is None:
         return None
     return BatchRecord(*row)
+
+
+def list_non_terminal_batches(path: Path | None = None) -> list[BatchRecord]:
+    """Lotes cuyo `status` todavía no es `'reported'` (dev_plan_phase_2.md
+    §3.3, requisito duro #6) -- incluye tanto los recién materializados
+    (`'materialized'`) como los que ya arrancaron a correr pero el proceso
+    murió antes de que el reporte final se mandara (`'running'`). Al
+    arrancar, el bot reconcilia cada uno de estos: los reanuda si conoce su
+    `chat_id`, o avisa por broadcast si no (lote de antes de esta
+    iteración, ver nota de módulo sobre migración).
+    """
+    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
+        rows = conn.execute(
+            "SELECT batch_id, theme, day_count, status, schedule_config, "
+            "created_at, chat_id FROM batch WHERE status != 'reported' "
+            "ORDER BY created_at"
+        ).fetchall()
+    return [BatchRecord(*row) for row in rows]
+
+
+def set_batch_chat_id(batch_id: str, chat_id: int, path: Path | None = None) -> None:
+    """Persiste a qué chat de Telegram pertenece un lote, en el momento en
+    que se confirma (dev_plan_phase_2.md §3.3) -- es lo único que permite a
+    la reconciliación al reiniciar saber a dónde reportar un lote que
+    quedó a medias tras un crash del proceso.
+    """
+    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
+        conn.execute(
+            "UPDATE batch SET chat_id = ? WHERE batch_id = ?", (chat_id, batch_id)
+        )
+
+
+def set_batch_status(batch_id: str, status: str, path: Path | None = None) -> None:
+    """Actualiza `batch.status` (dev_plan_phase_2.md §3.3): `'materialized'`
+    (recién confirmado) -> `'running'` (el corredor de fondo arrancó,
+    fresco o reanudado tras un reinicio, da igual) -> `'reported'`
+    (terminal, el reporte proactivo final ya se mandó). Un lote nunca
+    "falla" a este nivel -- las fallas ya viven por `batch_item`
+    (`needs_attention`), y el corredor siempre termina en un estado
+    reportable, así que no existe un tercer valor terminal de error.
+    """
+    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
+        conn.execute(
+            "UPDATE batch SET status = ? WHERE batch_id = ?", (status, batch_id)
+        )
 
 
 def get_batch_days(batch_id: str, path: Path | None = None) -> list[BatchDayRecord]:
