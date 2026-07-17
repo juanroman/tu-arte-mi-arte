@@ -22,6 +22,17 @@ haya fallado -- así una re-invocación que solo falló al partir nunca
 vuelve a llamar `generation.generate_final_high_res` sobre la fuente,
 solo reintenta el split.
 
+Escritura atómica de días split (§2.5, requisito duro #5): cuando un
+intento sobre un día split escribe más de una fila a la vez (los dos
+`batch_item` de 43L/43R, y a veces también `batch_day`), lo hace en una
+sola transacción vía `batch_store.record_split_day_outcome` -- nunca con
+llamadas separadas a `record_item_attempt`/`record_wide_image`, que
+dejarían una ventana real de inconsistencia si el proceso muere entre
+escrituras (43R huérfano, o `wide_stage` sin avanzar mientras los
+paneles ya sí lo hicieron, lo que dispararía una regeneración/reintento
+espurio de la fuente ancha en la reinvocación, violando potencialmente
+el requisito duro #1 sobre un `policy_rejection`).
+
 Procesamiento secuencial, no paralelo: a diferencia de
 `tv_deploy.deploy_set_to_panels` (TVs físicas independientes, sin cuota
 compartida), la generación de imágenes comparte una sola cuota de la
@@ -38,11 +49,14 @@ from engine.art_direction import ArtDirection, build_prompt, load_art_direction
 from engine.batch_store import (
     BatchDayRecord,
     BatchItemRecord,
+    PanelOutcome,
+    WideOutcome,
     get_batch,
     get_batch_days,
     get_batch_items,
     load_batch_config,
     record_item_attempt,
+    record_split_day_outcome,
     record_wide_image,
 )
 from engine.generation import generate_final_high_res, generate_image
@@ -148,43 +162,34 @@ def _draft_split_day(
     )
 
     if "image_id" in result:
-        for panel in ("43L", "43R"):
-            record_item_attempt(
-                batch_id,
-                day.day_index,
-                panel,
-                attempts=attempts,
-                stage="drafted",
-                image_id=None,
-                error=None,
-                path=path,
-            )
-        record_wide_image(
+        record_split_day_outcome(
             batch_id,
             day.day_index,
-            wide_image_id=result["image_id"],
-            wide_stage="drafted",
+            panel_43l=PanelOutcome(attempts=attempts, stage="drafted"),
+            panel_43r=PanelOutcome(attempts=attempts, stage="drafted"),
+            wide=WideOutcome(wide_image_id=result["image_id"], wide_stage="drafted"),
             path=path,
         )
         return "drafted"
 
-    for panel in ("43L", "43R"):
-        record_item_attempt(
-            batch_id,
-            day.day_index,
-            panel,
-            attempts=attempts,
-            stage="needs_attention",
-            image_id=None,
-            error=result.get("error"),
-            policy_rejection=bool(result.get("policy_rejection")),
-            path=path,
-        )
-    record_wide_image(
+    panel_error = result.get("error")
+    panel_policy_rejection = bool(result.get("policy_rejection"))
+    record_split_day_outcome(
         batch_id,
         day.day_index,
-        wide_image_id=None,
-        wide_stage="needs_attention",
+        panel_43l=PanelOutcome(
+            attempts=attempts,
+            stage="needs_attention",
+            error=panel_error,
+            policy_rejection=panel_policy_rejection,
+        ),
+        panel_43r=PanelOutcome(
+            attempts=attempts,
+            stage="needs_attention",
+            error=panel_error,
+            policy_rejection=panel_policy_rejection,
+        ),
+        wide=WideOutcome(wide_image_id=None, wide_stage="needs_attention"),
         path=path,
     )
     return "needs_attention"
@@ -325,23 +330,26 @@ def _finalize_split_day(
         )
 
         if "image_id" not in result:
-            for panel in ("43L", "43R"):
-                record_item_attempt(
-                    batch_id,
-                    day.day_index,
-                    panel,
-                    attempts=attempts,
-                    stage="needs_attention",
-                    image_id=None,
-                    error=result.get("error"),
-                    policy_rejection=bool(result.get("policy_rejection")),
-                    path=path,
-                )
-            record_wide_image(
+            finalize_error = result.get("error")
+            finalize_policy_rejection = bool(result.get("policy_rejection"))
+            record_split_day_outcome(
                 batch_id,
                 day.day_index,
-                wide_image_id=day.wide_image_id,
-                wide_stage="needs_attention",
+                panel_43l=PanelOutcome(
+                    attempts=attempts,
+                    stage="needs_attention",
+                    error=finalize_error,
+                    policy_rejection=finalize_policy_rejection,
+                ),
+                panel_43r=PanelOutcome(
+                    attempts=attempts,
+                    stage="needs_attention",
+                    error=finalize_error,
+                    policy_rejection=finalize_policy_rejection,
+                ),
+                wide=WideOutcome(
+                    wide_image_id=day.wide_image_id, wide_stage="needs_attention"
+                ),
                 path=path,
             )
             return "needs_attention"
@@ -364,38 +372,36 @@ def _finalize_split_day(
     split_result = split_wide_image(wide_image_id, split_config.gap_fraction)
 
     if "error" in split_result:
-        for panel in ("43L", "43R"):
-            record_item_attempt(
-                batch_id,
-                day.day_index,
-                panel,
+        record_split_day_outcome(
+            batch_id,
+            day.day_index,
+            panel_43l=PanelOutcome(
                 attempts=attempts,
                 stage="needs_attention",
-                image_id=None,
                 error=split_result["error"],
-                policy_rejection=False,
-                path=path,
-            )
+            ),
+            panel_43r=PanelOutcome(
+                attempts=attempts,
+                stage="needs_attention",
+                error=split_result["error"],
+            ),
+            path=path,
+        )
         return "needs_attention"
 
-    record_item_attempt(
+    record_split_day_outcome(
         batch_id,
         day.day_index,
-        "43L",
-        attempts=attempts,
-        stage="finalized",
-        image_id=split_result["left"]["image_id"],
-        error=None,
-        path=path,
-    )
-    record_item_attempt(
-        batch_id,
-        day.day_index,
-        "43R",
-        attempts=attempts,
-        stage="finalized",
-        image_id=split_result["right"]["image_id"],
-        error=None,
+        panel_43l=PanelOutcome(
+            attempts=attempts,
+            stage="finalized",
+            image_id=split_result["left"]["image_id"],
+        ),
+        panel_43r=PanelOutcome(
+            attempts=attempts,
+            stage="finalized",
+            image_id=split_result["right"]["image_id"],
+        ),
         path=path,
     )
     return "finalized"

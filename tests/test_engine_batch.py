@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from engine import (
@@ -745,3 +747,290 @@ def test_summarize_batch_distinguishes_policy_rejection_from_technical_failure(
     day_2 = next(day for day in result["days"] if day["day_index"] == 2)
     assert day_2["mode"] == "split"
     assert day_2["sub_group"] == "Sub-grupo B"
+
+
+# --- 2.5: resumibilidad ante reinicio -----------------------------------
+
+
+def _spy_on_record_split_day_outcome(monkeypatch):
+    """Wraps the real `batch.record_split_day_outcome` with a spy that still
+    calls through to the real implementation, so tests can assert *how*
+    a split day's outcome was persisted (one atomic call) without faking
+    away the actual database write.
+    """
+    calls = []
+    real = batch.record_split_day_outcome
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(batch, "record_split_day_outcome", spy)
+    return calls
+
+
+def _spy_on_record_item_attempt(monkeypatch):
+    """Same spying pattern for `batch.record_item_attempt`, used to assert
+    that a split day's shared panels (43L/43R) never go through this
+    single-row function -- only `record_split_day_outcome` should touch
+    them, since two separate single-row writes would reopen the atomicity
+    gap this iteration closes.
+    """
+    calls = []
+    real = batch.record_item_attempt
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(batch, "record_item_attempt", spy)
+    return calls
+
+
+def test_draft_split_day_success_writes_atomically(tmp_path, monkeypatch):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+    monkeypatch.setattr(batch, "generate_image", _succeeding_generate_image([]))
+    outcome_calls = _spy_on_record_split_day_outcome(monkeypatch)
+    item_calls = _spy_on_record_item_attempt(monkeypatch)
+
+    batch.run_draft_stage(batch_id, path=db_path)
+
+    assert len(outcome_calls) == 1
+    # El panel 50 (independiente incluso en un día split) sí pasa por
+    # record_item_attempt -- solo 43L/43R nunca deben hacerlo.
+    panels_via_item_attempt = {call[0][2] for call in item_calls}
+    assert "43L" not in panels_via_item_attempt
+    assert "43R" not in panels_via_item_attempt
+
+
+def test_draft_split_day_failure_writes_atomically(tmp_path, monkeypatch):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+
+    def fake(prompt, aspect_ratio):
+        return {"error": "fallo técnico transitorio"}
+
+    monkeypatch.setattr(batch, "generate_image", fake)
+    outcome_calls = _spy_on_record_split_day_outcome(monkeypatch)
+    item_calls = _spy_on_record_item_attempt(monkeypatch)
+
+    batch.run_draft_stage(batch_id, path=db_path)
+
+    assert len(outcome_calls) == 1
+    panels_via_item_attempt = {call[0][2] for call in item_calls}
+    assert "43L" not in panels_via_item_attempt
+    assert "43R" not in panels_via_item_attempt
+
+
+def test_finalize_split_day_wide_failure_writes_atomically(tmp_path, monkeypatch):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+    _draft_successfully(batch_id, db_path, monkeypatch)
+
+    def fake_finalize(image_id):
+        return {"error": "fallo técnico transitorio"}
+
+    monkeypatch.setattr(batch, "generate_final_high_res", fake_finalize)
+    outcome_calls = _spy_on_record_split_day_outcome(monkeypatch)
+    item_calls = _spy_on_record_item_attempt(monkeypatch)
+
+    batch.run_finalize_stage(batch_id, path=db_path)
+
+    assert len(outcome_calls) == 1
+    panels_via_item_attempt = {call[0][2] for call in item_calls}
+    assert "43L" not in panels_via_item_attempt
+    assert "43R" not in panels_via_item_attempt
+
+
+def test_finalize_split_day_split_failure_writes_atomically(tmp_path, monkeypatch):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+    _draft_successfully(batch_id, db_path, monkeypatch)
+    monkeypatch.setattr(
+        batch, "generate_final_high_res", _succeeding_generate_final_high_res([])
+    )
+
+    def failing_split(image_id, gap_fraction):
+        return {"error": "no existe una imagen fuente"}
+
+    monkeypatch.setattr(batch, "split_wide_image", failing_split)
+    outcome_calls = _spy_on_record_split_day_outcome(monkeypatch)
+    item_calls = _spy_on_record_item_attempt(monkeypatch)
+
+    batch.run_finalize_stage(batch_id, path=db_path)
+
+    assert len(outcome_calls) == 1
+    panels_via_item_attempt = {call[0][2] for call in item_calls}
+    assert "43L" not in panels_via_item_attempt
+    assert "43R" not in panels_via_item_attempt
+
+
+def test_finalize_split_day_success_writes_atomically(tmp_path, monkeypatch):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+    _draft_successfully(batch_id, db_path, monkeypatch)
+    monkeypatch.setattr(
+        batch, "generate_final_high_res", _succeeding_generate_final_high_res([])
+    )
+    monkeypatch.setattr(batch, "split_wide_image", _succeeding_split_wide_image([]))
+    outcome_calls = _spy_on_record_split_day_outcome(monkeypatch)
+    item_calls = _spy_on_record_item_attempt(monkeypatch)
+
+    batch.run_finalize_stage(batch_id, path=db_path)
+
+    assert len(outcome_calls) == 1
+    panels_via_item_attempt = {call[0][2] for call in item_calls}
+    assert "43L" not in panels_via_item_attempt
+    assert "43R" not in panels_via_item_attempt
+
+
+def _materialize_two_independiente_days(db_path):
+    days = [
+        ApprovedDay(
+            day_index=1,
+            mode="independiente",
+            sub_group="Sub-grupo A",
+            prompts={"43L": "l uno", "43R": "r uno", "50": "50 uno"},
+        ),
+        ApprovedDay(
+            day_index=2,
+            mode="independiente",
+            sub_group="Sub-grupo A",
+            prompts={"43L": "l dos", "43R": "r dos", "50": "50 dos"},
+        ),
+    ]
+    return batch_store.materialize_batch("Tema", days, path=db_path)
+
+
+def test_run_draft_stage_resumes_after_simulated_crash_mid_batch(tmp_path, monkeypatch):
+    """Simula un `kill -9` real del proceso a la mitad del lote: la
+    excepción se propaga sin que ningún worker la atrape (ninguno lo hace
+    hoy), dejando el día ya commiteado intacto en disco. Reinvocar el
+    corredor completa exactamente lo que faltaba, sin duplicar las
+    llamadas del día ya terminado -- requisito duro #5.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_two_independiente_days(db_path)
+    calls = []
+
+    def crashing_after_first_day(prompt, aspect_ratio):
+        if len(calls) == 3:
+            raise RuntimeError("proceso murió a la mitad del lote (simulado)")
+        calls.append((prompt, aspect_ratio))
+        return {"image_id": f"img_{len(calls)}"}
+
+    monkeypatch.setattr(batch, "generate_image", crashing_after_first_day)
+
+    with pytest.raises(RuntimeError):
+        batch.run_draft_stage(batch_id, path=db_path)
+
+    items = {
+        (item.day_index, item.panel): item
+        for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    for panel in ("43L", "43R", "50"):
+        assert items[(1, panel)].stage == "drafted"
+        assert items[(2, panel)].stage == "pending"
+    assert len(calls) == 3
+
+    # "Reinicio": una segunda invocación con un fake sano completa lo que
+    # faltaba sin volver a llamar por el día 1.
+    monkeypatch.setattr(batch, "generate_image", _succeeding_generate_image(calls))
+    second_summary = batch.run_draft_stage(batch_id, path=db_path)
+
+    assert set(second_summary["drafted"]) == {"2:43L", "2:43R", "2:50"}
+    assert set(second_summary["skipped"]) == {"1:43L", "1:43R", "1:50"}
+    assert len(calls) == 6  # 3 del día 1 (antes del crash) + 3 del día 2
+
+    items = {
+        (item.day_index, item.panel): item
+        for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    for panel in ("43L", "43R", "50"):
+        assert items[(2, panel)].stage == "drafted"
+
+
+def test_run_finalize_stage_resumes_after_simulated_crash_mid_batch(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_two_independiente_days(db_path)
+    _draft_successfully(batch_id, db_path, monkeypatch)
+
+    calls = []
+
+    def crashing_after_first_day(image_id):
+        if len(calls) == 3:
+            raise RuntimeError("proceso murió a la mitad del lote (simulado)")
+        calls.append(image_id)
+        return {"image_id": f"final_{image_id}"}
+
+    monkeypatch.setattr(batch, "generate_final_high_res", crashing_after_first_day)
+
+    with pytest.raises(RuntimeError):
+        batch.run_finalize_stage(batch_id, path=db_path)
+
+    items = {
+        (item.day_index, item.panel): item
+        for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    for panel in ("43L", "43R", "50"):
+        assert items[(1, panel)].stage == "finalized"
+        assert items[(2, panel)].stage == "drafted"
+    assert len(calls) == 3
+
+    monkeypatch.setattr(
+        batch, "generate_final_high_res", _succeeding_generate_final_high_res(calls)
+    )
+    second_summary = batch.run_finalize_stage(batch_id, path=db_path)
+
+    assert set(second_summary["finalized"]) == {"2:43L", "2:43R", "2:50"}
+    assert set(second_summary["skipped"]) == {"1:43L", "1:43R", "1:50"}
+    assert len(calls) == 6
+
+
+def test_run_draft_stage_split_day_crash_before_any_write_leaves_nothing_partial(
+    tmp_path, monkeypatch
+):
+    """Caso central del requisito duro #5 para días split: el crash ocurre
+    ANTES de cualquier escritura (a mitad de la llamada al modelo para la
+    imagen ancha compartida) -- confirma que no queda ningún estado a
+    medias (todo sigue en 'pending') y que la reinvocación genera la
+    imagen ancha una sola vez, nunca dos.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+
+    def crashing_on_wide(prompt, aspect_ratio):
+        raise RuntimeError("proceso murió generando la imagen ancha (simulado)")
+
+    monkeypatch.setattr(batch, "generate_image", crashing_on_wide)
+
+    with pytest.raises(RuntimeError):
+        batch.run_draft_stage(batch_id, path=db_path)
+
+    day = batch_store.get_batch_days(batch_id, path=db_path)[0]
+    assert day.wide_stage == "pending"
+    assert day.wide_image_id is None
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    assert items["43L"].stage == "pending"
+    assert items["43R"].stage == "pending"
+    assert items["50"].stage == "pending"
+
+    calls = []
+    monkeypatch.setattr(batch, "generate_image", _succeeding_generate_image(calls))
+    second_summary = batch.run_draft_stage(batch_id, path=db_path)
+
+    assert set(second_summary["drafted"]) == {"1:wide", "1:50"}
+    assert len(calls) == 2  # wide + 50, nunca duplicado
+
+    day = batch_store.get_batch_days(batch_id, path=db_path)[0]
+    assert day.wide_stage == "drafted"
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    assert items["43L"].stage == "drafted"
+    assert items["43R"].stage == "drafted"

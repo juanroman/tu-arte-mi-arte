@@ -1,10 +1,17 @@
+import sqlite3
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from engine import batch_store  # noqa: E402
-from engine.batch_store import ApprovedDay  # noqa: E402
+from engine.batch_store import (  # noqa: E402
+    ApprovedDay,
+    PanelOutcome,
+    WideOutcome,
+)
 
 
 def test_load_batch_config_reads_retry_ceilings():
@@ -282,3 +289,103 @@ def test_record_item_attempt_persists_policy_rejection_flag(tmp_path):
     }
     assert items["43L"].policy_rejection is True
     assert items["43R"].policy_rejection is False
+
+
+def _materialize_split_day(db_path, day_index=1):
+    days = [
+        ApprovedDay(
+            day_index=day_index,
+            mode="split",
+            sub_group="Sub-grupo A",
+            prompts={"wide": "un horizonte compartido", "50": "otra escena"},
+        )
+    ]
+    return batch_store.materialize_batch("Tema", days, path=db_path)
+
+
+def test_record_split_day_outcome_writes_both_panels_and_wide_atomically(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+
+    batch_store.record_split_day_outcome(
+        batch_id,
+        1,
+        panel_43l=PanelOutcome(attempts=1, stage="drafted"),
+        panel_43r=PanelOutcome(attempts=1, stage="drafted"),
+        wide=WideOutcome(wide_image_id="img_wide001", wide_stage="drafted"),
+        path=db_path,
+    )
+
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    assert items["43L"].stage == "drafted"
+    assert items["43R"].stage == "drafted"
+    assert items["43L"].attempts == 1
+    assert items["43R"].attempts == 1
+
+    day = batch_store.get_batch_days(batch_id, path=db_path)[0]
+    assert day.wide_image_id == "img_wide001"
+    assert day.wide_stage == "drafted"
+
+
+def test_record_split_day_outcome_with_wide_none_leaves_batch_day_untouched(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+    batch_store.record_wide_image(
+        batch_id, 1, wide_image_id="img_wide001", wide_stage="finalized", path=db_path
+    )
+
+    batch_store.record_split_day_outcome(
+        batch_id,
+        1,
+        panel_43l=PanelOutcome(attempts=1, stage="finalized", image_id="img_L"),
+        panel_43r=PanelOutcome(attempts=1, stage="finalized", image_id="img_R"),
+        wide=None,
+        path=db_path,
+    )
+
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    assert items["43L"].image_id == "img_L"
+    assert items["43R"].image_id == "img_R"
+
+    # batch_day no se tocó -- sigue con el valor escrito antes de esta llamada.
+    day = batch_store.get_batch_days(batch_id, path=db_path)[0]
+    assert day.wide_image_id == "img_wide001"
+    assert day.wide_stage == "finalized"
+
+
+def test_record_split_day_outcome_rolls_back_fully_on_mid_transaction_failure(
+    tmp_path,
+):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+
+    # `stage` es NOT NULL -- forzar una violación real de SQLite a mitad de
+    # la transacción (después de que 43L ya se "escribió" dentro de la misma
+    # transacción, antes de commitear) para confirmar que el fallo revierte
+    # TODAS las filas, no solo dejarlas a medio escribir.
+    with pytest.raises(sqlite3.IntegrityError):
+        batch_store.record_split_day_outcome(
+            batch_id,
+            1,
+            panel_43l=PanelOutcome(attempts=1, stage="drafted"),
+            panel_43r=PanelOutcome(attempts=1, stage=None),  # type: ignore[arg-type]
+            wide=WideOutcome(wide_image_id="img_wide001", wide_stage="drafted"),
+            path=db_path,
+        )
+
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    # Ninguna fila quedó modificada -- ni 43L (escrito primero en la misma
+    # transacción), ni batch_day.
+    assert items["43L"].stage == "pending"
+    assert items["43L"].attempts == 0
+    assert items["43R"].stage == "pending"
+
+    day = batch_store.get_batch_days(batch_id, path=db_path)[0]
+    assert day.wide_stage == "pending"
+    assert day.wide_image_id is None

@@ -106,6 +106,32 @@ class BatchItemRecord:
     policy_rejection: bool
 
 
+@dataclass
+class PanelOutcome:
+    """Resultado de un intento sobre un panel físico (43L/43R), tal como lo
+    escribiría `record_item_attempt` -- usado por `record_split_day_outcome`
+    (§2.5) para describir ambos paneles de un día split antes de escribirlos
+    en una sola transacción.
+    """
+
+    attempts: int
+    stage: str
+    image_id: str | None = None
+    error: str | None = None
+    policy_rejection: bool = False
+
+
+@dataclass
+class WideOutcome:
+    """Resultado de un intento sobre la imagen ancha compartida de un día
+    split, tal como lo escribiría `record_wide_image` -- usado por
+    `record_split_day_outcome` (§2.5).
+    """
+
+    wide_image_id: str | None
+    wide_stage: str
+
+
 def _new_batch_id() -> str:
     return f"batch_{uuid.uuid4().hex[:8]}"
 
@@ -261,6 +287,50 @@ def get_batch_items(batch_id: str, path: Path | None = None) -> list[BatchItemRe
     ]
 
 
+def _execute_item_update(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    day_index: int,
+    panel: str,
+    *,
+    attempts: int,
+    stage: str,
+    image_id: str | None,
+    error: str | None,
+    policy_rejection: bool,
+) -> None:
+    conn.execute(
+        "UPDATE batch_item SET attempts = ?, stage = ?, image_id = ?, "
+        "error = ?, policy_rejection = ?, updated_at = CURRENT_TIMESTAMP "
+        "WHERE batch_id = ? AND day_index = ? AND panel = ?",
+        (
+            attempts,
+            stage,
+            image_id,
+            error,
+            int(policy_rejection),
+            batch_id,
+            day_index,
+            panel,
+        ),
+    )
+
+
+def _execute_wide_update(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    day_index: int,
+    *,
+    wide_image_id: str | None,
+    wide_stage: str,
+) -> None:
+    conn.execute(
+        "UPDATE batch_day SET wide_image_id = ?, wide_stage = ? "
+        "WHERE batch_id = ? AND day_index = ?",
+        (wide_image_id, wide_stage, batch_id, day_index),
+    )
+
+
 def record_item_attempt(
     batch_id: str,
     day_index: int,
@@ -282,22 +352,24 @@ def record_item_attempt(
     que un reporte de lote (dev_plan_phase_2.md §2.4) distinga un rechazo de
     política de una falla técnica agotada sin tener que inferirlo del texto
     de `error`.
+
+    Escribe una sola fila -- ya atómico por sí solo. Para un día split, donde
+    un intento se escribe en varias filas a la vez (43L/43R y opcionalmente
+    `batch_day`), usar `record_split_day_outcome` (§2.5) en su lugar: llamar
+    esta función varias veces seguidas para el mismo intento deja una ventana
+    real de inconsistencia ante un crash de proceso a la mitad.
     """
     with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
-        conn.execute(
-            "UPDATE batch_item SET attempts = ?, stage = ?, image_id = ?, "
-            "error = ?, policy_rejection = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE batch_id = ? AND day_index = ? AND panel = ?",
-            (
-                attempts,
-                stage,
-                image_id,
-                error,
-                int(policy_rejection),
-                batch_id,
-                day_index,
-                panel,
-            ),
+        _execute_item_update(
+            conn,
+            batch_id,
+            day_index,
+            panel,
+            attempts=attempts,
+            stage=stage,
+            image_id=image_id,
+            error=error,
+            policy_rejection=policy_rejection,
         )
 
 
@@ -311,11 +383,77 @@ def record_wide_image(
 ) -> None:
     """Persiste el resultado de un intento sobre la imagen ancha compartida
     de un día split (`batch_day.wide_image_id`/`wide_stage`) -- mismo
-    principio de escritura completa que `record_item_attempt`.
+    principio de escritura completa que `record_item_attempt`. Ver la misma
+    advertencia sobre `record_split_day_outcome` cuando este intento también
+    implica escribir 43L/43R en la misma operación lógica.
     """
     with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
-        conn.execute(
-            "UPDATE batch_day SET wide_image_id = ?, wide_stage = ? "
-            "WHERE batch_id = ? AND day_index = ?",
-            (wide_image_id, wide_stage, batch_id, day_index),
+        _execute_wide_update(
+            conn,
+            batch_id,
+            day_index,
+            wide_image_id=wide_image_id,
+            wide_stage=wide_stage,
         )
+
+
+def record_split_day_outcome(
+    batch_id: str,
+    day_index: int,
+    *,
+    panel_43l: PanelOutcome,
+    panel_43r: PanelOutcome,
+    wide: WideOutcome | None = None,
+    path: Path | None = None,
+) -> None:
+    """Persiste en una sola transacción SQLite el resultado de un intento
+    sobre un día split que toca varias filas a la vez: los dos `batch_item`
+    físicos (43L/43R) y, si `wide` no es `None`, también `batch_day.wide_image_id`/
+    `wide_stage` (§2.5, requisito duro #5).
+
+    Existe porque escribir estas filas con llamadas separadas
+    (`record_item_attempt` × 2 + `record_wide_image`, cada una su propia
+    transacción) deja una ventana real de inconsistencia ante un crash de
+    proceso a la mitad: los paneles pueden quedar en `drafted`/`needs_attention`
+    mientras `wide_stage` sigue en `pending` (una reinvocación no reconoce el
+    trabajo ya hecho y vuelve a llamar al modelo -- gasto duplicado, y si fue
+    un `policy_rejection`, lo reintenta, violando el requisito duro #1), o
+    43R puede quedar huérfano si el proceso muere justo después de escribir
+    43L. Con una sola transacción, un crash a mitad de la operación dejará
+    todas las filas sin tocar (rollback) en vez de a medio escribir.
+
+    `wide=None` cuando el intento solo re-escribe los paneles físicos porque
+    la fuente ancha ya se finalizó en un paso previo (ya atómico por sí solo,
+    de una sola fila) -- no toca `batch_day`.
+    """
+    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
+        _execute_item_update(
+            conn,
+            batch_id,
+            day_index,
+            "43L",
+            attempts=panel_43l.attempts,
+            stage=panel_43l.stage,
+            image_id=panel_43l.image_id,
+            error=panel_43l.error,
+            policy_rejection=panel_43l.policy_rejection,
+        )
+        _execute_item_update(
+            conn,
+            batch_id,
+            day_index,
+            "43R",
+            attempts=panel_43r.attempts,
+            stage=panel_43r.stage,
+            image_id=panel_43r.image_id,
+            error=panel_43r.error,
+            policy_rejection=panel_43r.policy_rejection,
+        )
+        if wide is not None:
+            _execute_wide_update(
+                conn,
+                batch_id,
+                day_index,
+                wide_image_id=wide.wide_image_id,
+                wide_stage=wide.wide_stage,
+            )
