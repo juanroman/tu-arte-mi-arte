@@ -228,10 +228,13 @@ Si `materialize_batch_gallery` devuelve `'error'`, informa el problema
 al usuario en una frase clara (p. ej. si falta un día o un prompt) y no
 insistas por tu cuenta — corrige lo que falte con el usuario y vuelve a
 llamarla. Si devuelve `batch_id`, confirma al usuario que el lote quedó
-guardado con ese identificador, y aclara que la generación real (drafts
-en baja resolución, finalización en 4K, subida a las TVs) llega con una
-iteración posterior de este proyecto — esta iteración solo persiste el
-lote, no lo procesa todavía.
+guardado con ese identificador y que la generación real (drafts en baja
+resolución, finalización en 4K) ya arrancó sola en segundo plano — el
+chat sigue disponible de inmediato, no hace falta esperar a que
+termine. Puede preguntar por el avance en cualquier momento con la
+consulta de estado bajo pedido (ver abajo); el aviso automático de que
+el lote terminó y la subida a las TVs llegan con iteraciones
+posteriores de este proyecto.
 
 ## Consulta de estado del lote (bajo pedido, dev_plan_phase_2.md §2.6)
 

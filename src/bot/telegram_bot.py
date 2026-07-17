@@ -61,6 +61,7 @@ from telegram.ext import filters as tg_filters
 from agents.tu_arte_mi_arte.agent import root_agent
 from bot import preview_store, session_store
 from engine import tv_deploy
+from engine.batch import run_draft_stage, run_finalize_stage
 from engine.generation import IMAGES_DIR
 
 _logger = logging.getLogger(__name__)
@@ -336,6 +337,50 @@ def _extract_deploy_results(events: list) -> dict | None:
     return result
 
 
+def _extract_materialized_batch_id(events: list) -> str | None:
+    """Devuelve el `batch_id` de la última llamada exitosa a
+    `materialize_batch_gallery` en la corrida, o None si esa tool no se
+    llamó (o falló) en este turno. Mismo patrón de caminar
+    `event.content.parts` que `_extract_deploy_results`.
+    """
+    batch_id = None
+    for event_ in events:
+        if not event_.content or not event_.content.parts:
+            continue
+        for part in event_.content.parts:
+            if (
+                part.function_response
+                and part.function_response.name == "materialize_batch_gallery"
+            ):
+                data = part.function_response.response or {}
+                if "error" not in data:
+                    batch_id = data.get("batch_id")
+    return batch_id
+
+
+async def _run_batch_engine_in_background(batch_id: str) -> None:
+    """Corre el corredor completo de un lote recién confirmado (draft 1K
+    -> finalización 4K, PRD §15.3 paso 8) fuera del turno de Telegram que
+    lo disparó (dev_plan_phase_2.md §3.1, requisito duro #7: confirmar un
+    lote nunca bloquea el turno). `run_draft_stage`/`run_finalize_stage`
+    (Etapa 2, ya probados) son funciones síncronas que pueden tardar
+    minutos contra la API real de Gemini -- se corren en un hilo aparte
+    (mismo patrón que `revert_command_handler` con `tv_deploy.revert_panels`)
+    para no bloquear el loop de eventos del bot mientras corren.
+
+    No manda ningún mensaje al terminar (el reporte proactivo es 3.2) ni
+    actualiza `batch.status` (la reconciliación al reiniciar es 3.3, con
+    su propio diseño de esa máquina de estados). Una excepción real que
+    escape de aquí (no capturada por el corredor, p. ej. un fallo de I/O)
+    se propaga a través de `Application.create_task`, que la enruta a
+    `global_error_handler` -- nunca desaparece en silencio.
+    """
+    _logger.info("Corredor de lote arrancó en segundo plano: batch_id=%s", batch_id)
+    await asyncio.to_thread(run_draft_stage, batch_id)
+    await asyncio.to_thread(run_finalize_stage, batch_id)
+    _logger.info("Corredor de lote terminó en segundo plano: batch_id=%s", batch_id)
+
+
 def _partially_failed_tvs(deploy_results: dict) -> list[str]:
     """De un resultado de deploy_to_panels, devuelve los nombres de las TVs
     que sí se desplegaron con éxito, solo si el resultado es una falla
@@ -399,7 +444,12 @@ def _panels_album(preview: "_ComposedPreview") -> list[InputMediaPhoto]:
 
 
 async def _deliver_turn_result(
-    bot: object, chat_id: int, session_id: str, progress_message: object, events: list
+    application: object,
+    bot: object,
+    chat_id: int,
+    session_id: str,
+    progress_message: object,
+    events: list,
 ) -> None:
     """Por cada preview compuesto en la corrida: manda primero un álbum
     con las tres piezas por separado (detalle real de cada panel), luego
@@ -413,6 +463,12 @@ async def _deliver_turn_result(
     pantallas sí, otras no), manda además un aviso con un botón "↩️
     Revertir cambios" atado solo a las TVs que sí cambiaron — nunca a la
     que falló, porque esa nunca se tocó (dev_plan §3.5).
+
+    Si el turno materializó un lote de galería (`materialize_batch_gallery`,
+    dev_plan_phase_2.md §3.1), dispara el corredor completo (draft ->
+    finalización 4K) como tarea de fondo vía `application.create_task` —
+    el turno no espera a que termine, cumpliendo el requisito duro #7
+    (confirmar un lote nunca bloquea el turno de Telegram).
     """
     for preview in _extract_compose_previews(events):
         token = preview_store.new_token()
@@ -467,6 +523,12 @@ async def _deliver_turn_result(
                 reply_markup=_revert_keyboard(succeeded),
             )
 
+    materialized_batch_id = _extract_materialized_batch_id(events)
+    if materialized_batch_id is not None:
+        application.create_task(  # type: ignore[attr-defined]
+            _run_batch_engine_in_background(materialized_batch_id)
+        )
+
     reply_text = _final_text(events) or "Listo."
     await progress_message.edit_text(  # type: ignore[attr-defined]
         _to_markdown_v2(reply_text), parse_mode=ParseMode.MARKDOWN_V2
@@ -476,6 +538,7 @@ async def _deliver_turn_result(
 async def _run_and_deliver(
     runner: Runner,
     session_service: DatabaseSessionService,
+    application: object,
     bot: object,
     chat_id: int,
     user_id: str,
@@ -505,7 +568,9 @@ async def _run_and_deliver(
         events = await _run_turn_with_progress(
             runner, bot, chat_id, user_id, session_id, text
         )
-        await _deliver_turn_result(bot, chat_id, session_id, progress_message, events)
+        await _deliver_turn_result(
+            application, bot, chat_id, session_id, progress_message, events
+        )
     except Exception:
         _logger.exception("Turno falló para chat_id=%s", chat_id)
         await progress_message.edit_text(  # type: ignore[attr-defined]
@@ -618,6 +683,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _run_and_deliver(
         runner,
         session_service,
+        context.application,
         context.bot,
         chat_id,
         user_id,
@@ -704,6 +770,7 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _run_and_deliver(
         runner,
         session_service,
+        context.application,
         context.bot,
         chat_id,
         str(chat_id),

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import datetime
 import logging
 import sys
@@ -260,6 +261,21 @@ def _deploy_to_panels_response_event(response: dict) -> SimpleNamespace:
     )
 
 
+def _materialize_batch_gallery_response_event(response: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="materialize_batch_gallery", response=response
+                    )
+                )
+            ],
+        )
+    )
+
+
 def _fake_run_async_factory(events_by_call):
     """Returns a fake run_async bound method that yields events_by_call[i]
     (a list of lists) on the i-th call, tracking (user_id, session_id,
@@ -288,6 +304,37 @@ def _make_bot():
     )
 
 
+def _make_application(bot_data):
+    """Fake `Application` that supports `create_task` well enough to
+    exercise the real fire-and-forget wiring (dev_plan_phase_2.md §3.1):
+    schedules the coroutine as a genuine `asyncio.Task` on the running
+    loop, without waiting for it — same non-blocking contract as PTB's
+    own `Application.create_task`. Tasks created are collected on
+    `created_tasks` so a test can explicitly `await asyncio.gather(...)`
+    them when it needs the background work to have settled before
+    asserting on it.
+    """
+    application = SimpleNamespace(bot_data=bot_data, created_tasks=[])
+
+    def create_task(coro, update=None):
+        task = asyncio.ensure_future(coro)
+        application.created_tasks.append(task)
+        return task
+
+    application.create_task = create_task
+    return application
+
+
+async def _run_and_await_background_tasks(coro, application) -> None:
+    """Awaits `coro`, then awaits every task `application.create_task`
+    scheduled during it -- lets a test assert on background batch-engine
+    work (dev_plan_phase_2.md §3.1) after it has actually settled.
+    """
+    await coro
+    if application.created_tasks:
+        await asyncio.gather(*application.created_tasks)
+
+
 def _make_update_and_context(
     runner, session_service, chat_id, text="hola", timeout_seconds=DEFAULT_TIMEOUT
 ):
@@ -299,8 +346,8 @@ def _make_update_and_context(
         effective_chat=SimpleNamespace(id=chat_id),
     )
     context = SimpleNamespace(
-        application=SimpleNamespace(
-            bot_data={
+        application=_make_application(
+            {
                 "runner": runner,
                 "session_service": session_service,
                 "session_timeout_seconds": timeout_seconds,
@@ -870,8 +917,8 @@ def _make_callback_update_and_context(
         effective_user=SimpleNamespace(id=user_id),
     )
     context = SimpleNamespace(
-        application=SimpleNamespace(
-            bot_data={
+        application=_make_application(
+            {
                 "runner": runner,
                 "session_service": session_service,
                 "session_timeout_seconds": timeout_seconds,
@@ -1111,6 +1158,176 @@ def test_full_failure_deploy_sends_no_revert_button():
     asyncio.run(handle_message(update, context))
 
     context.bot.send_message.assert_not_awaited()
+
+
+def test_materialize_batch_gallery_success_triggers_background_batch_engine(
+    monkeypatch,
+):
+    """Confirmar un lote (paso 8, PRD §15.3) debe arrancar el corredor
+    (draft -> finalización 4K) sin que el turno de Telegram lo espere --
+    dev_plan_phase_2.md §3.1, requisito duro #7.
+    """
+    calls = []
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_draft_stage",
+        lambda batch_id: calls.append(("draft", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_finalize_stage",
+        lambda batch_id: calls.append(("finalize", batch_id)),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 3}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    assert calls == [
+        ("draft", "batch_abc123"),
+        ("finalize", "batch_abc123"),
+    ]
+
+
+def test_materialize_batch_gallery_success_does_not_block_the_turn(monkeypatch):
+    """Same non-blocking guarantee as
+    test_revert_handlers_do_not_block_the_event_loop: the handler must
+    return (and the progress message must be edited) well before a slow
+    corredor finishes -- dev_plan_phase_2.md §3.1, requisito duro #7.
+    Records the tick time from inside the coroutine rather than timing
+    the whole `asyncio.run` call, since `asyncio.run`'s own shutdown
+    phase waits for any still-pending background task before returning
+    control, which would make the outer wall-clock misleading here.
+    """
+
+    def slow_run_draft_stage(batch_id):
+        time.sleep(0.2)
+
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", slow_run_draft_stage)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 3}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    start = time.monotonic()
+    finished_at = []
+
+    async def run_and_record():
+        await handle_message(update, context)
+        finished_at.append(time.monotonic() - start)
+
+    asyncio.run(run_and_record())
+
+    assert finished_at[0] < 0.1
+    _final_reply(update).assert_awaited_once()
+
+
+def test_materialize_batch_gallery_error_response_does_not_trigger_background_engine(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        telegram_bot, "run_draft_stage", lambda batch_id: calls.append(batch_id)
+    )
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"error": "day_index no es consecutivo"}
+                ),
+                _text_event("faltó un día"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    assert calls == []
+    assert context.application.created_tasks == []
+
+
+def test_turn_without_materialize_batch_gallery_does_not_trigger_background_engine(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        telegram_bot, "run_draft_stage", lambda batch_id: calls.append(batch_id)
+    )
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [[_text_event("bicicletas vintage en Santorini, listo")]]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    assert calls == []
+    assert context.application.created_tasks == []
+
+
+def test_batch_engine_crash_in_background_is_routed_to_global_error_handler(
+    monkeypatch, caplog
+):
+    """A real crash inside the background corredor (e.g. an unhandled
+    I/O error) must not vanish silently -- PTB's own `create_task`
+    re-raises after `process_error`, which `global_error_handler`
+    (registered on the real Application) logs. Exercised here against a
+    real `python-telegram-bot` `Application`, not the test double, to
+    confirm the actual wiring PTB provides.
+    """
+    from telegram.ext import ApplicationBuilder
+
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_draft_stage",
+        lambda batch_id: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    async def scenario():
+        application = ApplicationBuilder().token("123:fake-token-for-tests").build()
+        application.add_error_handler(telegram_bot.global_error_handler)
+        with pytest.warns(UserWarning, match="won't be automatically awaited"):
+            task = application.create_task(
+                telegram_bot._run_batch_engine_in_background("batch_abc123")
+            )
+        with contextlib.suppress(RuntimeError):
+            await task
+
+    with caplog.at_level(logging.ERROR, logger="bot.telegram_bot"):
+        asyncio.run(scenario())
+
+    assert any("Excepción no manejada" in record.message for record in caplog.records)
 
 
 def _make_revert_callback_update_and_context(
