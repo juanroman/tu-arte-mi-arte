@@ -1,0 +1,6 @@
+# Techos de reintento del motor de lote (PRD §15.5). El de generación se
+# usa desde la Etapa 2 (motor de lote, config/batch.toml); el de TV se
+# define aquí junto con el resto de la config pero no se usa hasta la
+# Etapa 4 (despliegue a TVs por lote).
+generation_max_attempts = 2
+tv_deploy_max_attempts = 3

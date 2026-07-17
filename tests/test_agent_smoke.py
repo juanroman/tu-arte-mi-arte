@@ -188,9 +188,9 @@ def test_batch_skill_declares_preview_tool_in_additional_tools():
     """
     skill = agent._galeria_por_lotes_skill
 
-    assert skill.frontmatter.metadata.get("adk_additional_tools") == [
-        "preview_batch_day"
-    ]
+    assert "preview_batch_day" in skill.frontmatter.metadata.get(
+        "adk_additional_tools", []
+    )
 
 
 def test_root_agent_skill_toolset_registers_preview_batch_day():
@@ -607,3 +607,119 @@ def test_revert_tv_forwards_tv_name(monkeypatch):
 
     assert captured == {"tv_name": "43L"}
     assert result == {"content_id": "MY_reverted"}
+
+
+def test_batch_skill_declares_materialize_tool_in_additional_tools():
+    """dev_plan_phase_2.md 2.1: la skill de galería por lotes debe declarar
+    materialize_batch_gallery en metadata.adk_additional_tools de su
+    frontmatter, igual que preview_batch_day en 1.4 — sin esa entrada,
+    SkillToolset nunca resuelve la tool para el modelo.
+    """
+    skill = agent._galeria_por_lotes_skill
+
+    assert "materialize_batch_gallery" in skill.frontmatter.metadata.get(
+        "adk_additional_tools", []
+    )
+
+
+def test_root_agent_skill_toolset_registers_materialize_batch_gallery():
+    """dev_plan_phase_2.md 2.1: materialize_batch_gallery se pasa como
+    additional_tools del SkillToolset, no directo en root_agent.tools —
+    permanece invisible para el modelo hasta que la skill se activa.
+    """
+    skill_toolset = next(
+        tool for tool in agent.root_agent.tools if isinstance(tool, SkillToolset)
+    )
+
+    assert "materialize_batch_gallery" in skill_toolset._provided_tools_by_name
+
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
+    assert "materialize_batch_gallery" not in tool_names
+
+
+def test_materialize_batch_gallery_rejects_non_consecutive_day_indices():
+    result = agent.materialize_batch_gallery(
+        theme="Otoño",
+        days=[
+            {
+                "day_index": 1,
+                "mode": "independiente",
+                "sub_group": "A",
+                "prompts": {"43L": "a", "43R": "b", "50": "c"},
+            },
+            {
+                "day_index": 3,
+                "mode": "independiente",
+                "sub_group": "A",
+                "prompts": {"43L": "a", "43R": "b", "50": "c"},
+            },
+        ],
+    )
+
+    assert "error" in result
+
+
+def test_materialize_batch_gallery_rejects_missing_prompts_for_mode():
+    result = agent.materialize_batch_gallery(
+        theme="Otoño",
+        days=[
+            {
+                "day_index": 1,
+                "mode": "split",
+                "sub_group": "A",
+                "prompts": {"50": "c"},
+            }
+        ],
+    )
+
+    assert "error" in result
+
+
+def test_materialize_batch_gallery_rejects_unknown_mode():
+    result = agent.materialize_batch_gallery(
+        theme="Otoño",
+        days=[
+            {
+                "day_index": 1,
+                "mode": "hibrido",
+                "sub_group": "A",
+                "prompts": {"43L": "a", "43R": "b", "50": "c"},
+            }
+        ],
+    )
+
+    assert "error" in result
+
+
+def test_materialize_batch_gallery_forwards_approved_days(monkeypatch):
+    captured = {}
+
+    def fake_materialize_batch_ai(theme, days):
+        captured["theme"] = theme
+        captured["days"] = days
+        return "batch_abc123"
+
+    monkeypatch.setattr(agent, "materialize_batch_ai", fake_materialize_batch_ai)
+
+    result = agent.materialize_batch_gallery(
+        theme="Primavera",
+        days=[
+            {
+                "day_index": 1,
+                "mode": "independiente",
+                "sub_group": "Sub-grupo A",
+                "prompts": {"43L": "a", "43R": "b", "50": "c"},
+            },
+            {
+                "day_index": 2,
+                "mode": "split",
+                "sub_group": "Sub-grupo A",
+                "prompts": {"wide": "d", "50": "e"},
+            },
+        ],
+    )
+
+    assert result == {"batch_id": "batch_abc123", "day_count": 2}
+    assert captured["theme"] == "Primavera"
+    assert [day.day_index for day in captured["days"]] == [1, 2]
+    assert captured["days"][1].prompts == {"wide": "d", "50": "e"}
