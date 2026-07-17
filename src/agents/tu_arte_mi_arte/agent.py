@@ -7,6 +7,10 @@ from google.adk.skills import load_skill_from_dir
 from google.adk.tools.skill_toolset import SkillToolset
 
 from engine.art_direction import build_prompt, load_art_direction
+from engine.batch import estimate_batch_duration as estimate_batch_duration_ai
+from engine.batch import summarize_batch as summarize_batch_ai
+from engine.batch_store import ApprovedDay
+from engine.batch_store import materialize_batch as materialize_batch_ai
 from engine.generation import edit_image as edit_image_ai
 from engine.generation import generate_final_high_res as generate_final_high_res_ai
 from engine.generation import generate_image as generate_image_ai
@@ -239,6 +243,147 @@ def preview_batch_day(
     return generate_set_diptico(
         scene_43l=scene_43l, scene_43r=scene_43r, scene_50=scene_50
     )
+
+
+def materialize_batch_gallery(theme: str, days: list[dict]) -> dict:
+    """Persiste en SQLite un lote de galería por varios días ya aprobado
+    por el usuario (agrupación en sub-grupos, prompts por sub-grupo, y
+    confirmación del lote completo — PRD §15.3 pasos 1-5+8) para que el
+    motor de lote lo procese. NO genera ninguna imagen — solo
+    materializa el estado; la generación real llega con el corredor de
+    lote (iteraciones posteriores de este plan).
+
+    Llámala una sola vez, después de que el usuario haya aprobado TODOS
+    los sub-grupos del lote y confirmado explícitamente el lote completo
+    (nunca sub-grupo por sub-grupo, ni antes de tener los N días
+    cubiertos).
+
+    `days` es una lista con un dict por día, en el orden del lote (día 1
+    primero), cada uno con las claves:
+      - day_index (int, 1-based, consecutivo sin huecos desde 1)
+      - mode: 'independiente' o 'split', la decisión ya tomada para ese
+        día en el paso 4
+      - sub_group: el nombre del sub-grupo al que pertenece ese día
+      - prompts (dict): usa exactamente las escenas ya redactadas y
+        aprobadas en el paso 4 para ese día, nunca inventes texto nuevo
+        aquí. Si mode es 'independiente': {'43L':.., '43R':.., '50':..}.
+        Si mode es 'split': {'wide':.., '50':..}.
+
+    Devuelve {'batch_id': ..., 'day_count': ...} en éxito, o {'error':
+    ...} si `days` está vacío, no cubre un rango consecutivo de
+    day_index desde 1, o algún día trae un mode desconocido o le faltan
+    prompts para ese mode.
+    """
+    _logger.info("materialize_batch_gallery: theme=%r day_count=%d", theme, len(days))
+    if not days:
+        return {"error": "El lote no puede tener cero días."}
+
+    expected_indices = set(range(1, len(days) + 1))
+    actual_indices = {day["day_index"] for day in days}
+    if actual_indices != expected_indices:
+        return {
+            "error": (
+                f"day_index debe ser consecutivo de 1 a {len(days)} sin "
+                f"huecos ni duplicados; recibido: {sorted(actual_indices)}."
+            )
+        }
+
+    approved_days = []
+    for day in sorted(days, key=lambda d: d["day_index"]):
+        mode = day.get("mode")
+        prompts = day.get("prompts") or {}
+        if mode == "independiente":
+            required_panels = {"43L", "43R", "50"}
+        elif mode == "split":
+            required_panels = {"wide", "50"}
+        else:
+            return {
+                "error": (
+                    f"mode inválido para day_index={day.get('day_index')}: "
+                    f"{mode!r} (debe ser 'independiente' o 'split')."
+                )
+            }
+        if not required_panels.issubset(prompts):
+            return {
+                "error": (
+                    f"day_index={day['day_index']} (mode={mode!r}) le "
+                    f"faltan prompts requeridos: "
+                    f"{sorted(required_panels - prompts.keys())}."
+                )
+            }
+        approved_days.append(
+            ApprovedDay(
+                day_index=day["day_index"],
+                mode=mode,
+                sub_group=day.get("sub_group", ""),
+                prompts=prompts,
+            )
+        )
+
+    batch_id = materialize_batch_ai(theme=theme, days=approved_days)
+    result = {"batch_id": batch_id, "day_count": len(approved_days)}
+    _log_tool_result("materialize_batch_gallery", result)
+    return result
+
+
+_VALID_BATCH_DAY_MODES = {"independiente", "split"}
+
+
+def estimate_batch_duration(day_modes: list[str]) -> dict:
+    """Calcula el estimado de duración de un lote (PRD §15.3 paso 7,
+    dev_plan_phase_2.md §2.4) a partir de los modos ya decididos para
+    todos los N días del lote (paso 4/5), ANTES de materializarlo — no
+    requiere que el lote ya exista en SQLite.
+
+    Llámala una sola vez, después de que TODOS los sub-grupos del lote
+    tengan sus prompts aprobados (mismo momento en el que se apoya el
+    paso 8 de confirmación/materialización), pasando `day_modes` como una
+    lista con el `mode` ('independiente' o 'split') de cada día del lote,
+    en orden (día 1 primero) — el mismo valor ya decidido en el paso 4
+    para cada día, nunca inventado aquí.
+
+    Devuelve {'day_count', 'independent_days', 'split_days',
+    'total_model_calls', 'estimated_seconds', 'estimated_minutes'} en
+    éxito, o {'error': ...} si `day_modes` está vacío o trae un valor que
+    no sea 'independiente'/'split'.
+    """
+    _logger.info("estimate_batch_duration: day_count=%d", len(day_modes))
+    if not day_modes:
+        return {"error": "El lote no puede tener cero días."}
+    invalid_modes = sorted(
+        {mode for mode in day_modes if mode not in _VALID_BATCH_DAY_MODES}
+    )
+    if invalid_modes:
+        return {
+            "error": (
+                f"day_modes trae valores inválidos: {invalid_modes} "
+                "(debe ser 'independiente' o 'split')."
+            )
+        }
+
+    result = estimate_batch_duration_ai(day_modes)
+    _log_tool_result("estimate_batch_duration", result)
+    return result
+
+
+def check_batch_status(batch_id: str) -> dict:
+    """Consulta el estado actual de un lote ya materializado (dev_plan_phase_2.md
+    §2.6) — una consulta BAJO PEDIDO del usuario, distinta del reporte
+    proactivo del paso 9 de PRD §15.3 (ese llega sin que el usuario
+    pregunte, vía Telegram, en una iteración posterior de este proyecto).
+    Envuelve engine.batch.summarize_batch tal cual, sin reinterpretar sus
+    columnas: cuenta batch_item por stage, separa needs_attention por
+    policy_rejection vs. falla técnica agotada, y desglosa por día.
+
+    Llámala cuando el usuario pregunte explícitamente por el estado de un
+    lote en curso o ya terminado (p. ej. "¿cómo va mi galería?", "¿qué
+    pasó con el lote de otoño?"). Devuelve {'error': ...} si el batch_id
+    no existe.
+    """
+    _logger.info("check_batch_status: batch_id=%s", batch_id)
+    result = summarize_batch_ai(batch_id)
+    _log_tool_result("check_batch_status", result)
+    return result
 
 
 def finalize_high_res(image_id: str, is_split_wide: bool = False) -> dict:
@@ -537,7 +682,12 @@ root_agent = Agent(
         revert_tv,
         SkillToolset(
             skills=[_galeria_por_lotes_skill],
-            additional_tools=[preview_batch_day],
+            additional_tools=[
+                preview_batch_day,
+                materialize_batch_gallery,
+                estimate_batch_duration,
+                check_batch_status,
+            ],
         ),
     ],
 )

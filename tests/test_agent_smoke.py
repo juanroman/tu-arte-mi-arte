@@ -188,9 +188,9 @@ def test_batch_skill_declares_preview_tool_in_additional_tools():
     """
     skill = agent._galeria_por_lotes_skill
 
-    assert skill.frontmatter.metadata.get("adk_additional_tools") == [
-        "preview_batch_day"
-    ]
+    assert "preview_batch_day" in skill.frontmatter.metadata.get(
+        "adk_additional_tools", []
+    )
 
 
 def test_root_agent_skill_toolset_registers_preview_batch_day():
@@ -607,3 +607,252 @@ def test_revert_tv_forwards_tv_name(monkeypatch):
 
     assert captured == {"tv_name": "43L"}
     assert result == {"content_id": "MY_reverted"}
+
+
+def test_batch_skill_declares_materialize_tool_in_additional_tools():
+    """dev_plan_phase_2.md 2.1: la skill de galería por lotes debe declarar
+    materialize_batch_gallery en metadata.adk_additional_tools de su
+    frontmatter, igual que preview_batch_day en 1.4 — sin esa entrada,
+    SkillToolset nunca resuelve la tool para el modelo.
+    """
+    skill = agent._galeria_por_lotes_skill
+
+    assert "materialize_batch_gallery" in skill.frontmatter.metadata.get(
+        "adk_additional_tools", []
+    )
+
+
+def test_root_agent_skill_toolset_registers_materialize_batch_gallery():
+    """dev_plan_phase_2.md 2.1: materialize_batch_gallery se pasa como
+    additional_tools del SkillToolset, no directo en root_agent.tools —
+    permanece invisible para el modelo hasta que la skill se activa.
+    """
+    skill_toolset = next(
+        tool for tool in agent.root_agent.tools if isinstance(tool, SkillToolset)
+    )
+
+    assert "materialize_batch_gallery" in skill_toolset._provided_tools_by_name
+
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
+    assert "materialize_batch_gallery" not in tool_names
+
+
+def test_materialize_batch_gallery_rejects_non_consecutive_day_indices():
+    result = agent.materialize_batch_gallery(
+        theme="Otoño",
+        days=[
+            {
+                "day_index": 1,
+                "mode": "independiente",
+                "sub_group": "A",
+                "prompts": {"43L": "a", "43R": "b", "50": "c"},
+            },
+            {
+                "day_index": 3,
+                "mode": "independiente",
+                "sub_group": "A",
+                "prompts": {"43L": "a", "43R": "b", "50": "c"},
+            },
+        ],
+    )
+
+    assert "error" in result
+
+
+def test_materialize_batch_gallery_rejects_missing_prompts_for_mode():
+    result = agent.materialize_batch_gallery(
+        theme="Otoño",
+        days=[
+            {
+                "day_index": 1,
+                "mode": "split",
+                "sub_group": "A",
+                "prompts": {"50": "c"},
+            }
+        ],
+    )
+
+    assert "error" in result
+
+
+def test_materialize_batch_gallery_rejects_unknown_mode():
+    result = agent.materialize_batch_gallery(
+        theme="Otoño",
+        days=[
+            {
+                "day_index": 1,
+                "mode": "hibrido",
+                "sub_group": "A",
+                "prompts": {"43L": "a", "43R": "b", "50": "c"},
+            }
+        ],
+    )
+
+    assert "error" in result
+
+
+def test_materialize_batch_gallery_forwards_approved_days(monkeypatch):
+    captured = {}
+
+    def fake_materialize_batch_ai(theme, days):
+        captured["theme"] = theme
+        captured["days"] = days
+        return "batch_abc123"
+
+    monkeypatch.setattr(agent, "materialize_batch_ai", fake_materialize_batch_ai)
+
+    result = agent.materialize_batch_gallery(
+        theme="Primavera",
+        days=[
+            {
+                "day_index": 1,
+                "mode": "independiente",
+                "sub_group": "Sub-grupo A",
+                "prompts": {"43L": "a", "43R": "b", "50": "c"},
+            },
+            {
+                "day_index": 2,
+                "mode": "split",
+                "sub_group": "Sub-grupo A",
+                "prompts": {"wide": "d", "50": "e"},
+            },
+        ],
+    )
+
+    assert result == {"batch_id": "batch_abc123", "day_count": 2}
+    assert captured["theme"] == "Primavera"
+    assert [day.day_index for day in captured["days"]] == [1, 2]
+    assert captured["days"][1].prompts == {"wide": "d", "50": "e"}
+
+
+def test_batch_skill_declares_estimate_duration_tool_in_additional_tools():
+    """dev_plan_phase_2.md 2.4: la skill de galería por lotes debe declarar
+    estimate_batch_duration en metadata.adk_additional_tools de su
+    frontmatter, mismo mecanismo que preview_batch_day/
+    materialize_batch_gallery — sin esa entrada, SkillToolset nunca
+    resuelve la tool para el modelo.
+    """
+    skill = agent._galeria_por_lotes_skill
+
+    assert "estimate_batch_duration" in skill.frontmatter.metadata.get(
+        "adk_additional_tools", []
+    )
+
+
+def test_root_agent_skill_toolset_registers_estimate_batch_duration():
+    """dev_plan_phase_2.md 2.4: estimate_batch_duration se pasa como
+    additional_tools del SkillToolset, no directo en root_agent.tools —
+    permanece invisible para el modelo hasta que la skill se activa.
+    """
+    skill_toolset = next(
+        tool for tool in agent.root_agent.tools if isinstance(tool, SkillToolset)
+    )
+
+    assert "estimate_batch_duration" in skill_toolset._provided_tools_by_name
+
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
+    assert "estimate_batch_duration" not in tool_names
+
+
+def test_estimate_batch_duration_rejects_empty_day_modes():
+    result = agent.estimate_batch_duration(day_modes=[])
+
+    assert "error" in result
+
+
+def test_estimate_batch_duration_rejects_unknown_mode():
+    result = agent.estimate_batch_duration(
+        day_modes=["independiente", "hibrido", "split"]
+    )
+
+    assert "error" in result
+
+
+def test_estimate_batch_duration_forwards_valid_day_modes(monkeypatch):
+    captured = {}
+
+    def fake_estimate_batch_duration_ai(day_modes):
+        captured["day_modes"] = day_modes
+        return {
+            "day_count": 3,
+            "independent_days": 2,
+            "split_days": 1,
+            "total_model_calls": 8,
+            "estimated_seconds": 384.0,
+            "estimated_minutes": 7,
+        }
+
+    monkeypatch.setattr(
+        agent, "estimate_batch_duration_ai", fake_estimate_batch_duration_ai
+    )
+
+    result = agent.estimate_batch_duration(
+        day_modes=["independiente", "split", "independiente"]
+    )
+
+    assert captured["day_modes"] == ["independiente", "split", "independiente"]
+    assert result["estimated_minutes"] == 7
+
+
+def test_batch_skill_declares_check_batch_status_in_additional_tools():
+    """dev_plan_phase_2.md 2.6: la skill de galería por lotes debe declarar
+    check_batch_status en metadata.adk_additional_tools de su frontmatter,
+    mismo mecanismo que preview_batch_day/materialize_batch_gallery/
+    estimate_batch_duration — sin esa entrada, SkillToolset nunca resuelve
+    la tool para el modelo.
+    """
+    skill = agent._galeria_por_lotes_skill
+
+    assert "check_batch_status" in skill.frontmatter.metadata.get(
+        "adk_additional_tools", []
+    )
+
+
+def test_root_agent_skill_toolset_registers_check_batch_status():
+    """dev_plan_phase_2.md 2.6: check_batch_status se pasa como
+    additional_tools del SkillToolset, no directo en root_agent.tools —
+    permanece invisible para el modelo hasta que la skill se activa.
+    """
+    skill_toolset = next(
+        tool for tool in agent.root_agent.tools if isinstance(tool, SkillToolset)
+    )
+
+    assert "check_batch_status" in skill_toolset._provided_tools_by_name
+
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
+    assert "check_batch_status" not in tool_names
+
+
+def test_check_batch_status_forwards_to_summarize_batch(monkeypatch):
+    captured = {}
+
+    def fake_summarize_batch_ai(batch_id):
+        captured["batch_id"] = batch_id
+        return {
+            "batch_id": batch_id,
+            "theme": "Otoño",
+            "day_count": 3,
+            "stage_counts": {"finalized": 9},
+            "needs_attention_policy_rejection": [],
+            "needs_attention_technical": [],
+            "days": [],
+        }
+
+    monkeypatch.setattr(agent, "summarize_batch_ai", fake_summarize_batch_ai)
+
+    result = agent.check_batch_status(batch_id="batch_abc123")
+
+    assert captured["batch_id"] == "batch_abc123"
+    assert result["theme"] == "Otoño"
+
+
+def test_check_batch_status_forwards_error_for_unknown_batch(monkeypatch):
+    monkeypatch.setattr(
+        agent,
+        "summarize_batch_ai",
+        lambda batch_id: {"error": f"No existe un lote con batch_id={batch_id!r}."},
+    )
+
+    result = agent.check_batch_status(batch_id="batch_nope")
+
+    assert "error" in result

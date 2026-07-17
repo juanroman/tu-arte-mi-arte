@@ -16,7 +16,13 @@ description: >
   el usuario lo llame "colección" o "conjunto" — ese sigue siendo el flujo
   por defecto sin esta skill.
 metadata:
-  adk_additional_tools: ["preview_batch_day"]
+  adk_additional_tools:
+    [
+      "preview_batch_day",
+      "materialize_batch_gallery",
+      "estimate_batch_duration",
+      "check_batch_status",
+    ]
 ---
 
 Estás en modo de arte para varios días.
@@ -182,6 +188,67 @@ no incluye finalización 4K, subida a TV, ni el estimado de tiempo
 
 Después del preview: si quedan sub-grupos sin redactar/aprobar, continúa
 con el paso 4 del siguiente sub-grupo. Si el sub-grupo recién
-previsualizado era el último, cierra el turno confirmando que todos los
-sub-grupos del lote quedaron con prompts aprobados y sus previews
-disponibles.
+previsualizado era el último, confirma que todos los sub-grupos del
+lote quedaron con prompts aprobados y sus previews disponibles, y
+continúa con el paso 7 (estimado de tiempo).
+
+## Paso 7 — Estimado de tiempo (PRD §15.3 paso 7)
+
+Una vez que TODOS los sub-grupos del lote tienen sus prompts aprobados
+(paso 5) — sin importar si se pidió o no el preview de cada uno —,
+llama `estimate_batch_duration` **una sola vez**, pasando `day_modes`
+como una lista con el `mode` ('independiente' o 'split') de cada uno de
+los N días del lote, en el orden del lote (día 1 primero) — el mismo
+valor ya decidido para cada día en el paso 4, nunca inventado aquí.
+
+Comunica el resultado (`estimated_minutes`) al usuario en una frase
+breve, en lenguaje natural (p. ej. "esto tomará aproximadamente 25
+minutos"), antes de pedir la confirmación del paso 8 — nunca como
+promesa exacta, es un estimado. Si `estimate_batch_duration` devuelve
+`'error'`, no bloquees el flujo por eso: informa al usuario que no se
+pudo calcular el estimado y continúa igual con el paso 8.
+
+## Paso 8 — Confirmación y materialización del lote (PRD §15.3 paso 8, parcial)
+
+Una vez comunicado el estimado de tiempo (paso 7), pregunta al usuario
+si confirma el lote completo para que el motor de lote lo procese
+(p. ej. "¿confirmas este lote de N días para generarlo?"). Espera su
+aprobación explícita antes de continuar.
+
+Al confirmar, llama `materialize_batch_gallery` **una sola vez** con
+`theme` (el tema general del lote) y `days`: una lista con un dict por
+cada uno de los N días del lote, en orden, usando exactamente las
+escenas ya redactadas y aprobadas en el paso 4 para cada día — nunca
+inventes ni reescribas una escena aquí. Cada dict de `days` lleva
+`day_index` (1-based), `mode` ('independiente' o 'split'), `sub_group`
+(el nombre de su sub-grupo), y `prompts` ({'43L','43R','50'} para
+independiente, {'wide','50'} para split).
+
+Si `materialize_batch_gallery` devuelve `'error'`, informa el problema
+al usuario en una frase clara (p. ej. si falta un día o un prompt) y no
+insistas por tu cuenta — corrige lo que falte con el usuario y vuelve a
+llamarla. Si devuelve `batch_id`, confirma al usuario que el lote quedó
+guardado con ese identificador, y aclara que la generación real (drafts
+en baja resolución, finalización en 4K, subida a las TVs) llega con una
+iteración posterior de este proyecto — esta iteración solo persiste el
+lote, no lo procesa todavía.
+
+## Consulta de estado del lote (bajo pedido, dev_plan_phase_2.md §2.6)
+
+Si el usuario pregunta explícitamente por el estado de un lote ya
+materializado (p. ej. "¿cómo va mi galería?", "¿qué pasó con los días
+que fallaron?", "¿ya terminó el lote de otoño?"), llama
+`check_batch_status(batch_id)` y redacta la respuesta en prosa con el
+mismo criterio de RESULTADOS MIXTOS ya usado para conjuntos sueltos y
+para el preview (paso 6): nunca generalices el peor resultado a todo el
+lote, menciona con precisión qué días/paneles sí se lograron, y
+distingue explícitamente un rechazo de política
+(`needs_attention_policy_rejection`) de una falla técnica agotada
+(`needs_attention_technical`) — nunca los mezcles en una sola frase
+genérica de "algo falló". Si `check_batch_status` devuelve `'error'`,
+informa que no se encontró un lote con ese identificador.
+
+Esto es una consulta bajo pedido (el usuario pregunta, tú respondes),
+no el aviso automático de que el lote terminó — ese reporte proactivo,
+enviado sin que el usuario tenga que preguntar, llega con Telegram en
+una iteración posterior de este proyecto (Etapa 3).
