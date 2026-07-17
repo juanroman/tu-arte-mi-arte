@@ -792,3 +792,67 @@ def test_estimate_batch_duration_forwards_valid_day_modes(monkeypatch):
 
     assert captured["day_modes"] == ["independiente", "split", "independiente"]
     assert result["estimated_minutes"] == 7
+
+
+def test_batch_skill_declares_check_batch_status_in_additional_tools():
+    """dev_plan_phase_2.md 2.6: la skill de galería por lotes debe declarar
+    check_batch_status en metadata.adk_additional_tools de su frontmatter,
+    mismo mecanismo que preview_batch_day/materialize_batch_gallery/
+    estimate_batch_duration — sin esa entrada, SkillToolset nunca resuelve
+    la tool para el modelo.
+    """
+    skill = agent._galeria_por_lotes_skill
+
+    assert "check_batch_status" in skill.frontmatter.metadata.get(
+        "adk_additional_tools", []
+    )
+
+
+def test_root_agent_skill_toolset_registers_check_batch_status():
+    """dev_plan_phase_2.md 2.6: check_batch_status se pasa como
+    additional_tools del SkillToolset, no directo en root_agent.tools —
+    permanece invisible para el modelo hasta que la skill se activa.
+    """
+    skill_toolset = next(
+        tool for tool in agent.root_agent.tools if isinstance(tool, SkillToolset)
+    )
+
+    assert "check_batch_status" in skill_toolset._provided_tools_by_name
+
+    tool_names = {getattr(tool, "__name__", None) for tool in agent.root_agent.tools}
+    assert "check_batch_status" not in tool_names
+
+
+def test_check_batch_status_forwards_to_summarize_batch(monkeypatch):
+    captured = {}
+
+    def fake_summarize_batch_ai(batch_id):
+        captured["batch_id"] = batch_id
+        return {
+            "batch_id": batch_id,
+            "theme": "Otoño",
+            "day_count": 3,
+            "stage_counts": {"finalized": 9},
+            "needs_attention_policy_rejection": [],
+            "needs_attention_technical": [],
+            "days": [],
+        }
+
+    monkeypatch.setattr(agent, "summarize_batch_ai", fake_summarize_batch_ai)
+
+    result = agent.check_batch_status(batch_id="batch_abc123")
+
+    assert captured["batch_id"] == "batch_abc123"
+    assert result["theme"] == "Otoño"
+
+
+def test_check_batch_status_forwards_error_for_unknown_batch(monkeypatch):
+    monkeypatch.setattr(
+        agent,
+        "summarize_batch_ai",
+        lambda batch_id: {"error": f"No existe un lote con batch_id={batch_id!r}."},
+    )
+
+    result = agent.check_batch_status(batch_id="batch_nope")
+
+    assert "error" in result

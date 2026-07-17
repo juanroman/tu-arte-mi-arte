@@ -17,7 +17,12 @@ description: >
   por defecto sin esta skill.
 metadata:
   adk_additional_tools:
-    ["preview_batch_day", "materialize_batch_gallery", "estimate_batch_duration"]
+    [
+      "preview_batch_day",
+      "materialize_batch_gallery",
+      "estimate_batch_duration",
+      "check_batch_status",
+    ]
 ---
 
 Estás en modo de arte para varios días.
@@ -227,3 +232,23 @@ guardado con ese identificador, y aclara que la generación real (drafts
 en baja resolución, finalización en 4K, subida a las TVs) llega con una
 iteración posterior de este proyecto — esta iteración solo persiste el
 lote, no lo procesa todavía.
+
+## Consulta de estado del lote (bajo pedido, dev_plan_phase_2.md §2.6)
+
+Si el usuario pregunta explícitamente por el estado de un lote ya
+materializado (p. ej. "¿cómo va mi galería?", "¿qué pasó con los días
+que fallaron?", "¿ya terminó el lote de otoño?"), llama
+`check_batch_status(batch_id)` y redacta la respuesta en prosa con el
+mismo criterio de RESULTADOS MIXTOS ya usado para conjuntos sueltos y
+para el preview (paso 6): nunca generalices el peor resultado a todo el
+lote, menciona con precisión qué días/paneles sí se lograron, y
+distingue explícitamente un rechazo de política
+(`needs_attention_policy_rejection`) de una falla técnica agotada
+(`needs_attention_technical`) — nunca los mezcles en una sola frase
+genérica de "algo falló". Si `check_batch_status` devuelve `'error'`,
+informa que no se encontró un lote con ese identificador.
+
+Esto es una consulta bajo pedido (el usuario pregunta, tú respondes),
+no el aviso automático de que el lote terminó — ese reporte proactivo,
+enviado sin que el usuario tenga que preguntar, llega con Telegram en
+una iteración posterior de este proyecto (Etapa 3).

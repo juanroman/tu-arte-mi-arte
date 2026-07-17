@@ -8,6 +8,7 @@ from google.adk.tools.skill_toolset import SkillToolset
 
 from engine.art_direction import build_prompt, load_art_direction
 from engine.batch import estimate_batch_duration as estimate_batch_duration_ai
+from engine.batch import summarize_batch as summarize_batch_ai
 from engine.batch_store import ApprovedDay
 from engine.batch_store import materialize_batch as materialize_batch_ai
 from engine.generation import edit_image as edit_image_ai
@@ -365,6 +366,26 @@ def estimate_batch_duration(day_modes: list[str]) -> dict:
     return result
 
 
+def check_batch_status(batch_id: str) -> dict:
+    """Consulta el estado actual de un lote ya materializado (dev_plan_phase_2.md
+    §2.6) — una consulta BAJO PEDIDO del usuario, distinta del reporte
+    proactivo del paso 9 de PRD §15.3 (ese llega sin que el usuario
+    pregunte, vía Telegram, en una iteración posterior de este proyecto).
+    Envuelve engine.batch.summarize_batch tal cual, sin reinterpretar sus
+    columnas: cuenta batch_item por stage, separa needs_attention por
+    policy_rejection vs. falla técnica agotada, y desglosa por día.
+
+    Llámala cuando el usuario pregunte explícitamente por el estado de un
+    lote en curso o ya terminado (p. ej. "¿cómo va mi galería?", "¿qué
+    pasó con el lote de otoño?"). Devuelve {'error': ...} si el batch_id
+    no existe.
+    """
+    _logger.info("check_batch_status: batch_id=%s", batch_id)
+    result = summarize_batch_ai(batch_id)
+    _log_tool_result("check_batch_status", result)
+    return result
+
+
 def finalize_high_res(image_id: str, is_split_wide: bool = False) -> dict:
     """Produce la versión final en alta resolución (4K) de un draft aprobado
     (PRD §7.7), re-generándolo vía image-to-image con una instrucción
@@ -665,6 +686,7 @@ root_agent = Agent(
                 preview_batch_day,
                 materialize_batch_gallery,
                 estimate_batch_duration,
+                check_batch_status,
             ],
         ),
     ],
