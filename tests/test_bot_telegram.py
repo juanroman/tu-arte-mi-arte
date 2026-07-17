@@ -1178,6 +1178,9 @@ def test_materialize_batch_gallery_success_triggers_background_batch_engine(
         "run_finalize_stage",
         lambda batch_id: calls.append(("finalize", batch_id)),
     )
+    monkeypatch.setattr(
+        telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
+    )
     runner, session_service, _ = _build_runner_with_fake_run_async(
         [
             [
@@ -1319,7 +1322,9 @@ def test_batch_engine_crash_in_background_is_routed_to_global_error_handler(
         application.add_error_handler(telegram_bot.global_error_handler)
         with pytest.warns(UserWarning, match="won't be automatically awaited"):
             task = application.create_task(
-                telegram_bot._run_batch_engine_in_background("batch_abc123")
+                telegram_bot._run_batch_engine_in_background(
+                    "batch_abc123", _make_bot(), 42
+                )
             )
         with contextlib.suppress(RuntimeError):
             await task
@@ -1328,6 +1333,299 @@ def test_batch_engine_crash_in_background_is_routed_to_global_error_handler(
         asyncio.run(scenario())
 
     assert any("Excepción no manejada" in record.message for record in caplog.records)
+
+
+def _batch_summary(
+    *,
+    theme="Otoño",
+    day_count=1,
+    stage_counts=None,
+    needs_attention_policy_rejection=None,
+    needs_attention_technical=None,
+    days=None,
+) -> dict:
+    """Fabrica un dict con el shape exacto de
+    `engine.batch.summarize_batch` (§2.4) para monkeypatchear
+    `telegram_bot.summarize_batch` sin tocar SQLite real -- mismo
+    principio que los demás fakes de este archivo, que trabajan a nivel
+    de tool-call-event en vez de contra el estado persistido real.
+    """
+    return {
+        "batch_id": "batch_abc123",
+        "theme": theme,
+        "day_count": day_count,
+        "stage_counts": stage_counts if stage_counts is not None else {"finalized": 3},
+        "needs_attention_policy_rejection": needs_attention_policy_rejection or [],
+        "needs_attention_technical": needs_attention_technical or [],
+        "days": days if days is not None else [],
+    }
+
+
+def _batch_day_summary(day_index, panel_image_ids: dict) -> dict:
+    return {
+        "day_index": day_index,
+        "mode": "independiente",
+        "sub_group": "Sub-grupo 1",
+        "panels": {
+            panel: {"stage": "finalized", "image_id": image_id, "error": None}
+            for panel, image_id in panel_image_ids.items()
+        },
+    }
+
+
+def test_batch_report_full_success_sends_summary_and_one_album(monkeypatch):
+    """Un lote sin ningún needs_attention manda un texto de éxito simple
+    (sin sección de fallas) seguido de un único álbum con todas las fotos
+    -- dev_plan_phase_2.md §3.2.
+    """
+    _write_fixture_images("img_1", "img_2", "img_3")
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda batch_id: _batch_summary(
+            day_count=1,
+            days=[
+                _batch_day_summary(1, {"43L": "img_1", "43R": "img_2", "50": "img_3"})
+            ],
+        ),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 1}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    context.bot.send_message.assert_awaited_once()
+    text_args, _ = context.bot.send_message.call_args
+    assert "lista" in text_args[1]
+    assert "atención" not in text_args[1]
+
+    context.bot.send_media_group.assert_awaited_once()
+    _, media_kwargs = context.bot.send_media_group.call_args
+    assert len(media_kwargs["media"]) == 3
+
+
+def test_batch_report_paginates_albums_over_ten_photos(monkeypatch):
+    """Requisito duro #8: un lote de más de 10 fotos manda varios álbumes,
+    cada uno de a lo más 10, pausados entre sí en vez de en una sola
+    llamada.
+    """
+    image_ids = [f"img_{i}" for i in range(12)]
+    _write_fixture_images(*image_ids)
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda batch_id: _batch_summary(
+            day_count=4,
+            stage_counts={"finalized": 12},
+            days=[
+                _batch_day_summary(
+                    i + 1,
+                    {
+                        "43L": image_ids[i * 3],
+                        "43R": image_ids[i * 3 + 1],
+                        "50": image_ids[i * 3 + 2],
+                    },
+                )
+                for i in range(4)
+            ],
+        ),
+    )
+    sleep_calls = []
+    real_sleep = asyncio.sleep
+
+    async def spying_sleep(seconds):
+        sleep_calls.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(telegram_bot.asyncio, "sleep", spying_sleep)
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 4}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    assert context.bot.send_media_group.await_count == 2
+    album_sizes = [
+        len(call.kwargs["media"])
+        for call in context.bot.send_media_group.await_args_list
+    ]
+    assert album_sizes == [10, 2]
+    assert sleep_calls.count(telegram_bot._PROACTIVE_SEND_PACING_SECONDS) == 2
+
+
+def test_batch_report_mixed_failure_distinguishes_policy_vs_technical(monkeypatch):
+    """El texto del reporte distingue un rechazo de política (nunca
+    reintentado, ofrece pivote) de una falla técnica agotada (ofrece
+    reintento) -- nunca infiere la distinción del texto de error, la lee
+    tal cual de las dos listas separadas de `summarize_batch`. Los
+    paneles sin `image_id` (los que fallaron) no rompen el álbum.
+    """
+    _write_fixture_images("img_1")
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda batch_id: _batch_summary(
+            day_count=2,
+            stage_counts={"finalized": 1, "needs_attention": 2},
+            needs_attention_policy_rejection=[
+                {"day_index": 1, "panel": "43R", "error": "policy"}
+            ],
+            needs_attention_technical=[
+                {"day_index": 2, "panel": "50", "error": "timeout", "attempts": 2}
+            ],
+            days=[
+                _batch_day_summary(1, {"43L": "img_1"}),
+            ],
+        ),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 2}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    text_args, _ = context.bot.send_message.call_args
+    report_text = text_args[1]
+    assert "rechazo de política" in report_text
+    assert "reintentos" in report_text
+
+    context.bot.send_media_group.assert_awaited_once()
+    _, media_kwargs = context.bot.send_media_group.call_args
+    assert len(media_kwargs["media"]) == 1
+
+
+def test_batch_report_total_failure_sends_text_but_no_album(monkeypatch):
+    """Un lote donde ningún panel produjo imagen manda el texto (con la
+    sección de fallas) pero nunca llama a send_media_group -- no hay
+    fotos que mandar.
+    """
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda batch_id: _batch_summary(
+            day_count=1,
+            stage_counts={"needs_attention": 3},
+            needs_attention_technical=[
+                {"day_index": 1, "panel": "43L", "error": "timeout", "attempts": 2},
+                {"day_index": 1, "panel": "43R", "error": "timeout", "attempts": 2},
+                {"day_index": 1, "panel": "50", "error": "timeout", "attempts": 2},
+            ],
+            days=[_batch_day_summary(1, {})],
+        ),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 1}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    context.bot.send_message.assert_awaited_once()
+    context.bot.send_media_group.assert_not_awaited()
+
+
+def test_batch_report_does_not_block_the_turn(monkeypatch):
+    """Mismo criterio de no bloqueo que
+    test_materialize_batch_gallery_success_does_not_block_the_turn, ahora
+    para el envío del reporte proactivo: el turno retorna (y el reporte
+    todavía no se manda) mucho antes de que un corredor lento termine.
+    """
+    _write_fixture_images("img_1")
+
+    def slow_run_draft_stage(batch_id):
+        time.sleep(0.2)
+
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", slow_run_draft_stage)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda batch_id: _batch_summary(days=[_batch_day_summary(1, {"43L": "img_1"})]),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 1}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    start = time.monotonic()
+    finished_at = []
+    report_sent_before_turn_finished = []
+
+    async def run_and_record():
+        await handle_message(update, context)
+        finished_at.append(time.monotonic() - start)
+        report_sent_before_turn_finished.append(
+            context.bot.send_message.await_count > 0
+        )
+
+    asyncio.run(run_and_record())
+
+    assert finished_at[0] < 0.1
+    assert report_sent_before_turn_finished == [False]
+    _final_reply(update).assert_awaited_once()
 
 
 def _make_revert_callback_update_and_context(

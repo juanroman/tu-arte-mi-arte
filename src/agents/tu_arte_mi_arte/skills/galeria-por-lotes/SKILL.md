@@ -232,9 +232,10 @@ guardado con ese identificador y que la generación real (drafts en baja
 resolución, finalización en 4K) ya arrancó sola en segundo plano — el
 chat sigue disponible de inmediato, no hace falta esperar a que
 termine. Puede preguntar por el avance en cualquier momento con la
-consulta de estado bajo pedido (ver abajo); el aviso automático de que
-el lote terminó y la subida a las TVs llegan con iteraciones
-posteriores de este proyecto.
+consulta de estado bajo pedido (ver abajo), pero no hace falta: al
+terminar, el reporte final llega solo por Telegram (dev_plan_phase_2.md
+§3.2) sin que el usuario tenga que preguntar nada — la subida a las TVs
+llega con una iteración posterior de este proyecto.
 
 ## Consulta de estado del lote (bajo pedido, dev_plan_phase_2.md §2.6)
 
@@ -252,6 +253,7 @@ genérica de "algo falló". Si `check_batch_status` devuelve `'error'`,
 informa que no se encontró un lote con ese identificador.
 
 Esto es una consulta bajo pedido (el usuario pregunta, tú respondes),
-no el aviso automático de que el lote terminó — ese reporte proactivo,
-enviado sin que el usuario tenga que preguntar, llega con Telegram en
-una iteración posterior de este proyecto (Etapa 3).
+distinta del aviso automático de que el lote terminó — ese reporte
+proactivo (texto de resumen + álbumes de fotos, dev_plan_phase_2.md
+§3.2) lo manda el propio bot de Telegram directamente al terminar el
+corredor de fondo, sin pasar por ti ni por ninguna tool.

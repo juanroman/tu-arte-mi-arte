@@ -61,7 +61,7 @@ from telegram.ext import filters as tg_filters
 from agents.tu_arte_mi_arte.agent import root_agent
 from bot import preview_store, session_store
 from engine import tv_deploy
-from engine.batch import run_draft_stage, run_finalize_stage
+from engine.batch import run_draft_stage, run_finalize_stage, summarize_batch
 from engine.generation import IMAGES_DIR
 
 _logger = logging.getLogger(__name__)
@@ -108,6 +108,8 @@ PARTIAL_DEPLOY_WARNING_TEXT = (
     "pantallas que sí cambiaron para dejarlas como estaban antes?"
 )
 _TYPING_INTERVAL_SECONDS = 4.0
+_PROACTIVE_SEND_PACING_SECONDS = 1.0
+_BATCH_ALBUM_PAGE_SIZE = 10
 
 RESET_KEYBOARD = ReplyKeyboardMarkup(
     [[RESET_BUTTON_TEXT]], resize_keyboard=True, is_persistent=True
@@ -358,7 +360,130 @@ def _extract_materialized_batch_id(events: list) -> str | None:
     return batch_id
 
 
-async def _run_batch_engine_in_background(batch_id: str) -> None:
+def _format_batch_report_text(summary: dict) -> str:
+    """Redacta el texto del reporte final de un lote a partir de
+    `engine.batch.summarize_batch` (dev_plan_phase_2.md §3.2). Es
+    determinístico, no redactado por el LLM -- no hay un turno de agente
+    corriendo cuando el corredor de fondo termina, mismo principio que el
+    estimado de tiempo de §2.4. Nunca infiere la distinción
+    policy_rejection vs. falla técnica del texto de error: la lee tal
+    cual de las dos listas ya separadas que produce `summarize_batch`.
+
+    Un lote sin ningún `needs_attention` produce un mensaje simple de
+    éxito, sin la sección de fallas -- no generalizar el peor caso ni
+    anunciar fallas que no existieron.
+    """
+    lines = [
+        f"🖼️ Tu galería de *{summary['theme']}* ({summary['day_count']} días) "
+        "ya está lista.",
+    ]
+
+    policy_failures = summary["needs_attention_policy_rejection"]
+    technical_failures = summary["needs_attention_technical"]
+
+    if not policy_failures and not technical_failures:
+        lines.append("Todos los paneles se generaron y finalizaron con éxito.")
+        return "\n\n".join(lines)
+
+    succeeded = sum(
+        count
+        for stage, count in summary["stage_counts"].items()
+        if stage != "needs_attention"
+    )
+    lines.append(
+        f"{succeeded} panel(es) se lograron. "
+        f"{len(policy_failures) + len(technical_failures)} necesitan tu atención:"
+    )
+
+    if policy_failures:
+        lines.append(
+            "\n".join(
+                f"❌ Día {failure['day_index']} panel {failure['panel']}: rechazo de "
+                "política, no se reintentó -- considera cambiar el tema de ese panel."
+                for failure in policy_failures
+            )
+        )
+    if technical_failures:
+        lines.append(
+            "\n".join(
+                f"⚠️ Día {failure['day_index']} panel {failure['panel']}: se agotaron "
+                "los reintentos -- puedes pedir que se reintente."
+                for failure in technical_failures
+            )
+        )
+
+    return "\n\n".join(lines)
+
+
+def _batch_report_albums(summary: dict) -> list[list[InputMediaPhoto]]:
+    """Arma los álbumes de fotos del reporte final de un lote, paginados a
+    lo más `_BATCH_ALBUM_PAGE_SIZE` fotos por álbum (Requisito duro #8,
+    dev_plan_phase_2.md §3.2). Recorre los días en orden y junta los
+    `image_id` reales (paneles en `needs_attention` sin imagen se saltan
+    -- nunca revienta por `image_id=None`). Mismo patrón de lectura de
+    bytes que `_panels_album`: nunca un `Path` crudo a `InputMediaPhoto`.
+    Solo la primera foto del primer álbum lleva caption; el detalle por
+    día/panel ya vive en el texto del reporte.
+    """
+    image_ids = [
+        panel["image_id"]
+        for day in summary["days"]
+        for panel in day["panels"].values()
+        if panel["image_id"] is not None
+    ]
+
+    albums = []
+    for page_start in range(0, len(image_ids), _BATCH_ALBUM_PAGE_SIZE):
+        page = image_ids[page_start : page_start + _BATCH_ALBUM_PAGE_SIZE]
+        albums.append(
+            [
+                InputMediaPhoto(
+                    media=(IMAGES_DIR / f"{image_id}.jpg").read_bytes(),
+                    caption=(
+                        _to_markdown_v2(PANELS_ALBUM_CAPTION)
+                        if page_start == 0 and index == 0
+                        else None
+                    ),
+                    parse_mode=(
+                        ParseMode.MARKDOWN_V2
+                        if page_start == 0 and index == 0
+                        else None
+                    ),
+                )
+                for index, image_id in enumerate(page)
+            ]
+        )
+    return albums
+
+
+async def _send_batch_report(bot: object, chat_id: int, batch_id: str) -> None:
+    """Manda el reporte proactivo final de un lote (PRD §15.3 paso 9,
+    §15.6, dev_plan_phase_2.md §3.2): un mensaje de texto con el resumen
+    seguido de los álbumes de fotos paginados, nunca como respuesta de
+    turno (`_deliver_turn_result` no aplica aquí -- no hay turno activo
+    cuando el corredor de fondo termina).
+
+    Respeta el límite de ~1 mensaje/segundo de la API de Telegram
+    (Requisito duro #8) pausando `_PROACTIVE_SEND_PACING_SECONDS` antes de
+    cada envío después del primero -- incluyendo antes del primer álbum,
+    para separarlo del mensaje de texto.
+    """
+    summary = summarize_batch(batch_id)
+    await bot.send_message(  # type: ignore[attr-defined]
+        chat_id,
+        _to_markdown_v2(_format_batch_report_text(summary)),
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    for album in _batch_report_albums(summary):
+        await asyncio.sleep(_PROACTIVE_SEND_PACING_SECONDS)
+        await bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)  # type: ignore[attr-defined]
+        await bot.send_media_group(chat_id=chat_id, media=album)  # type: ignore[attr-defined]
+
+
+async def _run_batch_engine_in_background(
+    batch_id: str, bot: object, chat_id: int
+) -> None:
     """Corre el corredor completo de un lote recién confirmado (draft 1K
     -> finalización 4K, PRD §15.3 paso 8) fuera del turno de Telegram que
     lo disparó (dev_plan_phase_2.md §3.1, requisito duro #7: confirmar un
@@ -368,17 +493,19 @@ async def _run_batch_engine_in_background(batch_id: str) -> None:
     (mismo patrón que `revert_command_handler` con `tv_deploy.revert_panels`)
     para no bloquear el loop de eventos del bot mientras corren.
 
-    No manda ningún mensaje al terminar (el reporte proactivo es 3.2) ni
-    actualiza `batch.status` (la reconciliación al reiniciar es 3.3, con
-    su propio diseño de esa máquina de estados). Una excepción real que
-    escape de aquí (no capturada por el corredor, p. ej. un fallo de I/O)
-    se propaga a través de `Application.create_task`, que la enruta a
+    Al terminar, manda el reporte proactivo (§3.2) al chat que confirmó el
+    lote. No actualiza `batch.status` todavía (la reconciliación al
+    reiniciar es 3.3, con su propio diseño de esa máquina de estados). Una
+    excepción real que escape de aquí (no capturada por el corredor, p.
+    ej. un fallo de I/O o del propio envío del reporte) se propaga a
+    través de `Application.create_task`, que la enruta a
     `global_error_handler` -- nunca desaparece en silencio.
     """
     _logger.info("Corredor de lote arrancó en segundo plano: batch_id=%s", batch_id)
     await asyncio.to_thread(run_draft_stage, batch_id)
     await asyncio.to_thread(run_finalize_stage, batch_id)
     _logger.info("Corredor de lote terminó en segundo plano: batch_id=%s", batch_id)
+    await _send_batch_report(bot, chat_id, batch_id)
 
 
 def _partially_failed_tvs(deploy_results: dict) -> list[str]:
@@ -526,7 +653,7 @@ async def _deliver_turn_result(
     materialized_batch_id = _extract_materialized_batch_id(events)
     if materialized_batch_id is not None:
         application.create_task(  # type: ignore[attr-defined]
-            _run_batch_engine_in_background(materialized_batch_id)
+            _run_batch_engine_in_background(materialized_batch_id, bot, chat_id)
         )
 
     reply_text = _final_text(events) or "Listo."
