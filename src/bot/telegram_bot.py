@@ -103,6 +103,11 @@ PREVIEW_CAPTION = (
     "🖼️ Así se vería en la sala. Si te gusta, toca *Confirmar* para subir "
     "esta versión a alta resolución."
 )
+BATCH_DAY_PREVIEW_CAPTION = (
+    "🖼️ Así se vería este día en la sala. La confirmación del lote "
+    "completo (todos los días) se hace por texto en el paso 8, no con "
+    "este botón — este preview es solo de un día del sub-grupo."
+)
 PANELS_ALBUM_CAPTION = "🎞️ Las piezas del conjunto por separado."
 STALE_PREVIEW_TEXT = (
     "⏱️ Esta vista previa es de una sesión que ya no está activa (expiró o "
@@ -311,6 +316,35 @@ def _extract_compose_previews(events: list) -> list[_ComposedPreview]:
                     )
                 pending_args = None
     return results
+
+
+def _turn_called_batch_preview(events: list) -> bool:
+    """True si este turno llamó `preview_batch_day` (dev_plan_phase_2.md
+    §1.4) en algún momento -- señal de que cualquier `compose_preview` de
+    este mismo turno compone la sala con imágenes de UN DÍA de un lote,
+    no una pieza suelta lista para aprobarse individualmente.
+
+    Hallazgo en vivo (2026-07-18, demo de cierre de la Etapa 4): el
+    modelo puede llamar `compose_preview` (tool base, siempre disponible,
+    nunca gateada por la skill) dentro del mismo turno que
+    `preview_batch_day`, cuando el usuario pide "el preview" en lenguaje
+    genérico -- `_BASE_INSTRUCTION` (ETAPA 2) instruye usar
+    `compose_preview` para cualquier pedido de preview, sin distinguir
+    lote de pieza suelta. Sin esta función, `_deliver_turn_result`
+    adjuntaba el botón "✅ Confirmar" de pieza suelta a ese preview de
+    lote -- tocarlo disparaba `finalize_high_res`/`deploy_to_panels`
+    sobre las tres imágenes del Día 1 como si fueran la pieza única de la
+    conversación, saltándose por completo `materialize_batch_gallery` y
+    desplegando contenido a las TVs antes de que el lote existiera
+    siquiera en SQLite.
+    """
+    for event_ in events:
+        if not event_.content or not event_.content.parts:
+            continue
+        for part in event_.content.parts:
+            if part.function_call and part.function_call.name == "preview_batch_day":
+                return True
+    return False
 
 
 def _finalize_high_res_all_succeeded(events: list) -> bool:
@@ -744,8 +778,34 @@ async def _deliver_turn_result(
     cada uno como tarea de fondo vía `application.create_task` — el turno
     no espera a que terminen, cumpliendo el requisito duro #7 (confirmar
     un lote nunca bloquea el turno de Telegram).
+
+    Si el turno también llamó `preview_batch_day` (§1.4), el botón "✅
+    Confirmar" de pieza suelta se omite en cualquier `compose_preview` de
+    ese mismo turno (`_turn_called_batch_preview`) -- confirmarlo
+    dispararía `finalize_high_res`/`deploy_to_panels` sobre las imágenes
+    de un solo día del lote como si fueran una pieza suelta, saltándose
+    `materialize_batch_gallery` por completo (hallazgo en vivo, demo de
+    cierre de la Etapa 4: `compose_preview` es una tool base sin gating
+    de skill, así que el modelo puede llamarla dentro de un turno de lote
+    cuando el usuario pide "el preview" en lenguaje genérico). La
+    confirmación de un lote sigue siendo por texto, vía el paso 8 de
+    `SKILL.md` (`materialize_batch_gallery`), nunca por este botón.
     """
+    is_batch_preview_turn = _turn_called_batch_preview(events)
     for preview in _extract_compose_previews(events):
+        await bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)  # type: ignore[attr-defined]
+        await bot.send_media_group(  # type: ignore[attr-defined]
+            chat_id=chat_id, media=_panels_album(preview)
+        )
+        if is_batch_preview_turn:
+            await bot.send_photo(  # type: ignore[attr-defined]
+                chat_id=chat_id,
+                photo=IMAGES_DIR / f"{preview.preview_image_id}.jpg",
+                caption=_to_markdown_v2(BATCH_DAY_PREVIEW_CAPTION),
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            continue
+
         token = preview_store.new_token()
         preview_store.save_preview(
             token,
@@ -765,10 +825,6 @@ async def _deliver_turn_result(
                     )
                 ]
             ]
-        )
-        await bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)  # type: ignore[attr-defined]
-        await bot.send_media_group(  # type: ignore[attr-defined]
-            chat_id=chat_id, media=_panels_album(preview)
         )
         await bot.send_photo(  # type: ignore[attr-defined]
             chat_id=chat_id,

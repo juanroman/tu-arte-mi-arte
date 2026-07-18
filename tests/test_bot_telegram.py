@@ -240,6 +240,22 @@ def _compose_preview_response_event(response: dict) -> SimpleNamespace:
     )
 
 
+def _preview_batch_day_call_event() -> SimpleNamespace:
+    return SimpleNamespace(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="preview_batch_day",
+                        args={"mode": "independiente"},
+                    )
+                )
+            ],
+        )
+    )
+
+
 def _finalize_response_event(response: dict) -> SimpleNamespace:
     return SimpleNamespace(
         content=types.Content(
@@ -664,6 +680,46 @@ def test_compose_preview_response_sends_photo_with_confirm_button():
     assert preview.image_43l == "img_l"
     assert preview.image_43r == "img_r"
     assert preview.image_50 == "img_50"
+
+
+def test_compose_preview_within_batch_preview_turn_sends_photo_without_confirm_button(
+    monkeypatch,
+):
+    """Hallazgo en vivo (2026-07-18, demo de cierre de la Etapa 4): un
+    turno que llama preview_batch_day (dev_plan_phase_2.md §1.4) puede
+    también llamar compose_preview (tool base, sin gating de skill) si el
+    usuario pide "el preview" en lenguaje genérico. Adjuntar el botón "✅
+    Confirmar" de pieza suelta en ese caso es incorrecto -- tocarlo
+    dispara finalize_high_res/deploy_to_panels sobre un solo día del lote
+    en vez de materialize_batch_gallery. El preview debe seguir
+    mandándose (con su álbum de paneles), solo sin el botón.
+    """
+    _write_fixture_images("img_l", "img_r", "img_50")
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _preview_batch_day_call_event(),
+                _compose_preview_call_event("img_l", "img_r", "img_50"),
+                _compose_preview_response_event(
+                    {"image_id": "img_preview1", "path": "x"}
+                ),
+                _text_event("aquí está el preview del día 1"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    context.bot.send_photo.assert_awaited_once()
+    _, kwargs = context.bot.send_photo.call_args
+    assert kwargs["chat_id"] == 42
+    assert str(kwargs["photo"]).endswith("img_preview1.jpg")
+    assert "reply_markup" not in kwargs
 
 
 def test_compose_preview_error_response_sends_no_photo():
