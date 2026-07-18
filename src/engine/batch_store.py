@@ -44,6 +44,16 @@ al reiniciar (`telegram_bot.reconcile_batches_on_startup`) trata un lote no
 terminal sin `chat_id` como un caso legado -- avisa por broadcast a los
 usuarios permitidos en vez de intentar reanudarlo, porque no hay a quién
 reportarle el resultado.
+
+Nota de migración (revisión posterior a 3.3, hallazgo de code review):
+`batch.report_text_sent`/`report_albums_sent` (mismo patrón guardado que
+las dos migraciones anteriores) hacen que `telegram_bot._send_batch_report`
+sea reanudable: si el proceso muere a mitad del envío del reporte
+proactivo (texto ya mandado, álbum 2 de 3 falla por un error real de red
+de Telegram), `batch.status` se queda en `'running'` y una reconciliación
+posterior reinvoca `_send_batch_report` desde cero -- sin este progreso
+persistido, esa reinvocación repetiría el texto y TODOS los álbumes,
+duplicando lo que el usuario ya había recibido antes de la falla.
 """
 
 import contextlib
@@ -195,6 +205,15 @@ def _connect(path: Path) -> sqlite3.Connection:
         )
     with contextlib.suppress(sqlite3.OperationalError):
         conn.execute("ALTER TABLE batch ADD COLUMN chat_id INTEGER")
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute(
+            "ALTER TABLE batch "
+            "ADD COLUMN report_text_sent INTEGER NOT NULL DEFAULT 0"
+        )
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute(
+            "ALTER TABLE batch ADD COLUMN report_albums_sent INTEGER NOT NULL DEFAULT 0"
+        )
     return conn
 
 
@@ -309,6 +328,55 @@ def set_batch_status(batch_id: str, status: str, path: Path | None = None) -> No
     with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
         conn.execute(
             "UPDATE batch SET status = ? WHERE batch_id = ?", (status, batch_id)
+        )
+
+
+def get_batch_report_progress(
+    batch_id: str, path: Path | None = None
+) -> tuple[bool, int]:
+    """Devuelve `(report_text_sent, report_albums_sent)` -- cuánto del
+    reporte proactivo final (`telegram_bot._send_batch_report`, §3.2) ya
+    se entregó con éxito para este lote. Hace reanudable el envío del
+    reporte: si el proceso muere a mitad de camino (p. ej. el texto ya se
+    mandó pero el segundo de tres álbumes falla por un error real de red),
+    una reinvocación posterior (disparada por `reconcile_batches_on_startup`
+    tras un reinicio) puede saltarse lo ya entregado en vez de repetirlo
+    desde cero -- hallazgo de code review posterior a 3.3: antes de esto,
+    `_send_batch_report` no persistía ningún progreso y duplicaba todo el
+    reporte en cada reintento.
+    """
+    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
+        row = conn.execute(
+            "SELECT report_text_sent, report_albums_sent FROM batch "
+            "WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+    if row is None:
+        return (False, 0)
+    return (bool(row[0]), row[1])
+
+
+def mark_batch_report_text_sent(batch_id: str, path: Path | None = None) -> None:
+    """Marca que el mensaje de texto del reporte proactivo ya se mandó
+    (§3.2) -- una reinvocación de `_send_batch_report` no debe repetirlo.
+    """
+    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
+        conn.execute(
+            "UPDATE batch SET report_text_sent = 1 WHERE batch_id = ?", (batch_id,)
+        )
+
+
+def mark_batch_report_album_sent(batch_id: str, path: Path | None = None) -> None:
+    """Incrementa el conteo de álbumes ya entregados del reporte proactivo
+    (§3.2), en el orden en que `_batch_report_albums` los produce -- una
+    reinvocación de `_send_batch_report` usa este conteo para saltarse los
+    álbumes ya mandados y solo continuar con el resto.
+    """
+    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
+        conn.execute(
+            "UPDATE batch SET report_albums_sent = report_albums_sent + 1 "
+            "WHERE batch_id = ?",
+            (batch_id,),
         )
 
 

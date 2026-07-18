@@ -1218,6 +1218,71 @@ def test_materialize_batch_gallery_success_triggers_background_batch_engine(
     ]
 
 
+def test_materialize_batch_gallery_called_twice_in_one_turn_starts_both_batches(
+    monkeypatch,
+):
+    """Si el modelo llama `materialize_batch_gallery` más de una vez en el
+    mismo turno (contra la instrucción de SKILL.md de llamarla "una sola
+    vez", pero sin nada que lo impida a nivel de código), las DOS filas
+    quedan materializadas en SQLite -- ninguna debe quedar huérfana sin
+    `chat_id` ni sin arrancar su corredor. Antes de este fix,
+    `_extract_materialized_batch_id` solo devolvía la última llamada
+    exitosa, dejando la primera con `chat_id=NULL` para siempre (y
+    confundida con un lote legado por `reconcile_batches_on_startup`).
+    """
+    calls = []
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_draft_stage",
+        lambda batch_id: calls.append(("draft", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_finalize_stage",
+        lambda batch_id: calls.append(("finalize", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
+    )
+    chat_id_calls = []
+    monkeypatch.setattr(
+        batch_store,
+        "set_batch_chat_id",
+        lambda batch_id, chat_id: chat_id_calls.append((batch_id, chat_id)),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_first111", "day_count": 2}
+                ),
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_second222", "day_count": 3}
+                ),
+                _text_event("dos lotes guardados"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    assert set(chat_id_calls) == {
+        ("batch_first111", 42),
+        ("batch_second222", 42),
+    }
+    assert set(calls) == {
+        ("draft", "batch_first111"),
+        ("finalize", "batch_first111"),
+        ("draft", "batch_second222"),
+        ("finalize", "batch_second222"),
+    }
+
+
 def test_materialize_batch_gallery_success_does_not_block_the_turn(monkeypatch):
     """Same non-blocking guarantee as
     test_revert_handlers_do_not_block_the_event_loop: the handler must
@@ -1875,6 +1940,65 @@ def test_batch_report_does_not_block_the_turn(monkeypatch):
     assert finished_at[0] < 0.1
     assert report_sent_before_turn_finished == [False]
     _final_reply(update).assert_awaited_once()
+
+
+def test_send_batch_report_resumes_without_resending_already_delivered_parts(
+    monkeypatch,
+):
+    """Si `_send_batch_report` falla a mitad de camino (p. ej. el segundo
+    álbum de varios revienta por un error de red real de Telegram), una
+    reinvocación posterior -- la que dispara `reconcile_batches_on_startup`
+    tras un reinicio del bot -- no debe volver a mandar el texto ni los
+    álbumes que ya se entregaron con éxito antes de la falla. Antes de
+    este fix, `_send_batch_report` no persistía ningún progreso: una
+    reinvocación repetía el mensaje de texto y TODOS los álbumes desde
+    cero, duplicando lo que el usuario ya había recibido.
+    """
+    _write_fixture_images("img_1", "img_2")
+    batch_id = batch_store.materialize_batch(
+        "Faroles",
+        [
+            batch_store.ApprovedDay(
+                day_index=1,
+                mode="independiente",
+                sub_group="Grupo 1",
+                prompts={"43L": "a", "43R": "b", "50": "c"},
+            )
+        ],
+    )
+    # _BATCH_ALBUM_PAGE_SIZE=1 fuerza 2 álbumes con solo 2 imágenes, sin
+    # necesitar un lote real de más de 10 paneles.
+    monkeypatch.setattr(telegram_bot, "_BATCH_ALBUM_PAGE_SIZE", 1)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda _batch_id: _batch_summary(
+            days=[_batch_day_summary(1, {"43L": "img_1", "43R": "img_2"})]
+        ),
+    )
+    bot = _make_bot()
+    sent_albums = []
+    calls_before_failure = {"n": 0}
+
+    async def flaky_send_media_group(*, chat_id, media):
+        calls_before_failure["n"] += 1
+        if calls_before_failure["n"] == 2:
+            raise RuntimeError("network blip")
+        sent_albums.append(media)
+
+    bot.send_media_group = AsyncMock(side_effect=flaky_send_media_group)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(telegram_bot._send_batch_report(bot, 42, batch_id))
+
+    assert bot.send_message.await_count == 1
+    assert len(sent_albums) == 1  # solo el álbum 1 se entregó antes de la falla
+
+    # Reinvocación (simula la reanudación tras un reinicio real del bot).
+    asyncio.run(telegram_bot._send_batch_report(bot, 42, batch_id))
+
+    assert bot.send_message.await_count == 1  # texto NO reenviado
+    assert len(sent_albums) == 2  # solo el álbum 2 (el pendiente) se mandó ahora
 
 
 def _make_revert_callback_update_and_context(

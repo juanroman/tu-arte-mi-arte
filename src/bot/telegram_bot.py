@@ -351,13 +351,24 @@ def _extract_deploy_results(events: list) -> dict | None:
     return result
 
 
-def _extract_materialized_batch_id(events: list) -> str | None:
-    """Devuelve el `batch_id` de la última llamada exitosa a
-    `materialize_batch_gallery` en la corrida, o None si esa tool no se
-    llamó (o falló) en este turno. Mismo patrón de caminar
-    `event.content.parts` que `_extract_deploy_results`.
+def _extract_materialized_batch_ids(events: list) -> list[str]:
+    """Devuelve el `batch_id` de cada llamada exitosa a
+    `materialize_batch_gallery` en la corrida, en el orden en que
+    ocurrieron -- lista vacía si esa tool no se llamó (o siempre falló) en
+    este turno. Mismo patrón de caminar `event.content.parts` que
+    `_extract_deploy_results`.
+
+    SKILL.md instruye al modelo a llamar esta tool una sola vez por lote
+    confirmado, pero nada a nivel de código lo impide -- si el modelo la
+    llama más de una vez en el mismo turno (p. ej. tras una respuesta
+    ambigua de una tool), cada llamada exitosa ya materializó una fila
+    real en SQLite y necesita su propio `chat_id`/corredor de fondo; una
+    versión anterior de esta función solo devolvía la última, dejando
+    cualquier lote anterior huérfano (`chat_id=NULL` para siempre,
+    confundido después con un lote legado por
+    `reconcile_batches_on_startup`).
     """
-    batch_id = None
+    batch_ids: list[str] = []
     for event_ in events:
         if not event_.content or not event_.content.parts:
             continue
@@ -367,9 +378,10 @@ def _extract_materialized_batch_id(events: list) -> str | None:
                 and part.function_response.name == "materialize_batch_gallery"
             ):
                 data = part.function_response.response or {}
-                if "error" not in data:
-                    batch_id = data.get("batch_id")
-    return batch_id
+                batch_id = data.get("batch_id")
+                if "error" not in data and batch_id is not None:
+                    batch_ids.append(batch_id)
+    return batch_ids
 
 
 def _format_batch_report_text(summary: dict) -> str:
@@ -479,18 +491,32 @@ async def _send_batch_report(bot: object, chat_id: int, batch_id: str) -> None:
     (Requisito duro #8) pausando `_PROACTIVE_SEND_PACING_SECONDS` antes de
     cada envío después del primero -- incluyendo antes del primer álbum,
     para separarlo del mensaje de texto.
+
+    Reanudable (hallazgo de code review posterior a 3.3): antes de mandar
+    el texto o cada álbum, consulta `batch_store.get_batch_report_progress`
+    y se salta lo que ya se entregó con éxito en una invocación anterior
+    de esta misma función -- si el proceso muere a mitad de camino (texto
+    ya mandado, álbum 2 de 3 falla por un error real de red de Telegram),
+    la reinvocación disparada por `reconcile_batches_on_startup` continúa
+    justo donde se quedó en vez de repetir el reporte completo desde cero.
     """
     summary = summarize_batch(batch_id)
-    await bot.send_message(  # type: ignore[attr-defined]
-        chat_id,
-        _to_markdown_v2(_format_batch_report_text(summary)),
-        parse_mode=ParseMode.MARKDOWN_V2,
+    text_already_sent, albums_already_sent = batch_store.get_batch_report_progress(
+        batch_id
     )
+    if not text_already_sent:
+        await bot.send_message(  # type: ignore[attr-defined]
+            chat_id,
+            _to_markdown_v2(_format_batch_report_text(summary)),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        batch_store.mark_batch_report_text_sent(batch_id)
 
-    for album in _batch_report_albums(summary):
+    for album in _batch_report_albums(summary)[albums_already_sent:]:
         await asyncio.sleep(_PROACTIVE_SEND_PACING_SECONDS)
         await bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)  # type: ignore[attr-defined]
         await bot.send_media_group(chat_id=chat_id, media=album)  # type: ignore[attr-defined]
+        batch_store.mark_batch_report_album_sent(batch_id)
 
 
 async def _run_batch_engine_in_background(
@@ -685,14 +711,16 @@ async def _deliver_turn_result(
     Revertir cambios" atado solo a las TVs que sí cambiaron — nunca a la
     que falló, porque esa nunca se tocó (dev_plan §3.5).
 
-    Si el turno materializó un lote de galería (`materialize_batch_gallery`,
-    dev_plan_phase_2.md §3.1), persiste primero a qué chat pertenece
-    (`batch_store.set_batch_chat_id`, §3.3 -- es lo único que le permite a
-    una reconciliación tras un reinicio saber a dónde reportar) y luego
-    dispara el corredor completo (draft -> finalización 4K) como tarea de
-    fondo vía `application.create_task` — el turno no espera a que
-    termine, cumpliendo el requisito duro #7 (confirmar un lote nunca
-    bloquea el turno de Telegram).
+    Si el turno materializó uno o más lotes de galería
+    (`materialize_batch_gallery`, dev_plan_phase_2.md §3.1 -- normalmente
+    uno solo por turno, pero nada a nivel de código impide que el modelo
+    la llame más de una vez), persiste primero a qué chat pertenece cada
+    uno (`batch_store.set_batch_chat_id`, §3.3 -- es lo único que le
+    permite a una reconciliación tras un reinicio saber a dónde reportar)
+    y luego dispara el corredor completo (draft -> finalización 4K) de
+    cada uno como tarea de fondo vía `application.create_task` — el turno
+    no espera a que terminen, cumpliendo el requisito duro #7 (confirmar
+    un lote nunca bloquea el turno de Telegram).
     """
     for preview in _extract_compose_previews(events):
         token = preview_store.new_token()
@@ -747,8 +775,7 @@ async def _deliver_turn_result(
                 reply_markup=_revert_keyboard(succeeded),
             )
 
-    materialized_batch_id = _extract_materialized_batch_id(events)
-    if materialized_batch_id is not None:
+    for materialized_batch_id in _extract_materialized_batch_ids(events):
         batch_store.set_batch_chat_id(materialized_batch_id, chat_id)
         application.create_task(  # type: ignore[attr-defined]
             _run_batch_engine_in_background(materialized_batch_id, bot, chat_id)
