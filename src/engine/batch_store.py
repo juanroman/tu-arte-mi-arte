@@ -83,6 +83,8 @@ class BatchConfig:
     finalize_seconds_per_call: int
     deploy_seconds_per_day: int
     eta_safety_margin: float
+    rotation_duration_minutes: int
+    rotation_shuffle: bool
 
 
 def load_batch_config(path: Path | None = None) -> BatchConfig:

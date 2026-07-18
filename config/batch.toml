@@ -31,3 +31,15 @@ finalize_seconds_per_call = 65
 deploy_seconds_per_day = 90
 
 eta_safety_margin = 1.2
+
+# Rotación nativa de la TV (PRD §15.2 objetivo 7, dev_plan_phase_2.md
+# §4.2). Alcance reducido decidido con el usuario: sin calendario/franjas
+# horarias (nada de "diario entre semana, cada 1-2h el fin de semana") --
+# se configura una sola vez al terminar de subir el lote y se deja así
+# hasta el próximo lote; si el usuario quiere otra cadencia, la ajusta a
+# mano. rotation_duration_minutes=1440 son 24h por imagen ("una por
+# día"). rotation_shuffle=false respeta el orden de day_index (la
+# progresión narrativa que el usuario ya aprobó sub-grupo por sub-grupo),
+# en vez de aleatorizar.
+rotation_duration_minutes = 1440
+rotation_shuffle = false

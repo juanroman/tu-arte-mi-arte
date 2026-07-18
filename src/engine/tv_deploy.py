@@ -16,6 +16,16 @@ por TV). `revert_tv`/`revert_panels` reutilizan `deploy_image_to_tv` para
 volver a subir/seleccionar el image_id anterior — no hay un "undo" nativo
 en la TV, revertir es simplemente desplegar hacia atrás.
 
+Galería por lotes (dev_plan_phase_2.md §4.1/§4.2): `upload_image_to_category`
+puebla 'Mis Fotos' sin seleccionar/limpiar (para no interrumpir una carga
+en curso); `clear_photos_category` vacía la categoría por completo antes
+de que un lote nuevo empiece a subir (§4.2, "clean slate per batch");
+`configure_batch_rotation` deja la TV rotando sola sobre ese contenido.
+Un despliegue de pieza suelta posterior (`deploy_image_to_tv`) sigue
+borrando cualquier galería activa al mostrar esa pieza — comportamiento
+intencional, no un defecto: pedir una pieza suelta es un override
+explícito de lo que esté rotando.
+
 No dependency on google.adk: this module is testable in isolation and
 reusable from any interface.
 """
@@ -88,11 +98,17 @@ def load_tv_deploy_config(path: Path | None = None) -> TvDeployConfig:
     return TvDeployConfig(matte=data["matte"])
 
 
-def _delete_old_uploads(tv: SamsungTVArt, keep_content_id: str, tv_name: str) -> None:
+def _delete_old_uploads(
+    tv: SamsungTVArt, keep_content_id: str | None, tv_name: str
+) -> None:
     """Borra todo el contenido de 'Mis Fotos' en `tv` salvo
-    `keep_content_id` (PRD §7.6). Nunca lanza: una falla de limpieza se
-    registra y se ignora — la imagen nueva ya está mostrándose, así que
-    esto es housekeeping incompleto, no una falla de despliegue.
+    `keep_content_id` (PRD §7.6). `keep_content_id=None` (dev_plan_phase_2.md
+    §4.2, `clear_photos_category`) borra absolutamente todo — ningún
+    content_id real hace match contra `None`. Nunca lanza: una falla de
+    limpieza se registra y se ignora — la imagen nueva ya está
+    mostrándose (o, en el caso de un vaciado completo, el caller decide
+    si continuar), así que esto es housekeeping incompleto, no una falla
+    de despliegue.
     """
     try:
         old_ids = [
@@ -356,13 +372,14 @@ def upload_image_to_category(tv_name: str, image_id: str) -> dict:
     tiene sentido durante una subida por lote donde nada se selecciona
     todavía.
 
-    Riesgo conocido, documentado aquí y diferido explícitamente al cierre
-    de 4.2 (no se arregla en esta iteración): un despliegue de pieza
-    suelta posterior (`deploy_image_to_tv`/`deploy_set_to_panels`)
-    seguiría llamando `_delete_old_uploads`, que borraría TODO el
-    contenido de 'Mis Fotos' salvo la imagen recién desplegada —
-    incluyendo cualquier galería de lote activa subida por esta función.
-    4.2 debe decidir cómo coexisten ambos flujos antes de cerrar Etapa 4.
+    Comportamiento intencional (resuelto en dev_plan_phase_2.md §4.2, ya
+    no es un riesgo diferido): un despliegue de pieza suelta posterior
+    (`deploy_image_to_tv`/`deploy_set_to_panels`) sigue llamando
+    `_delete_old_uploads`, que borra TODO el contenido de 'Mis Fotos'
+    salvo la imagen recién desplegada — incluyendo cualquier galería de
+    lote activa subida por esta función. Esto es correcto por diseño:
+    pedir que se muestre una pieza suelta es un override explícito de lo
+    que esté rotando, no un accidente a proteger.
     """
     _logger.info(
         "Subiendo a 'Mis Fotos' de %s (sin seleccionar): image_id=%s",
@@ -419,6 +436,171 @@ def upload_image_to_category(tv_name: str, image_id: str) -> dict:
             _logger.exception("Fallo inesperado subiendo a %s", tv_name)
             outcome["result"] = {
                 "error": f"Fallo inesperado subiendo a la TV {tv_name!r}: {error}"
+            }
+        finally:
+            try:
+                tv.close()
+            except Exception as error:
+                _logger.debug("Cierre de conexión falló para %s: %s", tv_name, error)
+
+    return _run_with_deploy_watchdog(tv_name, tv, work)
+
+
+def clear_photos_category(tv_name: str) -> dict:
+    """Borra TODO el contenido de 'Mis Fotos' en la TV `tv_name`
+    (dev_plan_phase_2.md §4.2) -- a diferencia de `_delete_old_uploads`
+    usada por `deploy_image_to_tv`, que siempre preserva la imagen recién
+    subida, aquí no hay ninguna a preservar.
+
+    Pensada para dejar "Mis Fotos" en blanco antes de que un lote nuevo
+    empiece a subir sus imágenes (§4.2: "clean slate per batch"), para
+    que la rotación nativa nunca mezcle el lote vigente con uno viejo. Es
+    housekeeping best-effort, mismo principio que `_delete_old_uploads`:
+    si falla (p. ej. la TV no responde), el caller debe loguear y seguir
+    con la subida real, nunca bloquearla por esto.
+
+    Mismo andamiaje de watchdog que `upload_image_to_category`
+    (`_run_with_deploy_watchdog`). No usa `_resolve_deploy_target`: no hay
+    `image_id` ni matte involucrados, solo listar/borrar content_ids ya
+    subidos. Nunca lanza; devuelve {'cleared': True} o {'error': '<msj>'}.
+    """
+    _logger.info("Vaciando 'Mis Fotos' de %s", tv_name)
+
+    try:
+        host = resolve_tv_host(tv_name)
+    except TvNotFoundError as error:
+        _logger.error("No se pudo resolver la TV %s: %s", tv_name, error)
+        return {"error": str(error)}
+
+    token_file = DATA_DIR / f"tv_{tv_name.lower()}_token.json"
+    tv = SamsungTVArt(
+        host=host, token_file=str(token_file), timeout=_TV_TIMEOUT_SECONDS
+    )
+
+    def work(outcome: dict, abandoned: threading.Event) -> None:
+        del abandoned  # nada que proteger: no hay estado compartido que mutar
+        try:
+            try:
+                tv.open()
+            except _CONNECTION_ERRORS as error:
+                _logger.warning("No se pudo conectar con la TV %s: %s", tv_name, error)
+                outcome["result"] = {
+                    "error": f"No se pudo conectar con la TV {tv_name!r}: {error}"
+                }
+                return
+
+            if not tv.supported():
+                _logger.warning("La TV %s no soporta Art Mode", tv_name)
+                outcome["result"] = {"error": f"La TV {tv_name!r} no soporta Art Mode."}
+                return
+
+            _delete_old_uploads(tv, keep_content_id=None, tv_name=tv_name)
+            _logger.info("'Mis Fotos' vaciada con éxito en %s", tv_name)
+            outcome["result"] = {"cleared": True}
+        except Exception as error:  # red de seguridad: corre sin supervisión
+            _logger.exception("Fallo inesperado vaciando 'Mis Fotos' en %s", tv_name)
+            outcome["result"] = {
+                "error": (
+                    f"Fallo inesperado vaciando 'Mis Fotos' en {tv_name!r}: {error}"
+                )
+            }
+        finally:
+            try:
+                tv.close()
+            except Exception as error:
+                _logger.debug("Cierre de conexión falló para %s: %s", tv_name, error)
+
+    return _run_with_deploy_watchdog(tv_name, tv, work)
+
+
+def configure_batch_rotation(
+    tv_name: str, duration_minutes: int, shuffle: bool
+) -> dict:
+    """Configura la rotación nativa de 'Mis Fotos' en la TV `tv_name`
+    (dev_plan_phase_2.md §4.2, PRD §15.2 objetivo 7): intenta
+    `set_slideshow_status` (API nueva) y, si la TV no la soporta
+    (`exceptions.ResponseError`), cae a `set_auto_rotation_status` (API
+    legacy) con los mismos parámetros -- mismo patrón de fallback que el
+    propio CLI de `samsungtvws` (`art-slideshow-set`).
+
+    `duration_minutes`: minutos entre cambios de imagen (0 desactiva la
+    rotación). `shuffle`: True para orden aleatorio, False para respetar
+    el orden de subida (día por día). Se aplica sobre la categoría
+    completa de 'Mis Fotos' (`_MY_PHOTOS_CATEGORY`) -- es la única
+    granularidad que expone la TV, no hay programación por imagen
+    individual (PRD §15.2, no-objetivo).
+
+    Idempotente por naturaleza: volver a llamarla (p. ej. tras una
+    reconciliación de reinicio) simplemente vuelve a aplicar la misma
+    configuración, sin ningún estado adicional que proteger. Mismo
+    andamiaje de watchdog que las demás funciones de este módulo. Nunca
+    lanza; devuelve {'result': ...} o {'error': '<mensaje>'}.
+    """
+    _logger.info(
+        "Configurando rotación en %s: duration=%s shuffle=%s",
+        tv_name,
+        duration_minutes,
+        shuffle,
+    )
+
+    try:
+        host = resolve_tv_host(tv_name)
+    except TvNotFoundError as error:
+        _logger.error("No se pudo resolver la TV %s: %s", tv_name, error)
+        return {"error": str(error)}
+
+    token_file = DATA_DIR / f"tv_{tv_name.lower()}_token.json"
+    tv = SamsungTVArt(
+        host=host, token_file=str(token_file), timeout=_TV_TIMEOUT_SECONDS
+    )
+
+    def work(outcome: dict, abandoned: threading.Event) -> None:
+        del abandoned  # nada que proteger: no hay estado compartido que mutar
+        try:
+            try:
+                tv.open()
+            except _CONNECTION_ERRORS as error:
+                _logger.warning("No se pudo conectar con la TV %s: %s", tv_name, error)
+                outcome["result"] = {
+                    "error": f"No se pudo conectar con la TV {tv_name!r}: {error}"
+                }
+                return
+
+            if not tv.supported():
+                _logger.warning("La TV %s no soporta Art Mode", tv_name)
+                outcome["result"] = {"error": f"La TV {tv_name!r} no soporta Art Mode."}
+                return
+
+            try:
+                try:
+                    result = tv.set_slideshow_status(
+                        duration=duration_minutes,
+                        type=shuffle,
+                        category_id=_MY_PHOTOS_CATEGORY,
+                    )
+                except exceptions.ResponseError:
+                    result = tv.set_auto_rotation_status(
+                        duration=duration_minutes,
+                        type=shuffle,
+                        category_id=_MY_PHOTOS_CATEGORY,
+                    )
+            except _CONNECTION_ERRORS as error:
+                _logger.warning(
+                    "No se pudo configurar rotación en %s: %s", tv_name, error
+                )
+                outcome["result"] = {
+                    "error": f"No se pudo configurar rotación en {tv_name!r}: {error}"
+                }
+                return
+
+            _logger.info("Rotación configurada con éxito en %s", tv_name)
+            outcome["result"] = {"result": result}
+        except Exception as error:  # red de seguridad: corre sin supervisión
+            _logger.exception("Fallo inesperado configurando rotación en %s", tv_name)
+            outcome["result"] = {
+                "error": (
+                    f"Fallo inesperado configurando rotación en {tv_name!r}: {error}"
+                )
             }
         finally:
             try:

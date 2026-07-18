@@ -14,6 +14,19 @@ from engine import (
 from engine.batch_store import ApprovedDay  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _stub_clear_photos_category(monkeypatch):
+    """run_upload_stage (dev_plan_phase_2.md §4.2) vacía 'Mis Fotos' antes
+    de subir el primer item de un lote nuevo a cada TV -- sin este stub,
+    las pruebas de subida dispararían resolve_tv_host/mDNS reales. Los
+    tests que quieren verificar el vaciado en sí lo sobrescriben con su
+    propio monkeypatch.
+    """
+    monkeypatch.setattr(
+        batch, "clear_photos_category", lambda tv_name: {"cleared": True}
+    )
+
+
 def _materialize_independiente_day(db_path, day_index=1):
     days = [
         ApprovedDay(
@@ -1314,3 +1327,170 @@ def test_run_upload_stage_processes_one_tv_concurrently_but_serializes_within_a_
     items = batch_store.get_batch_items(batch_id, path=db_path)
     assert len(items) == 45
     assert all(item.stage == "uploaded" for item in items)
+
+
+# --- 4.2: limpieza previa + rotación nativa -------------------------------
+
+
+def test_run_upload_stage_clears_each_tv_once_before_uploading_a_new_batch(
+    tmp_path, monkeypatch
+):
+    """dev_plan_phase_2.md §4.2, "clean slate per batch": antes de subir
+    el primer item de un lote nuevo a una TV, se vacía 'Mis Fotos' de esa
+    TV -- así la rotación nativa nunca mezcla el lote vigente con uno
+    anterior.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_independiente_day(db_path)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+
+    clear_calls = []
+    monkeypatch.setattr(
+        batch,
+        "clear_photos_category",
+        lambda tv_name: (clear_calls.append(tv_name), {"cleared": True})[1],
+    )
+    monkeypatch.setattr(
+        batch, "upload_image_to_category", _succeeding_upload_image_to_category([])
+    )
+
+    batch.run_upload_stage(batch_id, path=db_path)
+
+    assert sorted(clear_calls) == ["43L", "43R", "50"]
+
+
+def test_run_upload_stage_does_not_clear_a_tv_already_holding_uploaded_items(
+    tmp_path, monkeypatch
+):
+    """Reinvocar sobre un lote con items ya 'uploaded' en un panel (p. ej.
+    tras un crash a medio subir) no debe volver a vaciar esa TV --
+    borraría imágenes de este mismo lote que ya subieron con éxito.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_independiente_day(db_path)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43L",
+        attempts=1,
+        stage="uploaded",
+        image_id="final_img_1",
+        error=None,
+        path=db_path,
+    )
+
+    clear_calls = []
+    monkeypatch.setattr(
+        batch,
+        "clear_photos_category",
+        lambda tv_name: (clear_calls.append(tv_name), {"cleared": True})[1],
+    )
+    monkeypatch.setattr(
+        batch, "upload_image_to_category", _succeeding_upload_image_to_category([])
+    )
+
+    batch.run_upload_stage(batch_id, path=db_path)
+
+    assert "43L" not in clear_calls
+    assert sorted(clear_calls) == ["43R", "50"]
+
+
+def test_run_upload_stage_still_uploads_when_clear_photos_category_fails(
+    tmp_path, monkeypatch
+):
+    """El vaciado es housekeeping best-effort (mismo principio que
+    _delete_old_uploads): una TV inalcanzable para el vaciado no debe
+    impedir que la subida real de ese panel se intente.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_independiente_day(db_path)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+
+    monkeypatch.setattr(
+        batch, "clear_photos_category", lambda tv_name: {"error": "TV inalcanzable"}
+    )
+    calls = []
+    monkeypatch.setattr(
+        batch, "upload_image_to_category", _succeeding_upload_image_to_category(calls)
+    )
+
+    summary = batch.run_upload_stage(batch_id, path=db_path)
+
+    assert set(summary["uploaded"]) == {"1:43L", "1:43R", "1:50"}
+    assert {tv_name for tv_name, _ in calls} == {"43L", "43R", "50"}
+
+
+def test_run_rotation_stage_configures_all_three_tvs_with_config_values(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        batch,
+        "configure_batch_rotation",
+        lambda tv_name, duration, shuffle: (
+            calls.append((tv_name, duration, shuffle)),
+            {"result": "ok"},
+        )[1],
+    )
+
+    result = batch.run_rotation_stage("batch_x")
+
+    config = batch_store.load_batch_config()
+    assert sorted(calls) == sorted(
+        (tv_name, config.rotation_duration_minutes, config.rotation_shuffle)
+        for tv_name in ("43L", "43R", "50")
+    )
+    assert result == {
+        "43L": {"result": "ok"},
+        "43R": {"result": "ok"},
+        "50": {"result": "ok"},
+    }
+
+
+def test_run_rotation_stage_retries_transient_failure_up_to_the_ceiling(monkeypatch):
+    calls = []
+
+    def fake_configure(tv_name, duration, shuffle):
+        if tv_name != "43L":
+            return {"result": "ok"}
+        calls.append(tv_name)
+        if len(calls) < 3:
+            return {"error": "fallo técnico transitorio"}
+        return {"result": "ok"}
+
+    monkeypatch.setattr(batch, "configure_batch_rotation", fake_configure)
+
+    result = batch.run_rotation_stage("batch_x")
+
+    assert result["43L"] == {"result": "ok"}
+    max_attempts = batch_store.load_batch_config().tv_deploy_max_attempts
+    assert len(calls) == 3
+    assert len(calls) <= max_attempts
+
+
+def test_run_rotation_stage_one_tv_failure_does_not_block_the_others(monkeypatch):
+    def fake_configure(tv_name, duration, shuffle):
+        if tv_name == "43R":
+            return {"error": "no se pudo conectar"}
+        return {"result": "ok"}
+
+    monkeypatch.setattr(batch, "configure_batch_rotation", fake_configure)
+
+    result = batch.run_rotation_stage("batch_x")
+
+    assert result["43L"] == {"result": "ok"}
+    assert result["50"] == {"result": "ok"}
+    assert "error" in result["43R"]
+
+
+def test_run_rotation_stage_configures_the_three_tvs_concurrently(monkeypatch):
+    def fake_configure(tv_name, duration, shuffle):
+        time.sleep(0.2)
+        return {"result": "ok"}
+
+    monkeypatch.setattr(batch, "configure_batch_rotation", fake_configure)
+
+    start = time.monotonic()
+    batch.run_rotation_stage("batch_x")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.5

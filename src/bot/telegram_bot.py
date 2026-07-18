@@ -65,6 +65,7 @@ from engine import batch_store, tv_deploy
 from engine.batch import (
     run_draft_stage,
     run_finalize_stage,
+    run_rotation_stage,
     run_upload_stage,
     summarize_batch,
 )
@@ -400,7 +401,10 @@ def _format_batch_report_text(summary: dict) -> str:
 
     Un lote sin ningún `needs_attention` produce un mensaje simple de
     éxito, sin la sección de fallas -- no generalizar el peor caso ni
-    anunciar fallas que no existieron.
+    anunciar fallas que no existieron. Desde dev_plan_phase_2.md §4.2,
+    ese camino de éxito total también menciona que la rotación nativa ya
+    quedó configurada -- las TVs de verdad están rotando el lote, no solo
+    "listo" en el sentido de "generado".
     """
     lines = [
         f"🖼️ Tu galería de *{summary['theme']}* ({summary['day_count']} días) "
@@ -411,7 +415,10 @@ def _format_batch_report_text(summary: dict) -> str:
     technical_failures = summary["needs_attention_technical"]
 
     if not policy_failures and not technical_failures:
-        lines.append("Todos los paneles se generaron y finalizaron con éxito.")
+        lines.append(
+            "Todos los paneles se generaron y finalizaron con éxito, y las "
+            "pantallas ya están rotando la galería."
+        )
         return "\n\n".join(lines)
 
     succeeded = sum(
@@ -528,15 +535,15 @@ async def _run_batch_engine_in_background(
     batch_id: str, bot: object, chat_id: int
 ) -> None:
     """Corre el corredor completo de un lote recién confirmado (draft 1K
-    -> finalización 4K -> subida a "Mis Fotos" de las TVs, PRD §15.3 paso
-    8, dev_plan_phase_2.md §4.1) fuera del turno de Telegram que lo
-    disparó (§3.1, requisito duro #7: confirmar un lote nunca bloquea el
-    turno). `run_draft_stage`/`run_finalize_stage`/`run_upload_stage`
-    (Etapas 2 y 4, ya probadas) son funciones síncronas que pueden tardar
-    minutos contra la API real de Gemini o las TVs -- se corren en un
-    hilo aparte (mismo patrón que `revert_command_handler` con
-    `tv_deploy.revert_panels`) para no bloquear el loop de eventos del
-    bot mientras corren.
+    -> finalización 4K -> subida a "Mis Fotos" de las TVs -> rotación
+    nativa, PRD §15.3 paso 8, dev_plan_phase_2.md §4.1/§4.2) fuera del
+    turno de Telegram que lo disparó (§3.1, requisito duro #7: confirmar
+    un lote nunca bloquea el turno). `run_draft_stage`/`run_finalize_stage`/
+    `run_upload_stage`/`run_rotation_stage` (Etapas 2 y 4, ya probadas)
+    son funciones síncronas que pueden tardar minutos contra la API real
+    de Gemini o las TVs -- se corren en un hilo aparte (mismo patrón que
+    `revert_command_handler` con `tv_deploy.revert_panels`) para no
+    bloquear el loop de eventos del bot mientras corren.
 
     Al terminar, manda el reporte proactivo (§3.2) al chat que confirmó el
     lote. Marca `batch.status='running'` al arrancar y `'reported'` justo
@@ -544,8 +551,8 @@ async def _run_batch_engine_in_background(
     misma función tanto para un arranque en caliente (recién confirmado)
     como para una reanudación tras un reinicio del bot
     (`reconcile_batches_on_startup`), sin una segunda copia de esta
-    lógica: las tres etapas ya son idempotentes (§2.5, §4.1), así que
-    reinvocarlas sobre un lote a medias simplemente continúa donde se
+    lógica: las cuatro etapas ya son idempotentes (§2.5, §4.1, §4.2), así
+    que reinvocarlas sobre un lote a medias simplemente continúa donde se
     quedó. Una excepción real que escape de aquí (no capturada por el
     corredor, p. ej. un fallo de I/O o del propio envío del reporte) se
     propaga a través de `Application.create_task`, que la enruta a
@@ -553,17 +560,19 @@ async def _run_batch_engine_in_background(
     en `'running'`, y la próxima reconciliación al reiniciar lo vuelve a
     recoger igual que uno recién materializado.
 
-    Nota (§4.1): `upload_image_to_category` (usada por `run_upload_stage`)
-    nunca selecciona la imagen en pantalla ni configura rotación -- eso es
-    4.2. El texto del reporte proactivo (`_format_batch_report_text`) no
-    distingue esto todavía: dice "ya está lista" aunque las TVs no
-    cambien visiblemente de imagen hasta que 4.2 exista.
+    Sin cabos sueltos de Etapa 4 (dev_plan_phase_2.md §4.2 cierra el
+    último): `run_rotation_stage` deja las TVs rotando solas sobre el
+    contenido recién subido, así que el "ya está lista" del reporte
+    proactivo (`_format_batch_report_text`) ahora es literalmente cierto
+    -- las pantallas sí cambian de imagen, a diferencia de cuando 4.1
+    cerró y esta nota todavía documentaba lo contrario.
     """
     _logger.info("Corredor de lote arrancó en segundo plano: batch_id=%s", batch_id)
     batch_store.set_batch_status(batch_id, "running")
     await asyncio.to_thread(run_draft_stage, batch_id)
     await asyncio.to_thread(run_finalize_stage, batch_id)
     await asyncio.to_thread(run_upload_stage, batch_id)
+    await asyncio.to_thread(run_rotation_stage, batch_id)
     _logger.info("Corredor de lote terminó en segundo plano: batch_id=%s", batch_id)
     await _send_batch_report(bot, chat_id, batch_id)
     batch_store.set_batch_status(batch_id, "reported")

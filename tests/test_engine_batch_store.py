@@ -23,6 +23,8 @@ def test_load_batch_config_reads_retry_ceilings():
     assert config.finalize_seconds_per_call == 65
     assert config.deploy_seconds_per_day == 90
     assert config.eta_safety_margin == 1.2
+    assert config.rotation_duration_minutes == 1440
+    assert config.rotation_shuffle is False
 
 
 def test_materialize_batch_creates_correct_row_counts_for_mixed_modes(tmp_path):
