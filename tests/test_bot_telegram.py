@@ -1750,6 +1750,16 @@ def test_reconcile_batches_on_startup_resumes_non_terminal_batch_with_known_chat
         lambda batch_id: calls.append(("finalize", batch_id)),
     )
     monkeypatch.setattr(
+        telegram_bot,
+        "run_upload_stage",
+        lambda batch_id: calls.append(("upload", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_rotation_stage",
+        lambda batch_id: calls.append(("rotate", batch_id)),
+    )
+    monkeypatch.setattr(
         telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
     )
     application = _make_application({"allowed_user_ids": frozenset({111})})
@@ -1760,7 +1770,12 @@ def test_reconcile_batches_on_startup_resumes_non_terminal_batch_with_known_chat
         )
     )
 
-    assert calls == [("draft", batch_id), ("finalize", batch_id)]
+    assert calls == [
+        ("draft", batch_id),
+        ("finalize", batch_id),
+        ("upload", batch_id),
+        ("rotate", batch_id),
+    ]
     application.bot.send_message.assert_any_await(
         42, ANY, parse_mode=ParseMode.MARKDOWN_V2
     )
