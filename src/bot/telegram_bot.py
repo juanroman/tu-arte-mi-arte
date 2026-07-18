@@ -62,10 +62,47 @@ from telegram.ext import filters as tg_filters
 from agents.tu_arte_mi_arte.agent import root_agent
 from bot import preview_store, session_store
 from engine import batch_store, tv_deploy
-from engine.batch import run_draft_stage, run_finalize_stage, summarize_batch
+from engine.batch import (
+    run_draft_stage,
+    run_finalize_stage,
+    run_rotation_stage,
+    run_upload_stage,
+    summarize_batch,
+)
 from engine.generation import IMAGES_DIR
 
 _logger = logging.getLogger(__name__)
+
+# Serializa la etapa de subida+rotación (nunca draft/finalize, que solo
+# comparten cuota de la API de Gemini, no un dispositivo físico) entre
+# corredores de lote concurrentes (hallazgo de code review post-cierre de
+# Etapa 4): dos lotes materializados en turnos que se solapan arrancan cada
+# uno su propio `_run_batch_engine_in_background` sin ninguna
+# serialización entre sí (`_deliver_turn_result`/`reconcile_batches_on_startup`
+# disparan cada uno vía `application.create_task`). `run_upload_stage`/
+# `run_rotation_stage` (`engine.batch`) asumen una sola conexión websocket a
+# la vez por TV física -- sin este lock, el "clean slate per batch" de un
+# lote (`clear_photos_category`) podía borrar imágenes que el otro lote ya
+# había subido a la misma TV. Un solo `asyncio.Lock` de proceso basta: hoy
+# solo hay tres TVs físicas compartidas por todo corredor, así que no vale
+# la pena una granularidad por-TV.
+_upload_and_rotation_lock_state: dict[str, object] = {"loop": None, "lock": None}
+
+
+def _upload_and_rotation_lock() -> asyncio.Lock:
+    """Devuelve el lock de arriba, recreándolo si el event loop actual
+    cambió: `asyncio.Lock` se ata al loop en el que se usa por primera vez
+    y revienta (`RuntimeError`) si se reutiliza desde uno distinto. En
+    producción hay un solo loop de vida larga (el de la `Application` de
+    PTB), así que esto nunca importa fuera de tests, donde cada
+    `asyncio.run()` de un test distinto crea su propio loop.
+    """
+    loop = asyncio.get_running_loop()
+    if _upload_and_rotation_lock_state["loop"] is not loop:
+        _upload_and_rotation_lock_state["loop"] = loop
+        _upload_and_rotation_lock_state["lock"] = asyncio.Lock()
+    return _upload_and_rotation_lock_state["lock"]  # type: ignore[return-value]
+
 
 APP_NAME = "tu_arte_mi_arte"
 RESET_BUTTON_TEXT = "🔄 Empezar de cero"
@@ -96,6 +133,11 @@ KNOWN_TV_NAMES = ("43L", "43R", "50")
 PREVIEW_CAPTION = (
     "🖼️ Así se vería en la sala. Si te gusta, toca *Confirmar* para subir "
     "esta versión a alta resolución."
+)
+BATCH_DAY_PREVIEW_CAPTION = (
+    "🖼️ Así se vería este día en la sala. La confirmación del lote "
+    "completo (todos los días) se hace por texto en el paso 8, no con "
+    "este botón — este preview es solo de un día del sub-grupo."
 )
 PANELS_ALBUM_CAPTION = "🎞️ Las piezas del conjunto por separado."
 STALE_PREVIEW_TEXT = (
@@ -307,6 +349,53 @@ def _extract_compose_previews(events: list) -> list[_ComposedPreview]:
     return results
 
 
+def _batch_preview_image_id_sets(events: list) -> list[frozenset]:
+    """Devuelve, para cada llamada exitosa a `preview_batch_day`
+    (dev_plan_phase_2.md §1.4) en la corrida, el conjunto de `image_id` de
+    43L/43R/50 que produjo -- uno por día previsualizado (el paso 6 de
+    `SKILL.md` puede llamarla varias veces en el mismo turno si el usuario
+    pidió el preview del sub-grupo completo). Se usa para correlacionar,
+    llamada por llamada, cuál `compose_preview` de este turno compone la
+    sala con imágenes de UN DÍA de un lote (sin botón de confirmación de
+    pieza suelta) y cuál es una pieza suelta genuina no relacionada (con
+    botón).
+
+    Hallazgo en vivo (2026-07-18, demo de cierre de la Etapa 4): el
+    modelo puede llamar `compose_preview` (tool base, siempre disponible,
+    nunca gateada por la skill) dentro del mismo turno que
+    `preview_batch_day`, cuando el usuario pide "el preview" en lenguaje
+    genérico -- `_BASE_INSTRUCTION` (ETAPA 2) instruye usar
+    `compose_preview` para cualquier pedido de preview, sin distinguir
+    lote de pieza suelta. Una versión anterior de esta señal era un solo
+    booleano para todo el turno (`_turn_called_batch_preview`): bastaba
+    con que el turno hubiera llamado `preview_batch_day` una sola vez
+    para que TODOS los `compose_preview` de ese turno perdieran su botón
+    -- incluyendo una pieza suelta genuina no relacionada, si el modelo
+    llegaba a llamar ambas tools en el mismo turno. Correlacionar por
+    `image_id` real, en vez de por "¿el turno tocó esta tool en algún
+    momento?", corrige ese caso sin perder la protección original.
+    """
+    id_sets = []
+    for event_ in events:
+        if not event_.content or not event_.content.parts:
+            continue
+        for part in event_.content.parts:
+            if (
+                part.function_response
+                and part.function_response.name == "preview_batch_day"
+            ):
+                data = part.function_response.response or {}
+                ids = {
+                    panel_result["image_id"]
+                    for panel in ("43L", "43R", "50")
+                    if isinstance(panel_result := data.get(panel), dict)
+                    and "image_id" in panel_result
+                }
+                if ids:
+                    id_sets.append(frozenset(ids))
+    return id_sets
+
+
 def _finalize_high_res_all_succeeded(events: list) -> bool:
     """True only if the turn made at least one finalize_high_res call and
     every one of them succeeded. An approved session should close on
@@ -384,7 +473,25 @@ def _extract_materialized_batch_ids(events: list) -> list[str]:
     return batch_ids
 
 
-def _format_batch_report_text(summary: dict) -> str:
+def _failed_rotation_tvs(rotation_results: dict | None) -> list[str]:
+    """Nombres de TV, en el orden fijo de `KNOWN_TV_NAMES`, cuyo resultado
+    en `rotation_results` (shape de `engine.batch.run_rotation_stage`) es
+    una falla -- `rotation_results=None` (código legado que no lo pasó
+    todavía, o un caller de test que no lo necesita) se trata como "sin
+    fallas conocidas" en vez de reventar, ya que no hay nada que reportar.
+    """
+    if rotation_results is None:
+        return []
+    return [
+        tv_name
+        for tv_name in KNOWN_TV_NAMES
+        if tv_name in rotation_results and "error" in rotation_results[tv_name]
+    ]
+
+
+def _format_batch_report_text(
+    summary: dict, rotation_results: dict | None = None
+) -> str:
     """Redacta el texto del reporte final de un lote a partir de
     `engine.batch.summarize_batch` (dev_plan_phase_2.md §3.2). Es
     determinístico, no redactado por el LLM -- no hay un turno de agente
@@ -395,7 +502,22 @@ def _format_batch_report_text(summary: dict) -> str:
 
     Un lote sin ningún `needs_attention` produce un mensaje simple de
     éxito, sin la sección de fallas -- no generalizar el peor caso ni
-    anunciar fallas que no existieron.
+    anunciar fallas que no existieron. Desde dev_plan_phase_2.md §4.2,
+    ese camino de éxito total también menciona que la rotación nativa ya
+    quedó configurada -- las TVs de verdad están rotando el lote, no solo
+    "listo" en el sentido de "generado".
+
+    `rotation_results` es el resultado real de `run_rotation_stage`
+    (dev_plan_phase_2.md §4.2, hallazgo de code review post-cierre de
+    Etapa 4): antes de este parámetro, el texto afirmaba
+    incondicionalmente que "las pantallas ya están rotando la galería" sin
+    haber revisado si `configure_batch_rotation` en verdad tuvo éxito en
+    cada TV -- una TV inalcanzable en el momento de la subida quedaba sin
+    rotar y el usuario nunca se enteraba. Un panel/día con
+    `needs_attention` sigue siendo la falla principal a reportar (el
+    camino de "éxito total" ni siquiera se evalúa); la rotación solo se
+    menciona aparte cuando generación/subida sí tuvieron éxito total pero
+    alguna TV no quedó rotando.
     """
     lines = [
         f"🖼️ Tu galería de *{summary['theme']}* ({summary['day_count']} días) "
@@ -404,9 +526,22 @@ def _format_batch_report_text(summary: dict) -> str:
 
     policy_failures = summary["needs_attention_policy_rejection"]
     technical_failures = summary["needs_attention_technical"]
+    failed_rotation_tvs = _failed_rotation_tvs(rotation_results)
 
     if not policy_failures and not technical_failures:
-        lines.append("Todos los paneles se generaron y finalizaron con éxito.")
+        if failed_rotation_tvs:
+            lines.append(
+                "Todos los paneles se generaron y finalizaron con éxito, pero "
+                "no se pudo configurar la rotación en: "
+                f"{', '.join(failed_rotation_tvs)}. Esas pantallas no van a "
+                "cambiar de imagen solas -- revisa que estén encendidas y "
+                "conectadas, y vuelve a pedir el lote si quieres reintentarlo."
+            )
+        else:
+            lines.append(
+                "Todos los paneles se generaron y finalizaron con éxito, y las "
+                "pantallas ya están rotando la galería."
+            )
         return "\n\n".join(lines)
 
     succeeded = sum(
@@ -439,22 +574,50 @@ def _format_batch_report_text(summary: dict) -> str:
     return "\n\n".join(lines)
 
 
+def _batch_report_image_ids(summary: dict) -> list[str]:
+    """Junta los `image_id` 1K (nunca los 4K -- exclusivos de la subida a
+    TV, PRD §7.7) que va a mandar el reporte proactivo de un lote, en
+    orden de día.
+
+    Para un día `independiente`: el `draft_image_id` de cada uno de los 3
+    paneles (paneles en `needs_attention` sin draft se saltan -- nunca
+    revienta por `draft_image_id=None`). Para un día `split`: **una sola
+    foto** de `draft_wide_image_id` (la composición ancha 1K completa,
+    cubriendo 43L+43R) más el `draft_image_id` del panel 50 -- nunca los
+    `draft_image_id` individuales de 43L/43R, que no existen para un
+    panel físico de un día split (no tienen imagen propia hasta que la
+    finalización los separa de la fuente ancha). Un día split reporta
+    entonces 2 fotos contra las 3 de un día independiente -- decisión
+    deliberada (más simple que partir también el draft, y arguiblemente
+    mejor vista previa: la composición continua completa en vez de dos
+    recortes truncados).
+    """
+    image_ids = []
+    for day in summary["days"]:
+        if day["mode"] == "split":
+            if day["draft_wide_image_id"] is not None:
+                image_ids.append(day["draft_wide_image_id"])
+            panel_50 = day["panels"].get("50")
+            if panel_50 is not None and panel_50["draft_image_id"] is not None:
+                image_ids.append(panel_50["draft_image_id"])
+        else:
+            image_ids.extend(
+                panel["draft_image_id"]
+                for panel in day["panels"].values()
+                if panel["draft_image_id"] is not None
+            )
+    return image_ids
+
+
 def _batch_report_albums(summary: dict) -> list[list[InputMediaPhoto]]:
     """Arma los álbumes de fotos del reporte final de un lote, paginados a
     lo más `_BATCH_ALBUM_PAGE_SIZE` fotos por álbum (Requisito duro #8,
-    dev_plan_phase_2.md §3.2). Recorre los días en orden y junta los
-    `image_id` reales (paneles en `needs_attention` sin imagen se saltan
-    -- nunca revienta por `image_id=None`). Mismo patrón de lectura de
-    bytes que `_panels_album`: nunca un `Path` crudo a `InputMediaPhoto`.
-    Solo la primera foto del primer álbum lleva caption; el detalle por
-    día/panel ya vive en el texto del reporte.
+    dev_plan_phase_2.md §3.2). Mismo patrón de lectura de bytes que
+    `_panels_album`: nunca un `Path` crudo a `InputMediaPhoto`. Solo la
+    primera foto del primer álbum lleva caption; el detalle por día/panel
+    ya vive en el texto del reporte.
     """
-    image_ids = [
-        panel["image_id"]
-        for day in summary["days"]
-        for panel in day["panels"].values()
-        if panel["image_id"] is not None
-    ]
+    image_ids = _batch_report_image_ids(summary)
 
     albums = []
     for page_start in range(0, len(image_ids), _BATCH_ALBUM_PAGE_SIZE):
@@ -480,12 +643,22 @@ def _batch_report_albums(summary: dict) -> list[list[InputMediaPhoto]]:
     return albums
 
 
-async def _send_batch_report(bot: object, chat_id: int, batch_id: str) -> None:
+async def _send_batch_report(
+    bot: object, chat_id: int, batch_id: str, rotation_results: dict | None = None
+) -> None:
     """Manda el reporte proactivo final de un lote (PRD §15.3 paso 9,
     §15.6, dev_plan_phase_2.md §3.2): un mensaje de texto con el resumen
     seguido de los álbumes de fotos paginados, nunca como respuesta de
     turno (`_deliver_turn_result` no aplica aquí -- no hay turno activo
     cuando el corredor de fondo termina).
+
+    `rotation_results` (shape de `engine.batch.run_rotation_stage`) se
+    reenvía tal cual a `_format_batch_report_text` (hallazgo de code
+    review post-cierre de Etapa 4, ver docstring de esa función) -- no se
+    persiste en `batch_store` porque no hace falta: esta función solo se
+    llama desde `_run_batch_engine_in_background`, que siempre acaba de
+    correr `run_rotation_stage` (idempotente) justo antes, incluso en una
+    reanudación tras un reinicio.
 
     Respeta el límite de ~1 mensaje/segundo de la API de Telegram
     (Requisito duro #8) pausando `_PROACTIVE_SEND_PACING_SECONDS` antes de
@@ -507,7 +680,7 @@ async def _send_batch_report(bot: object, chat_id: int, batch_id: str) -> None:
     if not text_already_sent:
         await bot.send_message(  # type: ignore[attr-defined]
             chat_id,
-            _to_markdown_v2(_format_batch_report_text(summary)),
+            _to_markdown_v2(_format_batch_report_text(summary, rotation_results)),
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         batch_store.mark_batch_report_text_sent(batch_id)
@@ -523,13 +696,15 @@ async def _run_batch_engine_in_background(
     batch_id: str, bot: object, chat_id: int
 ) -> None:
     """Corre el corredor completo de un lote recién confirmado (draft 1K
-    -> finalización 4K, PRD §15.3 paso 8) fuera del turno de Telegram que
-    lo disparó (dev_plan_phase_2.md §3.1, requisito duro #7: confirmar un
-    lote nunca bloquea el turno). `run_draft_stage`/`run_finalize_stage`
-    (Etapa 2, ya probados) son funciones síncronas que pueden tardar
-    minutos contra la API real de Gemini -- se corren en un hilo aparte
-    (mismo patrón que `revert_command_handler` con `tv_deploy.revert_panels`)
-    para no bloquear el loop de eventos del bot mientras corren.
+    -> finalización 4K -> subida a "Mis Fotos" de las TVs -> rotación
+    nativa, PRD §15.3 paso 8, dev_plan_phase_2.md §4.1/§4.2) fuera del
+    turno de Telegram que lo disparó (§3.1, requisito duro #7: confirmar
+    un lote nunca bloquea el turno). `run_draft_stage`/`run_finalize_stage`/
+    `run_upload_stage`/`run_rotation_stage` (Etapas 2 y 4, ya probadas)
+    son funciones síncronas que pueden tardar minutos contra la API real
+    de Gemini o las TVs -- se corren en un hilo aparte (mismo patrón que
+    `revert_command_handler` con `tv_deploy.revert_panels`) para no
+    bloquear el loop de eventos del bot mientras corren.
 
     Al terminar, manda el reporte proactivo (§3.2) al chat que confirmó el
     lote. Marca `batch.status='running'` al arrancar y `'reported'` justo
@@ -537,21 +712,44 @@ async def _run_batch_engine_in_background(
     misma función tanto para un arranque en caliente (recién confirmado)
     como para una reanudación tras un reinicio del bot
     (`reconcile_batches_on_startup`), sin una segunda copia de esta
-    lógica: `run_draft_stage`/`run_finalize_stage` ya son idempotentes
-    (§2.5), así que reinvocarlas sobre un lote a medias simplemente
-    continúa donde se quedó. Una excepción real que escape de aquí (no
-    capturada por el corredor, p. ej. un fallo de I/O o del propio envío
-    del reporte) se propaga a través de `Application.create_task`, que la
-    enruta a `global_error_handler` -- nunca desaparece en silencio; el
-    lote queda en `'running'`, y la próxima reconciliación al reiniciar lo
-    vuelve a recoger igual que uno recién materializado.
+    lógica: las cuatro etapas ya son idempotentes (§2.5, §4.1, §4.2), así
+    que reinvocarlas sobre un lote a medias simplemente continúa donde se
+    quedó. Una excepción real que escape de aquí (no capturada por el
+    corredor, p. ej. un fallo de I/O o del propio envío del reporte) se
+    propaga a través de `Application.create_task`, que la enruta a
+    `global_error_handler` -- nunca desaparece en silencio; el lote queda
+    en `'running'`, y la próxima reconciliación al reiniciar lo vuelve a
+    recoger igual que uno recién materializado.
+
+    Sin cabos sueltos de Etapa 4 (dev_plan_phase_2.md §4.2 cierra el
+    último): `run_rotation_stage` deja las TVs rotando solas sobre el
+    contenido recién subido, así que el "ya está lista" del reporte
+    proactivo (`_format_batch_report_text`) ahora es literalmente cierto
+    -- las pantallas sí cambian de imagen, a diferencia de cuando 4.1
+    cerró y esta nota todavía documentaba lo contrario.
+
+    Subida/rotación serializadas entre lotes concurrentes
+    (`_upload_and_rotation_lock`, hallazgo de code review post-cierre de
+    Etapa 4): dos corredores de lote pueden estar corriendo a la vez (nada
+    serializa `materialize_batch_gallery`/`reconcile_batches_on_startup`
+    entre sí), pero `run_upload_stage`/`run_rotation_stage` tocan las
+    mismas tres TVs físicas sin importar de qué lote vengan -- sin este
+    lock, el vaciado "clean slate per batch" de un lote podía borrar
+    imágenes que el otro ya había subido a la misma TV. El draft/finalize
+    de arriba se queda fuera del lock a propósito: solo comparten cuota de
+    la API de Gemini, no un dispositivo físico, así que dos lotes generando
+    en paralelo es seguro y deseable (no hace esperar innecesariamente a
+    un lote más corto detrás de uno más largo).
     """
     _logger.info("Corredor de lote arrancó en segundo plano: batch_id=%s", batch_id)
     batch_store.set_batch_status(batch_id, "running")
     await asyncio.to_thread(run_draft_stage, batch_id)
     await asyncio.to_thread(run_finalize_stage, batch_id)
+    async with _upload_and_rotation_lock():
+        await asyncio.to_thread(run_upload_stage, batch_id)
+        rotation_results = await asyncio.to_thread(run_rotation_stage, batch_id)
     _logger.info("Corredor de lote terminó en segundo plano: batch_id=%s", batch_id)
-    await _send_batch_report(bot, chat_id, batch_id)
+    await _send_batch_report(bot, chat_id, batch_id, rotation_results)
     batch_store.set_batch_status(batch_id, "reported")
 
 
@@ -721,8 +919,42 @@ async def _deliver_turn_result(
     cada uno como tarea de fondo vía `application.create_task` — el turno
     no espera a que terminen, cumpliendo el requisito duro #7 (confirmar
     un lote nunca bloquea el turno de Telegram).
+
+    Si un `compose_preview` de este turno usa exactamente los `image_id`
+    que una llamada a `preview_batch_day` (§1.4) de ese mismo turno acaba
+    de producir, el botón "✅ Confirmar" de pieza suelta se omite para ESE
+    `compose_preview` en particular (`_batch_preview_image_id_sets`) --
+    confirmarlo dispararía `finalize_high_res`/`deploy_to_panels` sobre
+    las imágenes de un solo día del lote como si fueran una pieza suelta,
+    saltándose `materialize_batch_gallery` por completo (hallazgo en
+    vivo, demo de cierre de la Etapa 4: `compose_preview` es una tool
+    base sin gating de skill, así que el modelo puede llamarla dentro de
+    un turno de lote cuando el usuario pide "el preview" en lenguaje
+    genérico). La correlación es por `image_id`, no por "¿el turno tocó
+    `preview_batch_day` en algún momento?" -- así una pieza suelta
+    genuina, con sus propios `image_id` no relacionados, conserva su
+    botón aunque comparta turno con un preview de lote. La confirmación
+    de un lote sigue siendo por texto, vía el paso 8 de `SKILL.md`
+    (`materialize_batch_gallery`), nunca por este botón.
     """
+    batch_preview_id_sets = _batch_preview_image_id_sets(events)
     for preview in _extract_compose_previews(events):
+        await bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)  # type: ignore[attr-defined]
+        await bot.send_media_group(  # type: ignore[attr-defined]
+            chat_id=chat_id, media=_panels_album(preview)
+        )
+        preview_ids = frozenset(
+            {preview.image_43l, preview.image_43r, preview.image_50}
+        )
+        if preview_ids in batch_preview_id_sets:
+            await bot.send_photo(  # type: ignore[attr-defined]
+                chat_id=chat_id,
+                photo=IMAGES_DIR / f"{preview.preview_image_id}.jpg",
+                caption=_to_markdown_v2(BATCH_DAY_PREVIEW_CAPTION),
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            continue
+
         token = preview_store.new_token()
         preview_store.save_preview(
             token,
@@ -742,10 +974,6 @@ async def _deliver_turn_result(
                     )
                 ]
             ]
-        )
-        await bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)  # type: ignore[attr-defined]
-        await bot.send_media_group(  # type: ignore[attr-defined]
-            chat_id=chat_id, media=_panels_album(preview)
         )
         await bot.send_photo(  # type: ignore[attr-defined]
             chat_id=chat_id,

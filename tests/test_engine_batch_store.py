@@ -23,6 +23,8 @@ def test_load_batch_config_reads_retry_ceilings():
     assert config.finalize_seconds_per_call == 65
     assert config.deploy_seconds_per_day == 90
     assert config.eta_safety_margin == 1.2
+    assert config.rotation_duration_minutes == 1440
+    assert config.rotation_shuffle is False
 
 
 def test_materialize_batch_creates_correct_row_counts_for_mixed_modes(tmp_path):
@@ -188,6 +190,83 @@ def test_record_item_attempt_updates_only_the_targeted_item(tmp_path):
     assert items["50"].stage == "pending"
 
 
+def test_record_item_attempt_persists_draft_image_id(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+    days = [
+        ApprovedDay(
+            day_index=1,
+            mode="independiente",
+            sub_group="Sub-grupo A",
+            prompts={"43L": "a", "43R": "b", "50": "c"},
+        )
+    ]
+    batch_id = batch_store.materialize_batch("Tema", days, path=db_path)
+
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43L",
+        attempts=1,
+        stage="drafted",
+        image_id="img_draft001",
+        error=None,
+        draft_image_id="img_draft001",
+        path=db_path,
+    )
+
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    assert items["43L"].draft_image_id == "img_draft001"
+
+
+def test_record_item_attempt_without_draft_image_id_never_overwrites_it(tmp_path):
+    """Caso central del hallazgo real post-4.3: una llamada de
+    finalización (que nunca pasa `draft_image_id`) no debe borrar el
+    draft 1K ya guardado por la llamada de draft anterior sobre la misma
+    fila -- de lo contrario el reporte de Telegram perdería el único id
+    1K disponible en cuanto el item se finalizara.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    days = [
+        ApprovedDay(
+            day_index=1,
+            mode="independiente",
+            sub_group="Sub-grupo A",
+            prompts={"43L": "a", "43R": "b", "50": "c"},
+        )
+    ]
+    batch_id = batch_store.materialize_batch("Tema", days, path=db_path)
+
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43L",
+        attempts=1,
+        stage="drafted",
+        image_id="img_draft001",
+        error=None,
+        draft_image_id="img_draft001",
+        path=db_path,
+    )
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43L",
+        attempts=1,
+        stage="finalized",
+        image_id="img_final001",
+        error=None,
+        path=db_path,
+    )
+
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    assert items["43L"].image_id == "img_final001"
+    assert items["43L"].draft_image_id == "img_draft001"
+
+
 def test_record_item_attempt_persists_error_and_needs_attention(tmp_path):
     db_path = tmp_path / "batch.sqlite3"
     days = [
@@ -246,6 +325,70 @@ def test_record_wide_image_updates_batch_day_without_touching_batch_item(tmp_pat
     assert items["43L"].stage == "pending"
     assert items["43R"].stage == "pending"
     assert items["43L"].image_id is None
+
+
+def test_record_wide_image_persists_draft_wide_image_id(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+    days = [
+        ApprovedDay(
+            day_index=1,
+            mode="split",
+            sub_group="Sub-grupo A",
+            prompts={"wide": "un horizonte compartido", "50": "otra escena"},
+        )
+    ]
+    batch_id = batch_store.materialize_batch("Tema", days, path=db_path)
+
+    batch_store.record_wide_image(
+        batch_id,
+        1,
+        wide_image_id="img_wide001",
+        wide_stage="drafted",
+        draft_wide_image_id="img_wide001",
+        path=db_path,
+    )
+
+    batch_day = batch_store.get_batch_days(batch_id, path=db_path)[0]
+    assert batch_day.draft_wide_image_id == "img_wide001"
+
+
+def test_record_wide_image_without_draft_wide_image_id_never_overwrites_it(tmp_path):
+    """Mismo caso central que
+    `test_record_item_attempt_without_draft_image_id_never_overwrites_it`,
+    para la imagen ancha de un día split: la finalización de la fuente
+    ancha (que nunca pasa `draft_wide_image_id`) no debe borrar el draft
+    1K ya guardado.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    days = [
+        ApprovedDay(
+            day_index=1,
+            mode="split",
+            sub_group="Sub-grupo A",
+            prompts={"wide": "un horizonte compartido", "50": "otra escena"},
+        )
+    ]
+    batch_id = batch_store.materialize_batch("Tema", days, path=db_path)
+
+    batch_store.record_wide_image(
+        batch_id,
+        1,
+        wide_image_id="img_wide_draft",
+        wide_stage="drafted",
+        draft_wide_image_id="img_wide_draft",
+        path=db_path,
+    )
+    batch_store.record_wide_image(
+        batch_id,
+        1,
+        wide_image_id="img_wide_final",
+        wide_stage="finalized",
+        path=db_path,
+    )
+
+    batch_day = batch_store.get_batch_days(batch_id, path=db_path)[0]
+    assert batch_day.wide_image_id == "img_wide_final"
+    assert batch_day.draft_wide_image_id == "img_wide_draft"
 
 
 def test_record_item_attempt_persists_policy_rejection_flag(tmp_path):
@@ -327,6 +470,44 @@ def test_record_split_day_outcome_writes_both_panels_and_wide_atomically(tmp_pat
     day = batch_store.get_batch_days(batch_id, path=db_path)[0]
     assert day.wide_image_id == "img_wide001"
     assert day.wide_stage == "drafted"
+
+
+def test_record_split_day_outcome_preserves_draft_wide_image_id_through_finalize(
+    tmp_path,
+):
+    """Mismo caso central que las pruebas de `record_item_attempt`/
+    `record_wide_image`, para el camino atómico de un día split: el
+    draft 1K de la fuente ancha, guardado por la primera llamada (draft),
+    sobrevive intacto a una segunda llamada de finalización que reescribe
+    `wide_image_id` con la versión 4K sin pasar `draft_wide_image_id`.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+
+    batch_store.record_split_day_outcome(
+        batch_id,
+        1,
+        panel_43l=PanelOutcome(attempts=1, stage="drafted"),
+        panel_43r=PanelOutcome(attempts=1, stage="drafted"),
+        wide=WideOutcome(
+            wide_image_id="img_wide_draft",
+            wide_stage="drafted",
+            draft_wide_image_id="img_wide_draft",
+        ),
+        path=db_path,
+    )
+    batch_store.record_split_day_outcome(
+        batch_id,
+        1,
+        panel_43l=PanelOutcome(attempts=1, stage="finalized", image_id="img_43l_final"),
+        panel_43r=PanelOutcome(attempts=1, stage="finalized", image_id="img_43r_final"),
+        wide=WideOutcome(wide_image_id="img_wide_final", wide_stage="finalized"),
+        path=db_path,
+    )
+
+    day = batch_store.get_batch_days(batch_id, path=db_path)[0]
+    assert day.wide_image_id == "img_wide_final"
+    assert day.draft_wide_image_id == "img_wide_draft"
 
 
 def test_record_split_day_outcome_with_wide_none_leaves_batch_day_untouched(tmp_path):
@@ -484,3 +665,54 @@ def test_chat_id_column_migrates_onto_a_pre_existing_database_missing_it(tmp_pat
     assert batch_store.list_non_terminal_batches(path=db_path)[0].batch_id == (
         "batch_legacy"
     )
+
+
+def test_draft_image_id_columns_migrate_onto_a_pre_existing_database_missing_them(
+    tmp_path,
+):
+    """Mismo patrón de migración que `chat_id`/`policy_rejection`: una
+    base ya poblada por versiones anteriores del schema (sin
+    `batch_item.draft_image_id`/`batch_day.draft_wide_image_id`) gana las
+    columnas nuevas sin perder sus filas.
+    """
+    db_path = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE batch_day ("
+        "batch_id TEXT NOT NULL, "
+        "day_index INTEGER NOT NULL, "
+        "mode TEXT NOT NULL, "
+        "sub_group TEXT NOT NULL, "
+        "wide_image_id TEXT, "
+        "wide_stage TEXT, "
+        "PRIMARY KEY (batch_id, day_index)"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE batch_item ("
+        "batch_id TEXT NOT NULL, "
+        "day_index INTEGER NOT NULL, "
+        "panel TEXT NOT NULL, "
+        "prompt TEXT NOT NULL, "
+        "stage TEXT NOT NULL, "
+        "image_id TEXT, "
+        "attempts INTEGER NOT NULL DEFAULT 0, "
+        "error TEXT, "
+        "updated_at TEXT, "
+        "PRIMARY KEY (batch_id, day_index, panel)"
+        ")"
+    )
+    conn.execute(
+        "INSERT INTO batch_item "
+        "(batch_id, day_index, panel, prompt, stage, image_id, attempts) "
+        "VALUES ('batch_legacy', 1, '43L', 'escena vieja', 'finalized', "
+        "'img_legacy', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    items = batch_store.get_batch_items("batch_legacy", path=db_path)
+
+    assert len(items) == 1
+    assert items[0].image_id == "img_legacy"
+    assert items[0].draft_image_id is None

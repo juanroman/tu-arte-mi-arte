@@ -11,11 +11,14 @@ from samsungtvws import exceptions
 from engine import deploy_history, generation, tv_deploy
 from engine.tv_deploy import (
     TvDeployConfig,
+    clear_photos_category,
+    configure_batch_rotation,
     deploy_image_to_tv,
     deploy_set_to_panels,
     load_tv_deploy_config,
     revert_panels,
     revert_tv,
+    upload_image_to_category,
 )
 from engine.tv_discovery import TvNotFoundError
 
@@ -35,6 +38,9 @@ class _FakeSamsungTVArt:
         content_id="MY_F0001",
         hang_seconds=None,
         open_hang_seconds=None,
+        slideshow_status_error=None,
+        slideshow_status_result="ok-slideshow",
+        auto_rotation_status_result="ok-auto-rotation",
     ):
         self.host = host
         self.token_file = token_file
@@ -50,12 +56,17 @@ class _FakeSamsungTVArt:
         self._content_id = content_id
         self._hang_seconds = hang_seconds
         self._open_hang_seconds = open_hang_seconds
+        self._slideshow_status_error = slideshow_status_error
+        self._slideshow_status_result = slideshow_status_result
+        self._auto_rotation_status_result = auto_rotation_status_result
 
         self.connection = None
         self.closed = False
         self.uploaded: list[tuple[str, str, str]] = []
         self.selected: list[str] = []
         self.deleted: list[str] = []
+        self.slideshow_status_calls: list[dict] = []
+        self.auto_rotation_status_calls: list[dict] = []
 
     def open(self):
         if self._open_hang_seconds is not None:
@@ -104,6 +115,22 @@ class _FakeSamsungTVArt:
     def delete_list(self, content_ids):
         self.deleted.extend(content_ids)
         return True
+
+    def set_slideshow_status(self, duration=0, type=True, category=2, category_id=None):
+        if self._slideshow_status_error is not None:
+            raise self._slideshow_status_error
+        self.slideshow_status_calls.append(
+            {"duration": duration, "type": type, "category_id": category_id}
+        )
+        return self._slideshow_status_result
+
+    def set_auto_rotation_status(
+        self, duration=0, type=True, category=2, category_id=None
+    ):
+        self.auto_rotation_status_calls.append(
+            {"duration": duration, "type": type, "category_id": category_id}
+        )
+        return self._auto_rotation_status_result
 
 
 def _write_fixture_image(images_dir: Path, image_id: str) -> None:
@@ -512,6 +539,318 @@ def test_deploy_image_to_tv_worst_case_wait_is_deadline_plus_grace_constant(
     _install_fake(monkeypatch, tmp_path, hang_seconds=2)
 
     result = deploy_image_to_tv("43L", "img_0001")
+
+    assert "error" in result
+    assert "no respondió" in result["error"]
+
+
+def test_upload_image_to_category_success_uploads_without_selecting_or_deleting(
+    tmp_path, monkeypatch
+):
+    """dev_plan_phase_2.md §4.1: a diferencia de deploy_image_to_tv, esta
+    función solo puebla 'Mis Fotos' -- nunca selecciona la imagen en
+    pantalla ni borra subidas viejas, porque durante una subida por lote
+    mostrar/limpiar a mitad de camino sería activamente incorrecto.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(monkeypatch, tmp_path, content_id="MY_F0099")
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert result == {"content_id": "MY_F0099"}
+    assert fake.selected == []
+    assert fake.deleted == []
+    assert fake.uploaded == [
+        (str(tmp_path / "img_0001.jpg"), "shadowbox_warm", "shadowbox_warm")
+    ]
+    assert fake.closed is True
+
+
+def test_upload_image_to_category_does_not_record_deploy_history(tmp_path, monkeypatch):
+    """No tiene sentido registrar 'qué se está mostrando ahora' (esa es la
+    semántica de deploy_history, usada por revert_tv) cuando esta función
+    nunca selecciona nada en pantalla.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    _install_fake(monkeypatch, tmp_path, content_id="MY_F0099")
+
+    upload_image_to_category("43L", "img_0001")
+
+    history = deploy_history.get_history(
+        "43L", path=tmp_path / "tv_deploy_history.sqlite3"
+    )
+    assert history is None
+
+
+def test_upload_image_to_category_reports_missing_image(tmp_path, monkeypatch):
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+
+    def _fail_resolve(name):
+        raise AssertionError("resolve_tv_host should not run without a local image")
+
+    monkeypatch.setattr(tv_deploy, "resolve_tv_host", _fail_resolve)
+
+    result = upload_image_to_category("43L", "img_does_not_exist")
+
+    assert "error" in result
+
+
+def test_upload_image_to_category_converts_tv_not_found_to_error_dict(
+    tmp_path, monkeypatch
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+
+    def _raise_not_found(name):
+        raise TvNotFoundError(f"No hay TV {name!r}")
+
+    monkeypatch.setattr(tv_deploy, "resolve_tv_host", _raise_not_found)
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+
+
+def test_upload_image_to_category_reports_connection_failure_on_open(
+    tmp_path, monkeypatch
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(
+        monkeypatch, tmp_path, open_error=exceptions.ConnectionFailure("no conecta")
+    )
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+    assert fake.closed is True
+
+
+def test_upload_image_to_category_reports_unsupported_tv(tmp_path, monkeypatch):
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(monkeypatch, tmp_path, supported=False)
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+    assert fake.uploaded == []
+
+
+def test_upload_image_to_category_reports_upload_failure(tmp_path, monkeypatch):
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(
+        monkeypatch, tmp_path, upload_error=exceptions.ResponseError("falló subida")
+    )
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+    assert fake.closed is True
+
+
+def test_upload_image_to_category_uses_the_matte_configured_for_that_tv(
+    tmp_path, monkeypatch
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(monkeypatch, tmp_path)
+
+    upload_image_to_category("50", "img_0001")
+
+    assert fake.uploaded == [
+        (str(tmp_path / "img_0001.jpg"), "shadowbox_warm", "shadowbox_warm")
+    ]
+
+
+def test_upload_image_to_category_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
+    """La función nueva comparte el mismo watchdog extraído
+    (_run_with_deploy_watchdog) que deploy_image_to_tv -- una TV sin
+    responder no debe colgar este llamado para siempre tampoco aquí.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=2)
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+    assert "no respondió" in result["error"]
+
+
+def test_upload_image_to_category_logs_error_when_watchdog_times_out(
+    tmp_path, monkeypatch, caplog
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=2)
+
+    with caplog.at_level(logging.ERROR, logger="engine.tv_deploy"):
+        result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+    assert any(
+        record.levelno == logging.ERROR and "43L" in record.message
+        for record in caplog.records
+    )
+
+
+def test_clear_photos_category_deletes_all_existing_content(tmp_path, monkeypatch):
+    """dev_plan_phase_2.md §4.2: a diferencia de _delete_old_uploads usada
+    por deploy_image_to_tv (que siempre preserva la imagen recién
+    subida), clear_photos_category no tiene ninguna que preservar --
+    borra absolutamente todo lo que ya estaba subido.
+    """
+    fake = _install_fake(
+        monkeypatch,
+        tmp_path,
+        existing_content=[
+            {"content_id": "MY_F0001", "category_id": "MY-C0002"},
+            {"content_id": "MY_F0002", "category_id": "MY-C0002"},
+        ],
+    )
+
+    result = clear_photos_category("43L")
+
+    assert result == {"cleared": True}
+    assert sorted(fake.deleted) == ["MY_F0001", "MY_F0002"]
+    assert fake.closed is True
+
+
+def test_clear_photos_category_reports_no_content_without_error(tmp_path, monkeypatch):
+    fake = _install_fake(monkeypatch, tmp_path, existing_content=[])
+
+    result = clear_photos_category("43L")
+
+    assert result == {"cleared": True}
+    assert fake.deleted == []
+
+
+def test_clear_photos_category_converts_tv_not_found_to_error_dict(
+    tmp_path, monkeypatch
+):
+    def _raise_not_found(name):
+        raise TvNotFoundError(f"No hay TV {name!r}")
+
+    monkeypatch.setattr(tv_deploy, "resolve_tv_host", _raise_not_found)
+
+    result = clear_photos_category("43L")
+
+    assert "error" in result
+
+
+def test_clear_photos_category_reports_connection_failure_on_open(
+    tmp_path, monkeypatch
+):
+    fake = _install_fake(
+        monkeypatch, tmp_path, open_error=exceptions.ConnectionFailure("no conecta")
+    )
+
+    result = clear_photos_category("43L")
+
+    assert "error" in result
+    assert fake.closed is True
+
+
+def test_clear_photos_category_reports_unsupported_tv(tmp_path, monkeypatch):
+    fake = _install_fake(monkeypatch, tmp_path, supported=False)
+
+    result = clear_photos_category("43L")
+
+    assert "error" in result
+    assert fake.deleted == []
+
+
+def test_clear_photos_category_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
+    """Comparte el mismo watchdog extraído (_run_with_deploy_watchdog) que
+    el resto de las funciones de este módulo.
+    """
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, open_hang_seconds=2)
+
+    result = clear_photos_category("43L")
+
+    assert "error" in result
+    assert "no respondió" in result["error"]
+
+
+def test_configure_batch_rotation_uses_new_slideshow_api_on_success(
+    tmp_path, monkeypatch
+):
+    fake = _install_fake(monkeypatch, tmp_path)
+
+    result = configure_batch_rotation("43L", 1440, False)
+
+    assert result == {"result": "ok-slideshow"}
+    assert fake.slideshow_status_calls == [
+        {"duration": 1440, "type": False, "category_id": "MY-C0002"}
+    ]
+    assert fake.auto_rotation_status_calls == []
+    assert fake.closed is True
+
+
+def test_configure_batch_rotation_falls_back_to_legacy_auto_rotation_api(
+    tmp_path, monkeypatch
+):
+    """Algunas TVs (protocolo legacy, PRD §3.2) no soportan la API nueva
+    de slideshow y responden con ResponseError -- mismo patrón de
+    fallback que el propio CLI de samsungtvws (art-slideshow-set).
+    """
+    fake = _install_fake(
+        monkeypatch,
+        tmp_path,
+        slideshow_status_error=exceptions.ResponseError("no soportado"),
+    )
+
+    result = configure_batch_rotation("50", 1440, False)
+
+    assert result == {"result": "ok-auto-rotation"}
+    assert fake.auto_rotation_status_calls == [
+        {"duration": 1440, "type": False, "category_id": "MY-C0002"}
+    ]
+
+
+def test_configure_batch_rotation_converts_tv_not_found_to_error_dict(
+    tmp_path, monkeypatch
+):
+    def _raise_not_found(name):
+        raise TvNotFoundError(f"No hay TV {name!r}")
+
+    monkeypatch.setattr(tv_deploy, "resolve_tv_host", _raise_not_found)
+
+    result = configure_batch_rotation("43L", 1440, False)
+
+    assert "error" in result
+
+
+def test_configure_batch_rotation_reports_connection_failure_on_open(
+    tmp_path, monkeypatch
+):
+    fake = _install_fake(
+        monkeypatch, tmp_path, open_error=exceptions.ConnectionFailure("no conecta")
+    )
+
+    result = configure_batch_rotation("43L", 1440, False)
+
+    assert "error" in result
+    assert fake.closed is True
+
+
+def test_configure_batch_rotation_reports_unsupported_tv(tmp_path, monkeypatch):
+    fake = _install_fake(monkeypatch, tmp_path, supported=False)
+
+    result = configure_batch_rotation("43L", 1440, False)
+
+    assert "error" in result
+    assert fake.slideshow_status_calls == []
+
+
+def test_configure_batch_rotation_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, open_hang_seconds=2)
+
+    result = configure_batch_rotation("43L", 1440, False)
 
     assert "error" in result
     assert "no respondió" in result["error"]

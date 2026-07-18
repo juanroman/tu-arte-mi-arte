@@ -33,13 +33,31 @@ paneles ya sí lo hicieron, lo que dispararía una regeneración/reintento
 espurio de la fuente ancha en la reinvocación, violando potencialmente
 el requisito duro #1 sobre un `policy_rejection`).
 
-Procesamiento secuencial, no paralelo: a diferencia de
-`tv_deploy.deploy_set_to_panels` (TVs físicas independientes, sin cuota
-compartida), la generación de imágenes comparte una sola cuota de la
-API de Gemini -- procesar en paralelo arriesgaría ráfagas de rate-limit
-sin ganancia real.
+Procesamiento secuencial, no paralelo, en generación/finalización: a
+diferencia de `tv_deploy.deploy_set_to_panels` (TVs físicas
+independientes, sin cuota compartida), la generación de imágenes
+comparte una sola cuota de la API de Gemini -- procesar en paralelo
+arriesgaría ráfagas de rate-limit sin ganancia real.
+
+Etapa de subida (§4.1, dev_plan_phase_2.md): modelo de concurrencia
+DISTINTO al de generación/finalización, porque la restricción real
+también es distinta. Las tres TVs son dispositivos físicos
+independientes sin cuota compartida (mismo principio que
+`tv_deploy.deploy_set_to_panels`) -- así que `run_upload_stage` corre un
+worker por TV en paralelo. Pero dentro de una misma TV, cada worker
+drena su cola de items SECUENCIALMENTE: `SamsungTVArt`/el protocolo de
+la TV asumen una sola conexión websocket a la vez por dispositivo (misma
+asunción que sostiene todo `tv_deploy.py`), así que subir varias
+imágenes a la MISMA TV en paralelo rompería esa asunción sin ganancia
+real -- ni fully-secuencial entre TVs (tres veces más lento sin razón)
+ni fully-paralelo sobre las hasta N*3 imágenes de un lote grande (arriesga
+conexiones concurrentes contra el mismo socket físico). Tampoco hay
+concepto de `policy_rejection` en la subida -- una TV no rechaza
+contenido por política, solo falla de forma transitoria de red, así que
+toda falla es reintentable hasta `tv_deploy_max_attempts`.
 """
 
+import concurrent.futures
 import logging
 import math
 from collections.abc import Callable
@@ -61,6 +79,11 @@ from engine.batch_store import (
 )
 from engine.generation import generate_final_high_res, generate_image
 from engine.split import SplitConfig, load_split_config, split_wide_image
+from engine.tv_deploy import (
+    clear_photos_category,
+    configure_batch_rotation,
+    upload_image_to_category,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -120,6 +143,7 @@ def _draft_item(
             stage="drafted",
             image_id=result["image_id"],
             error=None,
+            draft_image_id=result["image_id"],
             path=path,
         )
         return "drafted"
@@ -167,7 +191,11 @@ def _draft_split_day(
             day.day_index,
             panel_43l=PanelOutcome(attempts=attempts, stage="drafted"),
             panel_43r=PanelOutcome(attempts=attempts, stage="drafted"),
-            wide=WideOutcome(wide_image_id=result["image_id"], wide_stage="drafted"),
+            wide=WideOutcome(
+                wide_image_id=result["image_id"],
+                wide_stage="drafted",
+                draft_wide_image_id=result["image_id"],
+            ),
             path=path,
         )
         return "drafted"
@@ -455,6 +483,217 @@ def run_finalize_stage(batch_id: str, path: Path | None = None) -> dict:
     return summary
 
 
+def _upload_with_retries(
+    attempt: Callable[[], dict], max_attempts: int
+) -> tuple[int, dict]:
+    """Retry loop de la etapa de subida a TV (§4.1) -- variante mínima de
+    `_generate_with_retries`, no reutilizable tal cual: detecta éxito por
+    `'content_id' in result` (el shape de `tv_deploy.upload_image_to_category`),
+    no por `'image_id'`, y no existe concepto de `policy_rejection` en
+    subida -- toda falla es reintentable hasta `max_attempts`, a
+    diferencia del corte inmediato que sí aplica a generación.
+    """
+    attempts = 0
+    while True:
+        attempts += 1
+        result = attempt()
+        if "content_id" in result or attempts >= max_attempts:
+            return attempts, result
+
+
+def _upload_item(
+    batch_id: str,
+    item: BatchItemRecord,
+    max_attempts: int,
+    path: Path | None,
+) -> str:
+    """Sube un único panel físico (43L/43R/50, de un día independiente o
+    split -- indistinguible aquí, ver nota de módulo) ya en
+    stage='finalized' a la TV cuyo nombre coincide con `item.panel`.
+    Devuelve 'uploaded', 'needs_attention', o 'skipped' (todavía no
+    finalizado, o ya subido -- requisito duro #9).
+    """
+    if item.stage != "finalized":
+        return "skipped"
+
+    image_id = item.image_id
+    if image_id is None:
+        raise ValueError(f"batch_item en stage='finalized' sin image_id: {item!r}")
+
+    attempts, result = _upload_with_retries(
+        lambda: upload_image_to_category(item.panel, image_id), max_attempts
+    )
+
+    if "content_id" in result:
+        record_item_attempt(
+            batch_id,
+            item.day_index,
+            item.panel,
+            attempts=attempts,
+            stage="uploaded",
+            image_id=image_id,
+            error=None,
+            path=path,
+        )
+        return "uploaded"
+
+    record_item_attempt(
+        batch_id,
+        item.day_index,
+        item.panel,
+        attempts=attempts,
+        stage="needs_attention",
+        image_id=image_id,  # la imagen finalizada sigue válida en disco
+        error=result.get("error"),
+        path=path,
+    )
+    return "needs_attention"
+
+
+def run_upload_stage(batch_id: str, path: Path | None = None) -> dict:
+    """Sube cada `batch_item` de `batch_id` en `stage='finalized'` a la TV
+    correspondiente a su panel (dev_plan_phase_2.md §4.1), avanzando a
+    `uploaded` o `needs_attention`. Seguro de re-invocar: items ya
+    `uploaded` se saltan (requisito duro #9); items que aún no llegaron a
+    `finalized` también se saltan (todavía no hay nada que subir).
+
+    Concurrencia (ver nota de módulo): un worker por TV física (3 en
+    total), cada uno drenando su propia cola de items de esa TV en orden
+    secuencial de `day_index` -- nunca fully-secuencial entre TVs (tres
+    dispositivos físicos independientes sin cuota compartida) ni
+    fully-paralelo dentro de una misma TV (rompería la asunción de una
+    sola conexión websocket por TV).
+
+    Reintento con `tv_deploy_max_attempts` (config/batch.toml, §15.5) vía
+    `_upload_with_retries` -- sin concepto de `policy_rejection`.
+
+    Días split: sin manejo especial -- para cuando un item llega a
+    `stage='finalized'`, un día split ya dejó dos filas físicas 43L/43R
+    independientes (el split ya ocurrió en 2.3); este corredor itera
+    `batch_item` sin mirar `batch_day.mode` en absoluto.
+
+    Vaciado previo por TV ("clean slate per batch", dev_plan_phase_2.md
+    §4.2): antes de subir el primer item de este lote a una TV, si
+    NINGÚN item de `batch_id` para ese panel está ya en `stage='uploaded'`,
+    se asume que nada de este lote se subió todavía a esa TV y se vacía
+    'Mis Fotos' primero (`tv_deploy.clear_photos_category`) -- así la
+    rotación nativa nunca mezcla el lote vigente con uno anterior. Si al
+    menos un item ya está `uploaded` (reinvocación tras un crash a medio
+    subir), se salta el vaciado -- ya ocurrió en una corrida anterior, y
+    repetirlo borraría imágenes de este mismo lote que ya subieron con
+    éxito. Un vaciado fallido (TV inalcanzable) se loguea como warning y
+    la subida real continúa igual -- es limpieza best-effort, nunca debe
+    bloquear la subida.
+    """
+    max_attempts = load_batch_config().tv_deploy_max_attempts
+
+    items_by_panel: dict[str, list[BatchItemRecord]] = {"43L": [], "43R": [], "50": []}
+    for item in get_batch_items(batch_id, path=path):
+        items_by_panel[item.panel].append(item)
+
+    summary: dict[str, list[str]] = {
+        "uploaded": [],
+        "needs_attention": [],
+        "skipped": [],
+    }
+
+    def _drain_panel(panel: str) -> list[tuple[str, str]]:
+        items = items_by_panel[panel]
+        if not any(item.stage == "uploaded" for item in items):
+            clear_result = clear_photos_category(panel)
+            if "error" in clear_result:
+                _logger.warning(
+                    "No se pudo vaciar 'Mis Fotos' en %s antes de subir el "
+                    "lote %s: %s",
+                    panel,
+                    batch_id,
+                    clear_result["error"],
+                )
+        return [
+            (
+                _upload_item(batch_id, item, max_attempts, path),
+                f"{item.day_index}:{panel}",
+            )
+            for item in items
+        ]
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(items_by_panel)
+    ) as executor:
+        futures = [executor.submit(_drain_panel, panel) for panel in items_by_panel]
+        for future in futures:
+            for outcome, label in future.result():
+                summary[outcome].append(label)
+
+    _logger.info(
+        "run_upload_stage: batch_id=%s uploaded=%d needs_attention=%d skipped=%d",
+        batch_id,
+        len(summary["uploaded"]),
+        len(summary["needs_attention"]),
+        len(summary["skipped"]),
+    )
+    return summary
+
+
+def _configure_rotation_with_retries(panel: str, max_attempts: int) -> dict:
+    attempts = 0
+    config = load_batch_config()
+    while True:
+        attempts += 1
+        result = configure_batch_rotation(
+            panel, config.rotation_duration_minutes, config.rotation_shuffle
+        )
+        if "result" in result or attempts >= max_attempts:
+            return result
+
+
+def run_rotation_stage(batch_id: str, path: Path | None = None) -> dict:
+    """Configura la rotación nativa de 'Mis Fotos' en las tres TVs, una
+    sola vez, al terminar de subir un lote (dev_plan_phase_2.md §4.2, PRD
+    §15.2 objetivo 7). Duración/orden fijos de `config/batch.toml`
+    (`rotation_duration_minutes`/`rotation_shuffle`) -- alcance reducido
+    decidido con el usuario: sin variación por calendario, el usuario
+    ajusta a mano si quiere otra cadencia antes del próximo lote.
+
+    `batch_id` no se usa para leer `batch_item` -- la rotación se
+    configura sobre la categoría completa de cada TV, no por item -- solo
+    para el log; `path` se acepta (sin uso) para que la firma sea
+    simétrica con `run_draft_stage`/`run_finalize_stage`/`run_upload_stage`
+    y encaje en `_run_batch_engine_in_background` sin un caso especial.
+
+    Concurrencia: un worker por TV física (3 en total, mismo principio
+    que `deploy_set_to_panels`/`run_upload_stage` -- dispositivos físicos
+    independientes, se intentan siempre las tres). Reintento con
+    `tv_deploy_max_attempts` (config/batch.toml) vía
+    `_configure_rotation_with_retries`. Idempotente por naturaleza:
+    volver a llamarla (p. ej. en una reconciliación de reinicio) solo
+    reaplica la misma configuración. Nunca lanza; la falla de una TV
+    nunca impide que las otras dos se configuren.
+
+    Devuelve {'43L': {...}, '43R': {...}, '50': {...}}, cada valor el
+    resultado final de `configure_batch_rotation` para esa TV.
+    """
+    del path  # ver docstring: la rotación es por categoría, no por item
+    max_attempts = load_batch_config().tv_deploy_max_attempts
+    panels = ("43L", "43R", "50")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(panels)) as executor:
+        futures = {
+            panel: executor.submit(
+                _configure_rotation_with_retries, panel, max_attempts
+            )
+            for panel in panels
+        }
+        results = {panel: future.result() for panel, future in futures.items()}
+
+    _logger.info(
+        "run_rotation_stage: batch_id=%s resultados=%s",
+        batch_id,
+        {panel: ("ok" if "result" in r else "error") for panel, r in results.items()},
+    )
+    return results
+
+
 def estimate_batch_duration(day_modes: list[str]) -> dict:
     """Estimado determinístico de duración (PRD §15.2 objetivo 4, §15.3
     paso 7, dev_plan_phase_2.md §2.4) -- no es juicio de LLM, es aritmética
@@ -517,6 +756,14 @@ def summarize_batch(batch_id: str, path: Path | None = None) -> dict:
     `needs_attention` por `policy_rejection` vs. falla técnica agotada --
     nunca infiere esa distinción del texto de `error`, lee la columna
     persistida tal cual (§2.4, `batch_store.record_item_attempt`).
+
+    Cada panel de `days[].panels` incluye `draft_image_id` (el `image_id`
+    1K, nunca sobreescrito por la finalización) junto a `image_id` (el
+    stage actual -- 4K si ya se finalizó). Cada día trae también
+    `draft_wide_image_id` a nivel de día (solo relevante si `mode ==
+    'split'`): el reporte proactivo de Telegram usa estos ids 1K, nunca
+    `image_id`/`wide_image_id`, que son exclusivamente para la subida a
+    TV (PRD §7.7 -- 4K nunca debe salir por Telegram).
     """
     batch_record = get_batch(batch_id, path=path)
     if batch_record is None:
@@ -548,6 +795,7 @@ def summarize_batch(batch_id: str, path: Path | None = None) -> dict:
             panel: {
                 "stage": item.stage,
                 "image_id": item.image_id,
+                "draft_image_id": item.draft_image_id,
                 "error": item.error,
             }
             for panel, item in items_by_day.get(day_index, {}).items()
@@ -557,6 +805,7 @@ def summarize_batch(batch_id: str, path: Path | None = None) -> dict:
                 "day_index": day_index,
                 "mode": day.mode,
                 "sub_group": day.sub_group,
+                "draft_wide_image_id": day.draft_wide_image_id,
                 "panels": panels,
             }
         )

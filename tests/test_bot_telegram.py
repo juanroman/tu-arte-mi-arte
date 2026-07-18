@@ -3,6 +3,7 @@ import contextlib
 import datetime
 import logging
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -233,6 +234,37 @@ def _compose_preview_response_event(response: dict) -> SimpleNamespace:
                 types.Part(
                     function_response=types.FunctionResponse(
                         name="compose_preview", response=response
+                    )
+                )
+            ],
+        )
+    )
+
+
+def _preview_batch_day_call_event() -> SimpleNamespace:
+    return SimpleNamespace(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="preview_batch_day",
+                        args={"mode": "independiente"},
+                    )
+                )
+            ],
+        )
+    )
+
+
+def _preview_batch_day_response_event(response: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="preview_batch_day", response=response
                     )
                 )
             ],
@@ -664,6 +696,107 @@ def test_compose_preview_response_sends_photo_with_confirm_button():
     assert preview.image_43l == "img_l"
     assert preview.image_43r == "img_r"
     assert preview.image_50 == "img_50"
+
+
+def test_compose_preview_within_batch_preview_turn_sends_photo_without_confirm_button(
+    monkeypatch,
+):
+    """Hallazgo en vivo (2026-07-18, demo de cierre de la Etapa 4): un
+    turno que llama preview_batch_day (dev_plan_phase_2.md §1.4) puede
+    también llamar compose_preview (tool base, sin gating de skill) si el
+    usuario pide "el preview" en lenguaje genérico. Adjuntar el botón "✅
+    Confirmar" de pieza suelta en ese caso es incorrecto -- tocarlo
+    dispara finalize_high_res/deploy_to_panels sobre un solo día del lote
+    en vez de materialize_batch_gallery. El preview debe seguir
+    mandándose (con su álbum de paneles), solo sin el botón.
+    """
+    _write_fixture_images("img_l", "img_r", "img_50")
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _preview_batch_day_call_event(),
+                _preview_batch_day_response_event(
+                    {
+                        "43L": {"image_id": "img_l", "path": "x"},
+                        "43R": {"image_id": "img_r", "path": "x"},
+                        "50": {"image_id": "img_50", "path": "x"},
+                    }
+                ),
+                _compose_preview_call_event("img_l", "img_r", "img_50"),
+                _compose_preview_response_event(
+                    {"image_id": "img_preview1", "path": "x"}
+                ),
+                _text_event("aquí está el preview del día 1"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    context.bot.send_photo.assert_awaited_once()
+    _, kwargs = context.bot.send_photo.call_args
+    assert kwargs["chat_id"] == 42
+    assert str(kwargs["photo"]).endswith("img_preview1.jpg")
+    assert "reply_markup" not in kwargs
+
+
+def test_compose_preview_standalone_keeps_confirm_button_in_batch_preview_turn(
+    monkeypatch,
+):
+    """Hallazgo de code review post-cierre de la Etapa 4: la señal usada
+    para omitir el botón "✅ Confirmar" de pieza suelta
+    (`_turn_called_batch_preview`) era un booleano de TODO el turno --
+    si el modelo llamaba `preview_batch_day` y TAMBIÉN, en el mismo
+    turno, un `compose_preview` genuino sobre una pieza suelta no
+    relacionada (posible: `compose_preview` es una tool base sin gating
+    de skill), esa pieza suelta perdía su botón sin ningún aviso. El
+    botón solo debe omitirse en el `compose_preview` cuyos `image_id`
+    coinciden con los que `preview_batch_day` acaba de producir para ese
+    día -- nunca en uno con `image_id` distintos, aunque compartan turno.
+    """
+    _write_fixture_images("img_l", "img_r", "img_50", "img_suelta_l")
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _preview_batch_day_call_event(),
+                _preview_batch_day_response_event(
+                    {
+                        "43L": {"image_id": "img_l", "path": "x"},
+                        "43R": {"image_id": "img_r", "path": "x"},
+                        "50": {"image_id": "img_50", "path": "x"},
+                    }
+                ),
+                _compose_preview_call_event("img_l", "img_r", "img_50"),
+                _compose_preview_response_event(
+                    {"image_id": "img_preview_batch", "path": "x"}
+                ),
+                _compose_preview_call_event("img_suelta_l", "img_r", "img_50"),
+                _compose_preview_response_event(
+                    {"image_id": "img_preview_suelta", "path": "x"}
+                ),
+                _text_event("aquí están los dos previews"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    assert context.bot.send_photo.await_count == 2
+    batch_call, standalone_call = context.bot.send_photo.await_args_list
+    assert str(batch_call.kwargs["photo"]).endswith("img_preview_batch.jpg")
+    assert "reply_markup" not in batch_call.kwargs
+    assert str(standalone_call.kwargs["photo"]).endswith("img_preview_suelta.jpg")
+    assert "reply_markup" in standalone_call.kwargs
 
 
 def test_compose_preview_error_response_sends_no_photo():
@@ -1177,8 +1310,9 @@ def test_materialize_batch_gallery_success_triggers_background_batch_engine(
     monkeypatch,
 ):
     """Confirmar un lote (paso 8, PRD §15.3) debe arrancar el corredor
-    (draft -> finalización 4K) sin que el turno de Telegram lo espere --
-    dev_plan_phase_2.md §3.1, requisito duro #7.
+    (draft -> finalización 4K -> subida a TV -> rotación nativa) sin que
+    el turno de Telegram lo espere -- dev_plan_phase_2.md §3.1/§4.1/§4.2,
+    requisito duro #7.
     """
     calls = []
     monkeypatch.setattr(
@@ -1190,6 +1324,16 @@ def test_materialize_batch_gallery_success_triggers_background_batch_engine(
         telegram_bot,
         "run_finalize_stage",
         lambda batch_id: calls.append(("finalize", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_upload_stage",
+        lambda batch_id: calls.append(("upload", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_rotation_stage",
+        lambda batch_id: calls.append(("rotate", batch_id)),
     )
     monkeypatch.setattr(
         telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
@@ -1215,6 +1359,8 @@ def test_materialize_batch_gallery_success_triggers_background_batch_engine(
     assert calls == [
         ("draft", "batch_abc123"),
         ("finalize", "batch_abc123"),
+        ("upload", "batch_abc123"),
+        ("rotate", "batch_abc123"),
     ]
 
 
@@ -1240,6 +1386,16 @@ def test_materialize_batch_gallery_called_twice_in_one_turn_starts_both_batches(
         telegram_bot,
         "run_finalize_stage",
         lambda batch_id: calls.append(("finalize", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_upload_stage",
+        lambda batch_id: calls.append(("upload", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_rotation_stage",
+        lambda batch_id: calls.append(("rotate", batch_id)),
     )
     monkeypatch.setattr(
         telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
@@ -1278,8 +1434,12 @@ def test_materialize_batch_gallery_called_twice_in_one_turn_starts_both_batches(
     assert set(calls) == {
         ("draft", "batch_first111"),
         ("finalize", "batch_first111"),
+        ("upload", "batch_first111"),
+        ("rotate", "batch_first111"),
         ("draft", "batch_second222"),
         ("finalize", "batch_second222"),
+        ("upload", "batch_second222"),
+        ("rotate", "batch_second222"),
     }
 
 
@@ -1299,6 +1459,8 @@ def test_materialize_batch_gallery_success_does_not_block_the_turn(monkeypatch):
 
     monkeypatch.setattr(telegram_bot, "run_draft_stage", slow_run_draft_stage)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
     runner, session_service, _ = _build_runner_with_fake_run_async(
         [
             [
@@ -1332,6 +1494,8 @@ def test_materialize_batch_gallery_error_response_does_not_trigger_background_en
         telegram_bot, "run_draft_stage", lambda batch_id: calls.append(batch_id)
     )
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
     runner, session_service, _ = _build_runner_with_fake_run_async(
         [
             [
@@ -1362,6 +1526,8 @@ def test_turn_without_materialize_batch_gallery_does_not_trigger_background_engi
         telegram_bot, "run_draft_stage", lambda batch_id: calls.append(batch_id)
     )
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
     runner, session_service, _ = _build_runner_with_fake_run_async(
         [[_text_event("bicicletas vintage en Santorini, listo")]]
     )
@@ -1432,6 +1598,8 @@ def test_materialize_batch_gallery_persists_chat_id_before_starting_background_t
     )
     monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
     )
@@ -1481,6 +1649,8 @@ def test_run_batch_engine_in_background_updates_status_running_then_reported():
     with (
         patch.object(telegram_bot, "run_draft_stage", spy_run_draft_stage),
         patch.object(telegram_bot, "run_finalize_stage", lambda _batch_id: None),
+        patch.object(telegram_bot, "run_upload_stage", lambda _batch_id: None),
+        patch.object(telegram_bot, "run_rotation_stage", lambda _batch_id: None),
         patch.object(
             telegram_bot, "summarize_batch", lambda _batch_id: _batch_summary()
         ),
@@ -1491,6 +1661,60 @@ def test_run_batch_engine_in_background_updates_status_running_then_reported():
 
     assert status_during_run == ["running"]
     assert batch_store.get_batch(batch_id).status == "reported"
+
+
+def test_two_batches_never_run_upload_stage_concurrently(monkeypatch):
+    """Hallazgo de code review post-cierre de la Etapa 4: dos lotes
+    materializados en turnos que se solapan arrancan cada uno su propio
+    `_run_batch_engine_in_background` vía `application.create_task`, sin
+    ninguna serialización entre sí (confirmado por
+    `test_materialize_batch_gallery_called_twice_in_one_turn_starts_both_batches`,
+    que documenta esto como intencional para la materialización). Pero
+    `run_upload_stage`/`run_rotation_stage` asumen una sola conexión
+    websocket a la vez por TV física (nota de módulo de
+    `engine.batch`) -- si dos lotes drenan la MISMA TV al mismo tiempo,
+    uno puede llamar `clear_photos_category` justo cuando el otro ya
+    subió imágenes suyas a esa TV, borrándolas. La subida/rotación de dos
+    lotes debe estar serializada aunque el draft/finalize (que solo
+    comparte cuota de la API de Gemini, no un dispositivo físico) no lo
+    esté.
+    """
+    max_concurrent = {"upload": 0, "rotation": 0}
+    active = {"upload": 0, "rotation": 0}
+    lock = threading.Lock()
+
+    def make_stage_spy(stage_name):
+        def spy(_batch_id):
+            with lock:
+                active[stage_name] += 1
+                max_concurrent[stage_name] = max(
+                    max_concurrent[stage_name], active[stage_name]
+                )
+            time.sleep(0.05)
+            with lock:
+                active[stage_name] -= 1
+            return {}
+
+        return spy
+
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda _batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda _batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", make_stage_spy("upload"))
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", make_stage_spy("rotation"))
+    monkeypatch.setattr(
+        telegram_bot, "summarize_batch", lambda _batch_id: _batch_summary()
+    )
+
+    async def scenario():
+        await asyncio.gather(
+            telegram_bot._run_batch_engine_in_background("batch_one", _make_bot(), 42),
+            telegram_bot._run_batch_engine_in_background("batch_two", _make_bot(), 42),
+        )
+
+    asyncio.run(scenario())
+
+    assert max_concurrent["upload"] == 1
+    assert max_concurrent["rotation"] == 1
 
 
 def _materialize_batch_with_chat_id(chat_id, *, theme="Tema"):
@@ -1526,6 +1750,16 @@ def test_reconcile_batches_on_startup_resumes_non_terminal_batch_with_known_chat
         lambda batch_id: calls.append(("finalize", batch_id)),
     )
     monkeypatch.setattr(
+        telegram_bot,
+        "run_upload_stage",
+        lambda batch_id: calls.append(("upload", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_rotation_stage",
+        lambda batch_id: calls.append(("rotate", batch_id)),
+    )
+    monkeypatch.setattr(
         telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
     )
     application = _make_application({"allowed_user_ids": frozenset({111})})
@@ -1536,7 +1770,12 @@ def test_reconcile_batches_on_startup_resumes_non_terminal_batch_with_known_chat
         )
     )
 
-    assert calls == [("draft", batch_id), ("finalize", batch_id)]
+    assert calls == [
+        ("draft", batch_id),
+        ("finalize", batch_id),
+        ("upload", batch_id),
+        ("rotate", batch_id),
+    ]
     application.bot.send_message.assert_any_await(
         42, ANY, parse_mode=ParseMode.MARKDOWN_V2
     )
@@ -1610,9 +1849,24 @@ def test_reconcile_batches_on_startup_end_to_end_after_simulated_crash(monkeypat
         _write_fixture_images(final_image_id)
         return {"image_id": final_image_id}
 
+    def fake_upload_image_to_category(tv_name, image_id):
+        return {"content_id": f"MY_{tv_name}"}
+
+    def fake_configure_batch_rotation(tv_name, duration_minutes, shuffle):
+        return {"result": "ok"}
+
     monkeypatch.setattr(batch_engine, "generate_image", fake_generate_image)
     monkeypatch.setattr(
         batch_engine, "generate_final_high_res", fake_generate_final_high_res
+    )
+    monkeypatch.setattr(
+        batch_engine, "upload_image_to_category", fake_upload_image_to_category
+    )
+    monkeypatch.setattr(
+        batch_engine, "clear_photos_category", lambda tv_name: {"cleared": True}
+    )
+    monkeypatch.setattr(
+        batch_engine, "configure_batch_rotation", fake_configure_batch_rotation
     )
 
     batch_id = batch_store.materialize_batch(
@@ -1642,7 +1896,7 @@ def test_reconcile_batches_on_startup_end_to_end_after_simulated_crash(monkeypat
 
     assert batch_store.get_batch(batch_id).status == "reported"
     items = batch_store.get_batch_items(batch_id)
-    assert {item.stage for item in items} == {"finalized"}
+    assert {item.stage for item in items} == {"uploaded"}
     application.bot.send_message.assert_any_await(
         42, ANY, parse_mode=ParseMode.MARKDOWN_V2
     )
@@ -1675,13 +1929,35 @@ def _batch_summary(
     }
 
 
-def _batch_day_summary(day_index, panel_image_ids: dict) -> dict:
+def _batch_day_summary(
+    day_index,
+    panel_image_ids: dict,
+    *,
+    mode="independiente",
+    draft_wide_image_id=None,
+    panel_draft_image_ids: dict | None = None,
+) -> dict:
+    """Fabrica un dict con el shape de un día de `summarize_batch`.
+    `draft_image_id` defaultea a `== image_id` por panel salvo que
+    `panel_draft_image_ids` lo indique explícito -- suficiente para los
+    tests que no necesitan distinguir el draft 1K del final 4K; los que
+    sí lo necesitan (el fix de dev_plan_phase_2.md post-cierre-4.3: el
+    reporte nunca debe usar el `image_id` finalizado) pasan valores
+    distintos a propósito.
+    """
+    draft_ids = panel_draft_image_ids or {}
     return {
         "day_index": day_index,
-        "mode": "independiente",
+        "mode": mode,
         "sub_group": "Sub-grupo 1",
+        "draft_wide_image_id": draft_wide_image_id,
         "panels": {
-            panel: {"stage": "finalized", "image_id": image_id, "error": None}
+            panel: {
+                "stage": "finalized",
+                "image_id": image_id,
+                "draft_image_id": draft_ids.get(panel, image_id),
+                "error": None,
+            }
             for panel, image_id in panel_image_ids.items()
         },
     }
@@ -1695,6 +1971,8 @@ def test_batch_report_full_success_sends_summary_and_one_album(monkeypatch):
     _write_fixture_images("img_1", "img_2", "img_3")
     monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot,
         "summarize_batch",
@@ -1727,10 +2005,153 @@ def test_batch_report_full_success_sends_summary_and_one_album(monkeypatch):
     text_args, _ = context.bot.send_message.call_args
     assert "lista" in text_args[1]
     assert "atención" not in text_args[1]
+    assert "rotando" in text_args[1]
 
     context.bot.send_media_group.assert_awaited_once()
     _, media_kwargs = context.bot.send_media_group.call_args
     assert len(media_kwargs["media"]) == 3
+
+
+def test_format_batch_report_text_mentions_tv_that_failed_rotation(monkeypatch):
+    """Hallazgo de code review post-cierre de la Etapa 4: `run_rotation_stage`
+    corre pero su resultado se descartaba por completo -- el texto del
+    reporte afirmaba incondicionalmente que "las pantallas ya están
+    rotando la galería" aunque `configure_batch_rotation` hubiera agotado
+    sus reintentos en una TV real. El texto debe distinguir ese caso del
+    de éxito total, nombrando la TV que no quedó rotando.
+    """
+    summary = _batch_summary(
+        days=[_batch_day_summary(1, {"43L": "img_1", "43R": "img_2", "50": "img_3"})]
+    )
+    rotation_results = {
+        "43L": {"result": "ok"},
+        "43R": {"error": "no se pudo conectar"},
+        "50": {"result": "ok"},
+    }
+
+    text = telegram_bot._format_batch_report_text(summary, rotation_results)
+
+    assert "rotando la galería" not in text
+    assert "43R" in text
+
+
+def test_format_batch_report_text_still_claims_rotation_success_when_all_tvs_ok():
+    summary = _batch_summary(
+        days=[_batch_day_summary(1, {"43L": "img_1", "43R": "img_2", "50": "img_3"})]
+    )
+    rotation_results = {
+        "43L": {"result": "ok"},
+        "43R": {"result": "ok"},
+        "50": {"result": "ok"},
+    }
+
+    text = telegram_bot._format_batch_report_text(summary, rotation_results)
+
+    assert "rotando la galería" in text
+
+
+def test_batch_report_end_to_end_does_not_claim_success_when_rotation_fails(
+    monkeypatch,
+):
+    """Mismo hallazgo que arriba, pero ejercitando el cableado completo:
+    `_run_batch_engine_in_background` debe pasarle el resultado real de
+    `run_rotation_stage` a `_send_batch_report`/`_format_batch_report_text`
+    en vez de descartarlo -- antes de este fix, el texto mandado por
+    Telegram afirmaba éxito de rotación sin importar lo que
+    `run_rotation_stage` devolviera.
+    """
+    _write_fixture_images("img_1", "img_2", "img_3")
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_rotation_stage",
+        lambda batch_id: {
+            "43L": {"result": "ok"},
+            "43R": {"error": "no se pudo conectar"},
+            "50": {"result": "ok"},
+        },
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda batch_id: _batch_summary(
+            days=[
+                _batch_day_summary(1, {"43L": "img_1", "43R": "img_2", "50": "img_3"})
+            ],
+        ),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 1}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    text_args, _ = context.bot.send_message.call_args
+    report_text = text_args[1]
+    assert "rotando la galería" not in report_text
+    assert "43R" in report_text
+
+
+def test_batch_report_albums_use_draft_1k_image_ids_never_the_finalized_4k():
+    """Hallazgo real post-cierre de la Etapa 4 (dev_plan_phase_2.md
+    §4.3, batch_2a185ece): el reporte proactivo mandaba el `image_id`
+    finalizado (4K, TV-only, PRD §7.7) y crasheó contra el límite de
+    10MB de foto de la API de Telegram. La causa raíz no era el tamaño
+    -- es que 4K nunca debió salir por Telegram. `_batch_report_albums`
+    debe usar siempre `draft_image_id` (1K), nunca `image_id`.
+    """
+    day = _batch_day_summary(
+        1,
+        {"43L": "img_final_43l", "43R": "img_final_43r", "50": "img_final_50"},
+        panel_draft_image_ids={
+            "43L": "img_draft_43l",
+            "43R": "img_draft_43r",
+            "50": "img_draft_50",
+        },
+    )
+    summary = _batch_summary(days=[day])
+
+    image_ids = telegram_bot._batch_report_image_ids(summary)
+
+    assert set(image_ids) == {"img_draft_43l", "img_draft_43r", "img_draft_50"}
+    assert "img_final_43l" not in image_ids
+    assert "img_final_43r" not in image_ids
+    assert "img_final_50" not in image_ids
+
+
+def test_batch_report_albums_send_one_wide_photo_for_split_days_not_two_crops():
+    """Un día split reporta 2 fotos (la composición ancha 1K completa +
+    el panel 50), nunca los 3 `draft_image_id` de un día independiente --
+    43L/43R de un día split no tienen imagen propia hasta la
+    finalización, así que el reporte nunca debe intentar usar la suya
+    (no existe) ni los recortes 4K (TV-only).
+    """
+    day = _batch_day_summary(
+        1,
+        {"43L": "img_final_43l", "43R": "img_final_43r", "50": "img_final_50"},
+        mode="split",
+        draft_wide_image_id="img_draft_wide",
+        panel_draft_image_ids={"50": "img_draft_50"},
+    )
+    summary = _batch_summary(days=[day])
+
+    image_ids = telegram_bot._batch_report_image_ids(summary)
+
+    assert image_ids == ["img_draft_wide", "img_draft_50"]
 
 
 def test_batch_report_paginates_albums_over_ten_photos(monkeypatch):
@@ -1742,6 +2163,8 @@ def test_batch_report_paginates_albums_over_ten_photos(monkeypatch):
     _write_fixture_images(*image_ids)
     monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot,
         "summarize_batch",
@@ -1806,6 +2229,8 @@ def test_batch_report_mixed_failure_distinguishes_policy_vs_technical(monkeypatc
     _write_fixture_images("img_1")
     monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot,
         "summarize_batch",
@@ -1858,6 +2283,8 @@ def test_batch_report_total_failure_sends_text_but_no_album(monkeypatch):
     """
     monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot,
         "summarize_batch",
@@ -1907,6 +2334,8 @@ def test_batch_report_does_not_block_the_turn(monkeypatch):
 
     monkeypatch.setattr(telegram_bot, "run_draft_stage", slow_run_draft_stage)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_rotation_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot,
         "summarize_batch",
