@@ -485,22 +485,50 @@ def _format_batch_report_text(summary: dict) -> str:
     return "\n\n".join(lines)
 
 
+def _batch_report_image_ids(summary: dict) -> list[str]:
+    """Junta los `image_id` 1K (nunca los 4K -- exclusivos de la subida a
+    TV, PRD §7.7) que va a mandar el reporte proactivo de un lote, en
+    orden de día.
+
+    Para un día `independiente`: el `draft_image_id` de cada uno de los 3
+    paneles (paneles en `needs_attention` sin draft se saltan -- nunca
+    revienta por `draft_image_id=None`). Para un día `split`: **una sola
+    foto** de `draft_wide_image_id` (la composición ancha 1K completa,
+    cubriendo 43L+43R) más el `draft_image_id` del panel 50 -- nunca los
+    `draft_image_id` individuales de 43L/43R, que no existen para un
+    panel físico de un día split (no tienen imagen propia hasta que la
+    finalización los separa de la fuente ancha). Un día split reporta
+    entonces 2 fotos contra las 3 de un día independiente -- decisión
+    deliberada (más simple que partir también el draft, y arguiblemente
+    mejor vista previa: la composición continua completa en vez de dos
+    recortes truncados).
+    """
+    image_ids = []
+    for day in summary["days"]:
+        if day["mode"] == "split":
+            if day["draft_wide_image_id"] is not None:
+                image_ids.append(day["draft_wide_image_id"])
+            panel_50 = day["panels"].get("50")
+            if panel_50 is not None and panel_50["draft_image_id"] is not None:
+                image_ids.append(panel_50["draft_image_id"])
+        else:
+            image_ids.extend(
+                panel["draft_image_id"]
+                for panel in day["panels"].values()
+                if panel["draft_image_id"] is not None
+            )
+    return image_ids
+
+
 def _batch_report_albums(summary: dict) -> list[list[InputMediaPhoto]]:
     """Arma los álbumes de fotos del reporte final de un lote, paginados a
     lo más `_BATCH_ALBUM_PAGE_SIZE` fotos por álbum (Requisito duro #8,
-    dev_plan_phase_2.md §3.2). Recorre los días en orden y junta los
-    `image_id` reales (paneles en `needs_attention` sin imagen se saltan
-    -- nunca revienta por `image_id=None`). Mismo patrón de lectura de
-    bytes que `_panels_album`: nunca un `Path` crudo a `InputMediaPhoto`.
-    Solo la primera foto del primer álbum lleva caption; el detalle por
-    día/panel ya vive en el texto del reporte.
+    dev_plan_phase_2.md §3.2). Mismo patrón de lectura de bytes que
+    `_panels_album`: nunca un `Path` crudo a `InputMediaPhoto`. Solo la
+    primera foto del primer álbum lleva caption; el detalle por día/panel
+    ya vive en el texto del reporte.
     """
-    image_ids = [
-        panel["image_id"]
-        for day in summary["days"]
-        for panel in day["panels"].values()
-        if panel["image_id"] is not None
-    ]
+    image_ids = _batch_report_image_ids(summary)
 
     albums = []
     for page_start in range(0, len(image_ids), _BATCH_ALBUM_PAGE_SIZE):

@@ -143,6 +143,7 @@ def _draft_item(
             stage="drafted",
             image_id=result["image_id"],
             error=None,
+            draft_image_id=result["image_id"],
             path=path,
         )
         return "drafted"
@@ -190,7 +191,11 @@ def _draft_split_day(
             day.day_index,
             panel_43l=PanelOutcome(attempts=attempts, stage="drafted"),
             panel_43r=PanelOutcome(attempts=attempts, stage="drafted"),
-            wide=WideOutcome(wide_image_id=result["image_id"], wide_stage="drafted"),
+            wide=WideOutcome(
+                wide_image_id=result["image_id"],
+                wide_stage="drafted",
+                draft_wide_image_id=result["image_id"],
+            ),
             path=path,
         )
         return "drafted"
@@ -751,6 +756,14 @@ def summarize_batch(batch_id: str, path: Path | None = None) -> dict:
     `needs_attention` por `policy_rejection` vs. falla técnica agotada --
     nunca infiere esa distinción del texto de `error`, lee la columna
     persistida tal cual (§2.4, `batch_store.record_item_attempt`).
+
+    Cada panel de `days[].panels` incluye `draft_image_id` (el `image_id`
+    1K, nunca sobreescrito por la finalización) junto a `image_id` (el
+    stage actual -- 4K si ya se finalizó). Cada día trae también
+    `draft_wide_image_id` a nivel de día (solo relevante si `mode ==
+    'split'`): el reporte proactivo de Telegram usa estos ids 1K, nunca
+    `image_id`/`wide_image_id`, que son exclusivamente para la subida a
+    TV (PRD §7.7 -- 4K nunca debe salir por Telegram).
     """
     batch_record = get_batch(batch_id, path=path)
     if batch_record is None:
@@ -782,6 +795,7 @@ def summarize_batch(batch_id: str, path: Path | None = None) -> dict:
             panel: {
                 "stage": item.stage,
                 "image_id": item.image_id,
+                "draft_image_id": item.draft_image_id,
                 "error": item.error,
             }
             for panel, item in items_by_day.get(day_index, {}).items()
@@ -791,6 +805,7 @@ def summarize_batch(batch_id: str, path: Path | None = None) -> dict:
                 "day_index": day_index,
                 "mode": day.mode,
                 "sub_group": day.sub_group,
+                "draft_wide_image_id": day.draft_wide_image_id,
                 "panels": panels,
             }
         )

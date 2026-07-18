@@ -347,6 +347,37 @@ def test_finalize_item_succeeds_on_first_attempt_for_independiente_day(
     assert len(calls) == 3
 
 
+def test_finalize_item_preserves_draft_image_id_after_overwriting_image_id(
+    tmp_path, monkeypatch
+):
+    """Hallazgo real post-cierre de la Etapa 4 (dev_plan_phase_2.md §4.3,
+    batch_2a185ece): el reporte proactivo de Telegram usaba `image_id`
+    (4K tras la finalización, TV-only por PRD §7.7) porque
+    `draft_image_id` no existía. `_finalize_item` debe dejar el `image_id`
+    1K original intacto en `draft_image_id` aunque `image_id` pase a ser
+    la versión 4K.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_independiente_day(db_path)
+    _draft_successfully(batch_id, db_path, monkeypatch)
+    draft_items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+
+    monkeypatch.setattr(
+        batch, "generate_final_high_res", _succeeding_generate_final_high_res([])
+    )
+
+    batch.run_finalize_stage(batch_id, path=db_path)
+
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    for panel in ("43L", "43R", "50"):
+        assert items[panel].draft_image_id == draft_items[panel].image_id
+        assert items[panel].image_id != items[panel].draft_image_id
+
+
 def test_finalize_policy_rejection_never_retries_and_preserves_draft_image(
     tmp_path, monkeypatch
 ):
@@ -493,6 +524,34 @@ def test_split_day_finalizes_wide_once_and_splits_into_43l_43r(tmp_path, monkeyp
     assert finalize_calls.count(draft_wide_image_id) == 1
     assert len(finalize_calls) == 2
     assert split_calls == [(finalized_wide_image_id, split_calls[0][1])]
+
+
+def test_split_day_finalize_preserves_draft_wide_image_id_after_overwriting_it(
+    tmp_path, monkeypatch
+):
+    """Equivalente split-day de
+    `test_finalize_item_preserves_draft_image_id_after_overwriting_image_id`:
+    `batch_day.draft_wide_image_id` (el `image_id` 1K de la fuente ancha)
+    debe sobrevivir intacto a la finalización, que reescribe
+    `wide_image_id` con la versión 4K.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+    _draft_successfully(batch_id, db_path, monkeypatch)
+    draft_day = batch_store.get_batch_days(batch_id, path=db_path)[0]
+    draft_wide_image_id = draft_day.wide_image_id
+    assert draft_day.draft_wide_image_id == draft_wide_image_id
+
+    monkeypatch.setattr(
+        batch, "generate_final_high_res", _succeeding_generate_final_high_res([])
+    )
+    monkeypatch.setattr(batch, "split_wide_image", _succeeding_split_wide_image([]))
+
+    batch.run_finalize_stage(batch_id, path=db_path)
+
+    day = batch_store.get_batch_days(batch_id, path=db_path)[0]
+    assert day.draft_wide_image_id == draft_wide_image_id
+    assert day.wide_image_id != draft_wide_image_id
 
 
 def test_split_day_finalize_wide_failure_preserves_draft_wide_image_id(
@@ -776,6 +835,41 @@ def test_summarize_batch_distinguishes_policy_rejection_from_technical_failure(
     day_2 = next(day for day in result["days"] if day["day_index"] == 2)
     assert day_2["mode"] == "split"
     assert day_2["sub_group"] == "Sub-grupo B"
+
+
+def test_summarize_batch_exposes_draft_image_ids_separately_from_finalized(
+    tmp_path, monkeypatch
+):
+    """El reporte proactivo de Telegram (dev_plan_phase_2.md §4.3, hallazgo
+    post-cierre) depende de que `summarize_batch` exponga el `image_id`
+    1K por separado del finalizado -- este test confirma el shape nuevo
+    para un día independiente (`draft_image_id` por panel) y un día split
+    (`draft_wide_image_id` a nivel de día).
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_two_days(db_path)
+    _draft_successfully(batch_id, db_path, monkeypatch)
+    monkeypatch.setattr(
+        batch, "generate_final_high_res", _succeeding_generate_final_high_res([])
+    )
+    monkeypatch.setattr(batch, "split_wide_image", _succeeding_split_wide_image([]))
+    batch.run_finalize_stage(batch_id, path=db_path)
+
+    result = batch.summarize_batch(batch_id, path=db_path)
+
+    day_1 = next(day for day in result["days"] if day["day_index"] == 1)
+    for panel in ("43L", "43R", "50"):
+        assert day_1["panels"][panel]["draft_image_id"] is not None
+        assert (
+            day_1["panels"][panel]["draft_image_id"]
+            != day_1["panels"][panel]["image_id"]
+        )
+
+    day_2 = next(day for day in result["days"] if day["day_index"] == 2)
+    assert day_2["draft_wide_image_id"] is not None
+    day_2_wide_record = batch_store.get_batch_days(batch_id, path=db_path)[1]
+    assert day_2["draft_wide_image_id"] == day_2_wide_record.draft_wide_image_id
+    assert day_2["draft_wide_image_id"] != day_2_wide_record.wide_image_id
 
 
 # --- 2.5: resumibilidad ante reinicio -----------------------------------

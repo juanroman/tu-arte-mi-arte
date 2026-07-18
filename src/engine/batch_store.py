@@ -62,6 +62,24 @@ dedicado ni una columna `content_id`, porque el shape existente (una
 fila, `image_id` opcional pasado sin producir uno nuevo, `policy_rejection`
 en su default `False`, ya que una TV no rechaza contenido por política)
 ya cubre el caso completo sin necesidad de una función casi-idéntica.
+
+Nota de migración (post-cierre de Etapa 4, hallazgo en vivo 2026-07-18):
+`batch_item.draft_image_id`/`batch_day.draft_wide_image_id` (mismo patrón
+guardado que las migraciones anteriores) preservan el `image_id` 1K del
+draft por separado de `image_id`/`wide_image_id`, que la finalización
+sobreescribe con la versión 4K (TV-only, PRD §7.7). Antes de esto, el
+reporte proactivo de Telegram (`summarize_batch` -> `_batch_report_albums`)
+solo tenía acceso al `image_id` ya finalizado de un lote `finalized`, así
+que mandaba imágenes 4K por Telegram -- causa raíz real de un crash en
+vivo (`telegram.error.BadRequest`, imagen de 11.4MB sobre el límite de
+10MB de foto de la API), no solo un problema de tamaño a mitigar: 4K
+nunca debió salir por Telegram en primer lugar, es exclusivamente el
+formato de entrega a las TVs. `draft_image_id`/`draft_wide_image_id` se
+escriben una sola vez en el momento del draft y la finalización nunca los
+toca -- `record_item_attempt`/`record_split_day_outcome` solo incluyen
+esas columnas en el `UPDATE` cuando el caller las pasa explícitamente
+(nunca sobreescriben a `NULL` cuando una llamada de finalización, que no
+las pasa, corre después sobre la misma fila).
 """
 
 import contextlib
@@ -122,6 +140,7 @@ class BatchDayRecord:
     sub_group: str
     wide_image_id: str | None
     wide_stage: str | None
+    draft_wide_image_id: str | None = None
 
 
 @dataclass
@@ -136,6 +155,7 @@ class BatchItemRecord:
     error: str | None
     updated_at: str | None
     policy_rejection: bool
+    draft_image_id: str | None = None
 
 
 @dataclass
@@ -144,6 +164,12 @@ class PanelOutcome:
     escribiría `record_item_attempt` -- usado por `record_split_day_outcome`
     (§2.5) para describir ambos paneles de un día split antes de escribirlos
     en una sola transacción.
+
+    `draft_image_id` solo se pasa desde el draft de un panel independiente
+    (nunca desde un panel físico de un día split, que no tiene imagen
+    propia hasta que la finalización lo separa de la fuente ancha -- ver
+    `WideOutcome.draft_wide_image_id` para ese caso) ni desde la
+    finalización (que nunca debe tocar el draft id ya guardado).
     """
 
     attempts: int
@@ -151,6 +177,7 @@ class PanelOutcome:
     image_id: str | None = None
     error: str | None = None
     policy_rejection: bool = False
+    draft_image_id: str | None = None
 
 
 @dataclass
@@ -158,10 +185,15 @@ class WideOutcome:
     """Resultado de un intento sobre la imagen ancha compartida de un día
     split, tal como lo escribiría `record_wide_image` -- usado por
     `record_split_day_outcome` (§2.5).
+
+    `draft_wide_image_id` solo se pasa desde el draft (la primera vez que
+    la imagen ancha existe, en 1K) -- la finalización nunca lo toca, sigue
+    escribiendo solo `wide_image_id` (la versión 4K, TV-only).
     """
 
     wide_image_id: str | None
     wide_stage: str
+    draft_wide_image_id: str | None = None
 
 
 def _new_batch_id() -> str:
@@ -224,6 +256,10 @@ def _connect(path: Path) -> sqlite3.Connection:
         conn.execute(
             "ALTER TABLE batch ADD COLUMN report_albums_sent INTEGER NOT NULL DEFAULT 0"
         )
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE batch_item ADD COLUMN draft_image_id TEXT")
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE batch_day ADD COLUMN draft_wide_image_id TEXT")
     return conn
 
 
@@ -393,7 +429,8 @@ def mark_batch_report_album_sent(batch_id: str, path: Path | None = None) -> Non
 def get_batch_days(batch_id: str, path: Path | None = None) -> list[BatchDayRecord]:
     with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
         rows = conn.execute(
-            "SELECT batch_id, day_index, mode, sub_group, wide_image_id, wide_stage "
+            "SELECT batch_id, day_index, mode, sub_group, wide_image_id, wide_stage, "
+            "draft_wide_image_id "
             "FROM batch_day WHERE batch_id = ? ORDER BY day_index",
             (batch_id,),
         ).fetchall()
@@ -404,7 +441,7 @@ def get_batch_items(batch_id: str, path: Path | None = None) -> list[BatchItemRe
     with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
         rows = conn.execute(
             "SELECT batch_id, day_index, panel, prompt, stage, image_id, "
-            "attempts, error, updated_at, policy_rejection "
+            "attempts, error, updated_at, policy_rejection, draft_image_id "
             "FROM batch_item WHERE batch_id = ? ORDER BY day_index, panel",
             (batch_id,),
         ).fetchall()
@@ -420,6 +457,7 @@ def get_batch_items(batch_id: str, path: Path | None = None) -> list[BatchItemRe
             error=row[7],
             updated_at=row[8],
             policy_rejection=bool(row[9]),
+            draft_image_id=row[10],
         )
         for row in rows
     ]
@@ -436,7 +474,34 @@ def _execute_item_update(
     image_id: str | None,
     error: str | None,
     policy_rejection: bool,
+    draft_image_id: str | None = None,
 ) -> None:
+    """`draft_image_id` solo se incluye en el `UPDATE` cuando el caller lo
+    pasa explícitamente (no-`None`) -- una llamada de finalización, que
+    nunca lo pasa, no debe pisar con `NULL` el draft_image_id ya escrito
+    por una llamada de draft anterior sobre la misma fila. Dos consultas
+    estáticas (nunca una columna interpolada) para no depender de una
+    query armada dinámicamente.
+    """
+    if draft_image_id is not None:
+        conn.execute(
+            "UPDATE batch_item SET attempts = ?, stage = ?, image_id = ?, "
+            "error = ?, policy_rejection = ?, draft_image_id = ?, "
+            "updated_at = CURRENT_TIMESTAMP "
+            "WHERE batch_id = ? AND day_index = ? AND panel = ?",
+            (
+                attempts,
+                stage,
+                image_id,
+                error,
+                int(policy_rejection),
+                draft_image_id,
+                batch_id,
+                day_index,
+                panel,
+            ),
+        )
+        return
     conn.execute(
         "UPDATE batch_item SET attempts = ?, stage = ?, image_id = ?, "
         "error = ?, policy_rejection = ?, updated_at = CURRENT_TIMESTAMP "
@@ -461,7 +526,20 @@ def _execute_wide_update(
     *,
     wide_image_id: str | None,
     wide_stage: str,
+    draft_wide_image_id: str | None = None,
 ) -> None:
+    """`draft_wide_image_id` solo se incluye en el `UPDATE` cuando el
+    caller lo pasa explícitamente -- mismo principio que
+    `_execute_item_update`: la finalización nunca debe pisar el draft ya
+    guardado. Dos consultas estáticas, mismo motivo.
+    """
+    if draft_wide_image_id is not None:
+        conn.execute(
+            "UPDATE batch_day SET wide_image_id = ?, wide_stage = ?, "
+            "draft_wide_image_id = ? WHERE batch_id = ? AND day_index = ?",
+            (wide_image_id, wide_stage, draft_wide_image_id, batch_id, day_index),
+        )
+        return
     conn.execute(
         "UPDATE batch_day SET wide_image_id = ?, wide_stage = ? "
         "WHERE batch_id = ? AND day_index = ?",
@@ -479,6 +557,7 @@ def record_item_attempt(
     image_id: str | None = None,
     error: str | None = None,
     policy_rejection: bool = False,
+    draft_image_id: str | None = None,
     path: Path | None = None,
 ) -> None:
     """Persiste el resultado de un intento de generación/finalización sobre
@@ -490,6 +569,12 @@ def record_item_attempt(
     que un reporte de lote (dev_plan_phase_2.md §2.4) distinga un rechazo de
     política de una falla técnica agotada sin tener que inferirlo del texto
     de `error`.
+
+    `draft_image_id` solo debe pasarse desde una llamada de draft (el
+    `image_id` 1K, antes de que exista una versión 4K) -- una llamada de
+    finalización debe omitirlo (queda en su default `None`, que
+    `_execute_item_update` interpreta como "no tocar la columna", nunca
+    como "borrar el draft ya guardado").
 
     Escribe una sola fila -- ya atómico por sí solo. Para un día split, donde
     un intento se escribe en varias filas a la vez (43L/43R y opcionalmente
@@ -508,6 +593,7 @@ def record_item_attempt(
             image_id=image_id,
             error=error,
             policy_rejection=policy_rejection,
+            draft_image_id=draft_image_id,
         )
 
 
@@ -517,6 +603,7 @@ def record_wide_image(
     *,
     wide_image_id: str | None,
     wide_stage: str,
+    draft_wide_image_id: str | None = None,
     path: Path | None = None,
 ) -> None:
     """Persiste el resultado de un intento sobre la imagen ancha compartida
@@ -524,6 +611,9 @@ def record_wide_image(
     principio de escritura completa que `record_item_attempt`. Ver la misma
     advertencia sobre `record_split_day_outcome` cuando este intento también
     implica escribir 43L/43R en la misma operación lógica.
+
+    `draft_wide_image_id` solo debe pasarse desde el draft de la imagen
+    ancha (nunca desde su finalización).
     """
     with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
         _execute_wide_update(
@@ -532,6 +622,7 @@ def record_wide_image(
             day_index,
             wide_image_id=wide_image_id,
             wide_stage=wide_stage,
+            draft_wide_image_id=draft_wide_image_id,
         )
 
 
@@ -563,6 +654,11 @@ def record_split_day_outcome(
     `wide=None` cuando el intento solo re-escribe los paneles físicos porque
     la fuente ancha ya se finalizó en un paso previo (ya atómico por sí solo,
     de una sola fila) -- no toca `batch_day`.
+
+    `panel_43l.draft_image_id`/`panel_43r.draft_image_id` no aplican aquí
+    (un panel físico de un día split no tiene imagen propia hasta que la
+    finalización lo separa de la fuente ancha -- ver
+    `wide.draft_wide_image_id` para el draft 1K de esa fuente compartida).
     """
     with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
         _execute_item_update(
@@ -575,6 +671,7 @@ def record_split_day_outcome(
             image_id=panel_43l.image_id,
             error=panel_43l.error,
             policy_rejection=panel_43l.policy_rejection,
+            draft_image_id=panel_43l.draft_image_id,
         )
         _execute_item_update(
             conn,
@@ -586,6 +683,7 @@ def record_split_day_outcome(
             image_id=panel_43r.image_id,
             error=panel_43r.error,
             policy_rejection=panel_43r.policy_rejection,
+            draft_image_id=panel_43r.draft_image_id,
         )
         if wide is not None:
             _execute_wide_update(
@@ -594,4 +692,5 @@ def record_split_day_outcome(
                 day_index,
                 wide_image_id=wide.wide_image_id,
                 wide_stage=wide.wide_stage,
+                draft_wide_image_id=wide.draft_wide_image_id,
             )

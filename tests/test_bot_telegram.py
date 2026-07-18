@@ -1783,13 +1783,35 @@ def _batch_summary(
     }
 
 
-def _batch_day_summary(day_index, panel_image_ids: dict) -> dict:
+def _batch_day_summary(
+    day_index,
+    panel_image_ids: dict,
+    *,
+    mode="independiente",
+    draft_wide_image_id=None,
+    panel_draft_image_ids: dict | None = None,
+) -> dict:
+    """Fabrica un dict con el shape de un día de `summarize_batch`.
+    `draft_image_id` defaultea a `== image_id` por panel salvo que
+    `panel_draft_image_ids` lo indique explícito -- suficiente para los
+    tests que no necesitan distinguir el draft 1K del final 4K; los que
+    sí lo necesitan (el fix de dev_plan_phase_2.md post-cierre-4.3: el
+    reporte nunca debe usar el `image_id` finalizado) pasan valores
+    distintos a propósito.
+    """
+    draft_ids = panel_draft_image_ids or {}
     return {
         "day_index": day_index,
-        "mode": "independiente",
+        "mode": mode,
         "sub_group": "Sub-grupo 1",
+        "draft_wide_image_id": draft_wide_image_id,
         "panels": {
-            panel: {"stage": "finalized", "image_id": image_id, "error": None}
+            panel: {
+                "stage": "finalized",
+                "image_id": image_id,
+                "draft_image_id": draft_ids.get(panel, image_id),
+                "error": None,
+            }
             for panel, image_id in panel_image_ids.items()
         },
     }
@@ -1842,6 +1864,54 @@ def test_batch_report_full_success_sends_summary_and_one_album(monkeypatch):
     context.bot.send_media_group.assert_awaited_once()
     _, media_kwargs = context.bot.send_media_group.call_args
     assert len(media_kwargs["media"]) == 3
+
+
+def test_batch_report_albums_use_draft_1k_image_ids_never_the_finalized_4k():
+    """Hallazgo real post-cierre de la Etapa 4 (dev_plan_phase_2.md
+    §4.3, batch_2a185ece): el reporte proactivo mandaba el `image_id`
+    finalizado (4K, TV-only, PRD §7.7) y crasheó contra el límite de
+    10MB de foto de la API de Telegram. La causa raíz no era el tamaño
+    -- es que 4K nunca debió salir por Telegram. `_batch_report_albums`
+    debe usar siempre `draft_image_id` (1K), nunca `image_id`.
+    """
+    day = _batch_day_summary(
+        1,
+        {"43L": "img_final_43l", "43R": "img_final_43r", "50": "img_final_50"},
+        panel_draft_image_ids={
+            "43L": "img_draft_43l",
+            "43R": "img_draft_43r",
+            "50": "img_draft_50",
+        },
+    )
+    summary = _batch_summary(days=[day])
+
+    image_ids = telegram_bot._batch_report_image_ids(summary)
+
+    assert set(image_ids) == {"img_draft_43l", "img_draft_43r", "img_draft_50"}
+    assert "img_final_43l" not in image_ids
+    assert "img_final_43r" not in image_ids
+    assert "img_final_50" not in image_ids
+
+
+def test_batch_report_albums_send_one_wide_photo_for_split_days_not_two_crops():
+    """Un día split reporta 2 fotos (la composición ancha 1K completa +
+    el panel 50), nunca los 3 `draft_image_id` de un día independiente --
+    43L/43R de un día split no tienen imagen propia hasta la
+    finalización, así que el reporte nunca debe intentar usar la suya
+    (no existe) ni los recortes 4K (TV-only).
+    """
+    day = _batch_day_summary(
+        1,
+        {"43L": "img_final_43l", "43R": "img_final_43r", "50": "img_final_50"},
+        mode="split",
+        draft_wide_image_id="img_draft_wide",
+        panel_draft_image_ids={"50": "img_draft_50"},
+    )
+    summary = _batch_summary(days=[day])
+
+    image_ids = telegram_bot._batch_report_image_ids(summary)
+
+    assert image_ids == ["img_draft_wide", "img_draft_50"]
 
 
 def test_batch_report_paginates_albums_over_ten_photos(monkeypatch):
