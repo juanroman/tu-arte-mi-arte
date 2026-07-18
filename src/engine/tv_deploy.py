@@ -24,6 +24,7 @@ import concurrent.futures
 import logging
 import threading
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -105,22 +106,14 @@ def _delete_old_uploads(tv: SamsungTVArt, keep_content_id: str, tv_name: str) ->
         _logger.warning("No se pudo limpiar subidas viejas en %s: %s", tv_name, error)
 
 
-def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
-    """Sube la imagen `image_id` a la TV `tv_name` ('43L'/'43R'/'50') y la
-    selecciona en pantalla (PRD §3.3), limpiando después subidas viejas de
-    'Mis Fotos' (PRD §7.6). Nunca borra antes de que la subida nueva haya
-    tenido éxito, para que una falla a medias nunca deje la TV sin arte.
-
-    Corre bajo un watchdog de reloj (_DEPLOY_DEADLINE_SECONDS): la propia
-    librería samsungtvws puede quedarse esperando una respuesta
-    indefinidamente incluso con timeout= puesto (bug upstream, ver
-    docs/matte_investigation.md) — sin este tope, una TV que no responde
-    colgaría este llamado para siempre.
-
-    Devuelve {'content_id': ...} o {'error': '<mensaje>'} — nunca lanza.
+def _resolve_deploy_target(tv_name: str, image_id: str) -> tuple[Path, str, str] | dict:
+    """Resuelve las precondiciones comunes a cualquier operación de subida
+    (con o sin selección en pantalla): que la imagen exista en disco, el
+    host de la TV, y el matte configurado para `tv_name`. Devuelve
+    `(image_path, host, matte)` o `{'error': ...}` si algo falla — nunca
+    lanza. Compartido por `deploy_image_to_tv`/`upload_image_to_category`
+    para no duplicar estas ~15 líneas entre ambas.
     """
-    _logger.info("Desplegando a %s: image_id=%s", tv_name, image_id)
-
     image_path = generation.IMAGES_DIR / f"{image_id}.jpg"
     if not image_path.exists():
         return {"error": f"No existe una imagen con image_id={image_id!r}."}
@@ -141,15 +134,126 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
             )
         }
 
+    return image_path, host, matte
+
+
+def _run_with_deploy_watchdog(
+    tv_name: str,
+    tv: SamsungTVArt,
+    work: Callable[[dict, threading.Event], None],
+) -> dict:
+    """Orquesta un `work(outcome, abandoned)` bajo el mismo watchdog de
+    reloj que ya protegía `deploy_image_to_tv` (_DEPLOY_DEADLINE_SECONDS):
+    la propia librería samsungtvws puede quedarse esperando una respuesta
+    indefinidamente incluso con timeout= puesto (bug upstream, ver
+    docs/matte_investigation.md) — sin este tope, una TV que no responde
+    colgaría el llamado para siempre. Extraído para que
+    `upload_image_to_category` (dev_plan_phase_2.md §4.1) comparta esta
+    protección sin duplicar el manejo de hilo/timeout/cierre forzado.
+
+    `work` recibe `outcome` (debe escribir su resultado final en
+    `outcome["result"] = {...}`) y `abandoned` (un `threading.Event` que
+    `work` debe consultar antes de mutar cualquier estado compartido al
+    final de un camino de éxito — si ya está puesto, el watchdog ya dio
+    por perdido el intento y el caller pudo haber seguido su curso, p. ej.
+    reintentando; `work` es responsable de su propio `tv.close()`, este
+    helper no abre ni cierra la conexión). Devuelve {'error': ...} en
+    cualquier tipo de falla; nunca lanza.
+
+    Sigue leyendo `_DEPLOY_DEADLINE_SECONDS`/`_FORCE_CLOSE_GRACE_SECONDS`
+    del namespace del módulo en cada llamada (no como parámetros con
+    default) para que los tests puedan seguir monkeypatcheándolas.
+    """
+    outcome: dict = {}
+    abandoned = threading.Event()
+
+    worker = threading.Thread(target=work, args=(outcome, abandoned), daemon=True)
+    worker.start()
+    worker.join(_DEPLOY_DEADLINE_SECONDS)
+
+    if worker.is_alive():
+        # Bloqueado dentro de recv() (bug upstream, ver
+        # docs/matte_investigation.md): forzar el cierre del socket crudo
+        # desde afuera es la única forma de destrabarlo. Si el hang ocurre
+        # durante el propio handshake de open() (antes de que
+        # samsungtvws asigne tv.connection), no hay socket que forzar —
+        # se distingue en el log para no reportar un cierre que nunca
+        # ocurrió.
+        sock = getattr(getattr(tv, "connection", None), "sock", None)
+        forced_close = False
+        if sock is not None:
+            forced_close = True
+            try:
+                sock.close()
+            except OSError:
+                pass
+        worker.join(_FORCE_CLOSE_GRACE_SECONDS)
+
+        if not worker.is_alive():
+            # El cierre forzado (o el propio trabajo) destrabó al worker
+            # dentro del período de gracia — si terminó con éxito, ese
+            # resultado real no debe descartarse a favor de un timeout
+            # genérico.
+            return outcome.get(
+                "result",
+                {"error": (f"Fallo inesperado en la TV {tv_name!r} (sin resultado).")},
+            )
+
+        abandoned.set()
+        if forced_close:
+            _logger.error(
+                "Sin respuesta de la TV %s tras %ss, conexión forzada a cerrar",
+                tv_name,
+                _DEPLOY_DEADLINE_SECONDS,
+            )
+        else:
+            _logger.error(
+                "Sin respuesta de la TV %s tras %ss; la conexión nunca "
+                "llegó a establecerse, no hay socket que forzar a cerrar",
+                tv_name,
+                _DEPLOY_DEADLINE_SECONDS,
+            )
+        return {
+            "error": (
+                f"La TV {tv_name!r} no respondió a tiempo "
+                f"({_DEPLOY_DEADLINE_SECONDS}s); puede haber quedado en un "
+                f"estado inconsistente."
+            )
+        }
+
+    return outcome.get(
+        "result",
+        {"error": f"Fallo inesperado en la TV {tv_name!r} (sin resultado)."},
+    )
+
+
+def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
+    """Sube la imagen `image_id` a la TV `tv_name` ('43L'/'43R'/'50') y la
+    selecciona en pantalla (PRD §3.3), limpiando después subidas viejas de
+    'Mis Fotos' (PRD §7.6). Nunca borra antes de que la subida nueva haya
+    tenido éxito, para que una falla a medias nunca deje la TV sin arte.
+
+    Corre bajo un watchdog de reloj (_run_with_deploy_watchdog,
+    _DEPLOY_DEADLINE_SECONDS): la propia librería samsungtvws puede
+    quedarse esperando una respuesta indefinidamente incluso con timeout=
+    puesto (bug upstream, ver docs/matte_investigation.md) — sin este
+    tope, una TV que no responde colgaría este llamado para siempre.
+
+    Devuelve {'content_id': ...} o {'error': '<mensaje>'} — nunca lanza.
+    """
+    _logger.info("Desplegando a %s: image_id=%s", tv_name, image_id)
+
+    resolved = _resolve_deploy_target(tv_name, image_id)
+    if isinstance(resolved, dict):
+        return resolved
+    image_path, host, matte = resolved
+
     token_file = DATA_DIR / f"tv_{tv_name.lower()}_token.json"
     tv = SamsungTVArt(
         host=host, token_file=str(token_file), timeout=_TV_TIMEOUT_SECONDS
     )
 
-    outcome: dict = {}
-    abandoned = threading.Event()
-
-    def work() -> None:
+    def work(outcome: dict, abandoned: threading.Event) -> None:
         try:
             try:
                 tv.open()
@@ -228,69 +332,101 @@ def deploy_image_to_tv(tv_name: str, image_id: str) -> dict:
             except Exception as error:
                 _logger.debug("Cierre de conexión falló para %s: %s", tv_name, error)
 
-    worker = threading.Thread(target=work, daemon=True)
-    worker.start()
-    worker.join(_DEPLOY_DEADLINE_SECONDS)
+    return _run_with_deploy_watchdog(tv_name, tv, work)
 
-    if worker.is_alive():
-        # Bloqueado dentro de recv() (bug upstream, ver
-        # docs/matte_investigation.md): forzar el cierre del socket crudo
-        # desde afuera es la única forma de destrabarlo. Si el hang ocurre
-        # durante el propio handshake de open() (antes de que
-        # samsungtvws asigne tv.connection), no hay socket que forzar —
-        # se distingue en el log para no reportar un cierre que nunca
-        # ocurrió.
-        sock = getattr(getattr(tv, "connection", None), "sock", None)
-        forced_close = False
-        if sock is not None:
-            forced_close = True
-            try:
-                sock.close()
-            except OSError:
-                pass
-        worker.join(_FORCE_CLOSE_GRACE_SECONDS)
 
-        if not worker.is_alive():
-            # El cierre forzado (o el propio trabajo) destrabó al worker
-            # dentro del período de gracia — si terminó con éxito, ese
-            # resultado real no debe descartarse a favor de un timeout
-            # genérico.
-            return outcome.get(
-                "result",
-                {
-                    "error": (
-                        f"Fallo inesperado desplegando a la TV {tv_name!r} "
-                        "(sin resultado)."
-                    )
-                },
-            )
+def upload_image_to_category(tv_name: str, image_id: str) -> dict:
+    """Sube la imagen `image_id` a la categoría 'Mis Fotos' de la TV
+    `tv_name` SIN seleccionarla en pantalla y SIN borrar subidas viejas
+    (dev_plan_phase_2.md §4.1) — a diferencia de `deploy_image_to_tv`, que
+    hace ambas cosas porque modela "esto es lo que se muestra ahora".
+    Pensada para poblar la categoría con las N imágenes de un lote antes
+    de configurar la rotación nativa (Etapa 4.2): mostrar o limpiar
+    contenido a mitad de una carga por lote sería activamente incorrecto
+    (la TV parpadearía entre hasta N imágenes, y cada subida borraría todo
+    lo subido del lote hasta ese momento).
 
-        abandoned.set()
-        if forced_close:
-            _logger.error(
-                "Sin respuesta de la TV %s tras %ss, conexión forzada a cerrar",
-                tv_name,
-                _DEPLOY_DEADLINE_SECONDS,
-            )
-        else:
-            _logger.error(
-                "Sin respuesta de la TV %s tras %ss; la conexión nunca "
-                "llegó a establecerse, no hay socket que forzar a cerrar",
-                tv_name,
-                _DEPLOY_DEADLINE_SECONDS,
-            )
-        return {
-            "error": (
-                f"La TV {tv_name!r} no respondió a tiempo "
-                f"({_DEPLOY_DEADLINE_SECONDS}s); puede haber quedado en un "
-                f"estado inconsistente."
-            )
-        }
+    Mismo andamiaje de watchdog que `deploy_image_to_tv`
+    (`_run_with_deploy_watchdog`) — una TV sin responder no debe colgar
+    este llamado para siempre. Nunca lanza; devuelve {'content_id': ...}
+    o {'error': '<mensaje>'}.
 
-    return outcome.get(
-        "result",
-        {"error": f"Fallo inesperado desplegando a la TV {tv_name!r} (sin resultado)."},
+    No escribe en `deploy_history`: esa tabla modela "qué se está
+    mostrando ahora mismo" para el revert de pieza suelta (PRD §7.6), y no
+    tiene sentido durante una subida por lote donde nada se selecciona
+    todavía.
+
+    Riesgo conocido, documentado aquí y diferido explícitamente al cierre
+    de 4.2 (no se arregla en esta iteración): un despliegue de pieza
+    suelta posterior (`deploy_image_to_tv`/`deploy_set_to_panels`)
+    seguiría llamando `_delete_old_uploads`, que borraría TODO el
+    contenido de 'Mis Fotos' salvo la imagen recién desplegada —
+    incluyendo cualquier galería de lote activa subida por esta función.
+    4.2 debe decidir cómo coexisten ambos flujos antes de cerrar Etapa 4.
+    """
+    _logger.info(
+        "Subiendo a 'Mis Fotos' de %s (sin seleccionar): image_id=%s",
+        tv_name,
+        image_id,
     )
+
+    resolved = _resolve_deploy_target(tv_name, image_id)
+    if isinstance(resolved, dict):
+        return resolved
+    image_path, host, matte = resolved
+
+    token_file = DATA_DIR / f"tv_{tv_name.lower()}_token.json"
+    tv = SamsungTVArt(
+        host=host, token_file=str(token_file), timeout=_TV_TIMEOUT_SECONDS
+    )
+
+    def work(outcome: dict, abandoned: threading.Event) -> None:
+        del abandoned  # nada que proteger: no hay estado compartido que mutar
+        try:
+            try:
+                tv.open()
+            except _CONNECTION_ERRORS as error:
+                _logger.warning("No se pudo conectar con la TV %s: %s", tv_name, error)
+                outcome["result"] = {
+                    "error": f"No se pudo conectar con la TV {tv_name!r}: {error}"
+                }
+                return
+
+            if not tv.supported():
+                _logger.warning("La TV %s no soporta Art Mode", tv_name)
+                outcome["result"] = {"error": f"La TV {tv_name!r} no soporta Art Mode."}
+                return
+
+            try:
+                content_id = tv.upload(
+                    str(image_path), matte=matte, portrait_matte=matte
+                )
+            except (*_CONNECTION_ERRORS, OSError, ValueError) as error:
+                _logger.warning("Falló la subida a la TV %s: %s", tv_name, error)
+                outcome["result"] = {
+                    "error": f"Falló la subida a la TV {tv_name!r}: {error}"
+                }
+                return
+
+            _logger.info(
+                "Subida a 'Mis Fotos' con éxito en %s: image_id=%s content_id=%s",
+                tv_name,
+                image_id,
+                content_id,
+            )
+            outcome["result"] = {"content_id": content_id}
+        except Exception as error:  # red de seguridad: corre sin supervisión
+            _logger.exception("Fallo inesperado subiendo a %s", tv_name)
+            outcome["result"] = {
+                "error": f"Fallo inesperado subiendo a la TV {tv_name!r}: {error}"
+            }
+        finally:
+            try:
+                tv.close()
+            except Exception as error:
+                _logger.debug("Cierre de conexión falló para %s: %s", tv_name, error)
+
+    return _run_with_deploy_watchdog(tv_name, tv, work)
 
 
 def deploy_set_to_panels(image_43l: str, image_43r: str, image_50: str) -> dict:

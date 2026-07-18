@@ -54,6 +54,14 @@ de Telegram), `batch.status` se queda en `'running'` y una reconciliación
 posterior reinvoca `_send_batch_report` desde cero -- sin este progreso
 persistido, esa reinvocación repetiría el texto y TODOS los álbumes,
 duplicando lo que el usuario ya había recibido antes de la falla.
+
+Nota (dev_plan_phase_2.md §4.1): la etapa de subida a TV
+(`engine.batch.run_upload_stage`) escribe `stage='uploaded'` reutilizando
+`record_item_attempt` tal cual -- no se agregó un `record_item_upload`
+dedicado ni una columna `content_id`, porque el shape existente (una
+fila, `image_id` opcional pasado sin producir uno nuevo, `policy_rejection`
+en su default `False`, ya que una TV no rechaza contenido por política)
+ya cubre el caso completo sin necesidad de una función casi-idéntica.
 """
 
 import contextlib

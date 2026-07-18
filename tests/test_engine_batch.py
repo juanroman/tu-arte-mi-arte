@@ -1,4 +1,6 @@
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -51,6 +53,20 @@ def _draft_successfully(batch_id, db_path, monkeypatch):
     """
     monkeypatch.setattr(batch, "generate_image", _succeeding_generate_image([]))
     batch.run_draft_stage(batch_id, path=db_path)
+
+
+def _draft_and_finalize_successfully(batch_id, db_path, monkeypatch):
+    """Runs the real draft + finalize stages with always-succeeding fakes,
+    leaving every item in 'finalized' -- setup shared by the upload-stage
+    tests below (4.1), which only care about the upload transition itself.
+    """
+    monkeypatch.setattr(batch, "generate_image", _succeeding_generate_image([]))
+    batch.run_draft_stage(batch_id, path=db_path)
+    monkeypatch.setattr(
+        batch, "generate_final_high_res", _succeeding_generate_final_high_res([])
+    )
+    monkeypatch.setattr(batch, "split_wide_image", _succeeding_split_wide_image([]))
+    batch.run_finalize_stage(batch_id, path=db_path)
 
 
 def test_independiente_day_drafts_all_three_panels_on_first_success(
@@ -1034,3 +1050,267 @@ def test_run_draft_stage_split_day_crash_before_any_write_leaves_nothing_partial
     }
     assert items["43L"].stage == "drafted"
     assert items["43R"].stage == "drafted"
+
+
+# --- 4.1: subida por lote a "Mis Fotos" ----------------------------------
+
+
+def _succeeding_upload_image_to_category(calls):
+    def fake(tv_name, image_id):
+        calls.append((tv_name, image_id))
+        return {"content_id": f"MY_{tv_name}_{image_id}"}
+
+    return fake
+
+
+def test_run_upload_stage_uploads_every_finalized_item_to_its_matching_tv(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_independiente_day(db_path)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+
+    calls = []
+    monkeypatch.setattr(
+        batch, "upload_image_to_category", _succeeding_upload_image_to_category(calls)
+    )
+
+    summary = batch.run_upload_stage(batch_id, path=db_path)
+
+    assert set(summary["uploaded"]) == {"1:43L", "1:43R", "1:50"}
+    assert summary["needs_attention"] == []
+    assert {tv_name for tv_name, _ in calls} == {"43L", "43R", "50"}
+    items = {
+        item.panel: item for item in batch_store.get_batch_items(batch_id, path=db_path)
+    }
+    for panel in ("43L", "43R", "50"):
+        assert items[panel].stage == "uploaded"
+        assert items[panel].attempts == 1
+
+
+def test_run_upload_stage_skips_items_not_yet_finalized(tmp_path, monkeypatch):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_independiente_day(db_path)
+    _draft_successfully(batch_id, db_path, monkeypatch)  # deja todo en 'drafted'
+
+    calls = []
+    monkeypatch.setattr(
+        batch, "upload_image_to_category", _succeeding_upload_image_to_category(calls)
+    )
+
+    summary = batch.run_upload_stage(batch_id, path=db_path)
+
+    assert summary["uploaded"] == []
+    assert set(summary["skipped"]) == {"1:43L", "1:43R", "1:50"}
+    assert calls == []
+
+
+def test_run_upload_stage_never_reuploads_items_already_uploaded(tmp_path, monkeypatch):
+    """Requisito duro #9: un batch_item ya en stage='uploaded' nunca se
+    vuelve a subir en una reinvocación del corredor.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_independiente_day(db_path)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43L",
+        attempts=1,
+        stage="uploaded",
+        image_id="final_img_1",
+        error=None,
+        path=db_path,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        batch, "upload_image_to_category", _succeeding_upload_image_to_category(calls)
+    )
+
+    summary = batch.run_upload_stage(batch_id, path=db_path)
+
+    assert "1:43L" in summary["skipped"]
+    assert set(summary["uploaded"]) == {"1:43R", "1:50"}
+    assert "43L" not in {tv_name for tv_name, _ in calls}
+
+
+def test_one_item_upload_failure_does_not_block_the_others(tmp_path, monkeypatch):
+    """Requisito duro #2 (cara de subida): la falla persistente de un
+    panel/TV no bloquea que los demás (misma TV incluida en la cola, y
+    otras TVs) terminen 'uploaded'.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_independiente_day(db_path)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+
+    def fake_upload(tv_name, image_id):
+        if tv_name == "43R":
+            return {"error": "no se pudo conectar"}
+        return {"content_id": f"MY_{tv_name}"}
+
+    monkeypatch.setattr(batch, "upload_image_to_category", fake_upload)
+
+    summary = batch.run_upload_stage(batch_id, path=db_path)
+
+    assert set(summary["uploaded"]) == {"1:43L", "1:50"}
+    assert summary["needs_attention"] == ["1:43R"]
+
+
+def test_item_upload_exhausts_retry_ceiling_before_needs_attention(
+    tmp_path, monkeypatch
+):
+    """Requisito duro #3 (cara de subida): agota exactamente
+    tv_deploy_max_attempts (3, config/batch.toml) antes de needs_attention
+    -- ni uno más ni uno menos. El image_id finalizado se preserva (la
+    imagen sigue siendo válida, solo falló subirla).
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_independiente_day(db_path)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+    finalized_image_id = next(
+        item.image_id
+        for item in batch_store.get_batch_items(batch_id, path=db_path)
+        if item.panel == "43L"
+    )
+
+    calls = []
+
+    def always_failing_upload(tv_name, image_id):
+        calls.append((tv_name, image_id))
+        return {"error": "fallo técnico transitorio"}
+
+    monkeypatch.setattr(batch, "upload_image_to_category", always_failing_upload)
+
+    summary = batch.run_upload_stage(batch_id, path=db_path)
+
+    assert "1:43L" in summary["needs_attention"]
+    max_attempts = batch_store.load_batch_config().tv_deploy_max_attempts
+    assert len([c for c in calls if c[0] == "43L"]) == max_attempts
+    item = next(
+        item
+        for item in batch_store.get_batch_items(batch_id, path=db_path)
+        if item.panel == "43L"
+    )
+    assert item.stage == "needs_attention"
+    assert item.attempts == max_attempts
+    assert item.image_id == finalized_image_id
+
+
+def test_item_upload_retries_transient_failure_then_succeeds(tmp_path, monkeypatch):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_independiente_day(db_path)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+
+    calls = []
+
+    def fake_upload(tv_name, image_id):
+        if tv_name != "43L":
+            return {"content_id": f"MY_{tv_name}"}
+        calls.append((tv_name, image_id))
+        if len(calls) < 3:
+            return {"error": "fallo técnico transitorio"}
+        return {"content_id": "MY_43L_final"}
+
+    monkeypatch.setattr(batch, "upload_image_to_category", fake_upload)
+
+    summary = batch.run_upload_stage(batch_id, path=db_path)
+
+    assert "1:43L" in summary["uploaded"]
+    assert len(calls) == 3
+    item = next(
+        item
+        for item in batch_store.get_batch_items(batch_id, path=db_path)
+        if item.panel == "43L"
+    )
+    assert item.stage == "uploaded"
+    assert item.attempts == 3
+
+
+def test_run_upload_stage_treats_split_day_panels_like_any_other_finalized_item(
+    tmp_path, monkeypatch
+):
+    """Para cuando un item llega a stage='finalized', un día split ya dejó
+    dos filas físicas 43L/43R independientes (el split ocurrió en 2.3) --
+    la subida no debe distinguir modo ni etiquetar nada como 'wide'.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_split_day(db_path)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+
+    calls = []
+    monkeypatch.setattr(
+        batch, "upload_image_to_category", _succeeding_upload_image_to_category(calls)
+    )
+
+    summary = batch.run_upload_stage(batch_id, path=db_path)
+
+    assert set(summary["uploaded"]) == {"1:43L", "1:43R", "1:50"}
+    assert not any("wide" in label for label in summary["uploaded"])
+    assert {tv_name for tv_name, _ in calls} == {"43L", "43R", "50"}
+
+
+def _materialize_n_independiente_days(db_path, n):
+    days = [
+        ApprovedDay(
+            day_index=day_index,
+            mode="independiente",
+            sub_group="Sub-grupo A",
+            prompts={
+                "43L": f"l {day_index}",
+                "43R": f"r {day_index}",
+                "50": f"50 {day_index}",
+            },
+        )
+        for day_index in range(1, n + 1)
+    ]
+    return batch_store.materialize_batch("Tema de 15 días", days, path=db_path)
+
+
+def test_run_upload_stage_processes_one_tv_concurrently_but_serializes_within_a_tv(
+    tmp_path, monkeypatch
+):
+    """Escenario de escala explícito (15 días = 45 imágenes, 15 por TV):
+    las tres TVs deben subir en paralelo entre sí (dispositivos físicos
+    independientes), pero nunca dos uploads concurrentes a la MISMA TV
+    (una sola conexión websocket por dispositivo es la asunción que
+    sostiene tv_deploy.py). Usa una base sqlite3 real en tmp_path (no un
+    mock de la capa de persistencia) para confirmar además que 3 hilos
+    escribiendo concurrentemente contra el mismo archivo (WAL) no
+    corrompen ni pierden filas.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_n_independiente_days(db_path, 15)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+
+    lock = threading.Lock()
+    active_by_tv: dict[str, int] = {"43L": 0, "43R": 0, "50": 0}
+    max_active_by_tv: dict[str, int] = {"43L": 0, "43R": 0, "50": 0}
+
+    def fake_upload(tv_name, image_id):
+        with lock:
+            active_by_tv[tv_name] += 1
+            max_active_by_tv[tv_name] = max(
+                max_active_by_tv[tv_name], active_by_tv[tv_name]
+            )
+        time.sleep(0.02)
+        with lock:
+            active_by_tv[tv_name] -= 1
+        return {"content_id": f"MY_{tv_name}_{image_id}"}
+
+    monkeypatch.setattr(batch, "upload_image_to_category", fake_upload)
+
+    start = time.monotonic()
+    summary = batch.run_upload_stage(batch_id, path=db_path)
+    elapsed = time.monotonic() - start
+
+    assert max_active_by_tv == {"43L": 1, "43R": 1, "50": 1}
+    # 15 uploads/TV * 0.02s, en paralelo entre las 3 TVs: ~0.3s, nunca
+    # cerca de 45 * 0.02s = 0.9s (que sería el caso fully-secuencial).
+    assert elapsed < 0.7
+
+    assert len(summary["uploaded"]) == 45
+    assert summary["needs_attention"] == []
+    items = batch_store.get_batch_items(batch_id, path=db_path)
+    assert len(items) == 45
+    assert all(item.stage == "uploaded" for item in items)

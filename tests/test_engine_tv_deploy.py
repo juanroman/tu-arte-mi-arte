@@ -16,6 +16,7 @@ from engine.tv_deploy import (
     load_tv_deploy_config,
     revert_panels,
     revert_tv,
+    upload_image_to_category,
 )
 from engine.tv_discovery import TvNotFoundError
 
@@ -515,6 +516,156 @@ def test_deploy_image_to_tv_worst_case_wait_is_deadline_plus_grace_constant(
 
     assert "error" in result
     assert "no respondió" in result["error"]
+
+
+def test_upload_image_to_category_success_uploads_without_selecting_or_deleting(
+    tmp_path, monkeypatch
+):
+    """dev_plan_phase_2.md §4.1: a diferencia de deploy_image_to_tv, esta
+    función solo puebla 'Mis Fotos' -- nunca selecciona la imagen en
+    pantalla ni borra subidas viejas, porque durante una subida por lote
+    mostrar/limpiar a mitad de camino sería activamente incorrecto.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(monkeypatch, tmp_path, content_id="MY_F0099")
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert result == {"content_id": "MY_F0099"}
+    assert fake.selected == []
+    assert fake.deleted == []
+    assert fake.uploaded == [
+        (str(tmp_path / "img_0001.jpg"), "shadowbox_warm", "shadowbox_warm")
+    ]
+    assert fake.closed is True
+
+
+def test_upload_image_to_category_does_not_record_deploy_history(tmp_path, monkeypatch):
+    """No tiene sentido registrar 'qué se está mostrando ahora' (esa es la
+    semántica de deploy_history, usada por revert_tv) cuando esta función
+    nunca selecciona nada en pantalla.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    _install_fake(monkeypatch, tmp_path, content_id="MY_F0099")
+
+    upload_image_to_category("43L", "img_0001")
+
+    history = deploy_history.get_history(
+        "43L", path=tmp_path / "tv_deploy_history.sqlite3"
+    )
+    assert history is None
+
+
+def test_upload_image_to_category_reports_missing_image(tmp_path, monkeypatch):
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+
+    def _fail_resolve(name):
+        raise AssertionError("resolve_tv_host should not run without a local image")
+
+    monkeypatch.setattr(tv_deploy, "resolve_tv_host", _fail_resolve)
+
+    result = upload_image_to_category("43L", "img_does_not_exist")
+
+    assert "error" in result
+
+
+def test_upload_image_to_category_converts_tv_not_found_to_error_dict(
+    tmp_path, monkeypatch
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+
+    def _raise_not_found(name):
+        raise TvNotFoundError(f"No hay TV {name!r}")
+
+    monkeypatch.setattr(tv_deploy, "resolve_tv_host", _raise_not_found)
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+
+
+def test_upload_image_to_category_reports_connection_failure_on_open(
+    tmp_path, monkeypatch
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(
+        monkeypatch, tmp_path, open_error=exceptions.ConnectionFailure("no conecta")
+    )
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+    assert fake.closed is True
+
+
+def test_upload_image_to_category_reports_unsupported_tv(tmp_path, monkeypatch):
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(monkeypatch, tmp_path, supported=False)
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+    assert fake.uploaded == []
+
+
+def test_upload_image_to_category_reports_upload_failure(tmp_path, monkeypatch):
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(
+        monkeypatch, tmp_path, upload_error=exceptions.ResponseError("falló subida")
+    )
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+    assert fake.closed is True
+
+
+def test_upload_image_to_category_uses_the_matte_configured_for_that_tv(
+    tmp_path, monkeypatch
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(monkeypatch, tmp_path)
+
+    upload_image_to_category("50", "img_0001")
+
+    assert fake.uploaded == [
+        (str(tmp_path / "img_0001.jpg"), "shadowbox_warm", "shadowbox_warm")
+    ]
+
+
+def test_upload_image_to_category_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
+    """La función nueva comparte el mismo watchdog extraído
+    (_run_with_deploy_watchdog) que deploy_image_to_tv -- una TV sin
+    responder no debe colgar este llamado para siempre tampoco aquí.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=2)
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+    assert "no respondió" in result["error"]
+
+
+def test_upload_image_to_category_logs_error_when_watchdog_times_out(
+    tmp_path, monkeypatch, caplog
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, hang_seconds=2)
+
+    with caplog.at_level(logging.ERROR, logger="engine.tv_deploy"):
+        result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+    assert any(
+        record.levelno == logging.ERROR and "43L" in record.message
+        for record in caplog.records
+    )
 
 
 def test_deploy_set_to_panels_deploys_all_three_independently_on_success(monkeypatch):

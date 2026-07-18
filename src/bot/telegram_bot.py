@@ -62,7 +62,12 @@ from telegram.ext import filters as tg_filters
 from agents.tu_arte_mi_arte.agent import root_agent
 from bot import preview_store, session_store
 from engine import batch_store, tv_deploy
-from engine.batch import run_draft_stage, run_finalize_stage, summarize_batch
+from engine.batch import (
+    run_draft_stage,
+    run_finalize_stage,
+    run_upload_stage,
+    summarize_batch,
+)
 from engine.generation import IMAGES_DIR
 
 _logger = logging.getLogger(__name__)
@@ -523,13 +528,15 @@ async def _run_batch_engine_in_background(
     batch_id: str, bot: object, chat_id: int
 ) -> None:
     """Corre el corredor completo de un lote recién confirmado (draft 1K
-    -> finalización 4K, PRD §15.3 paso 8) fuera del turno de Telegram que
-    lo disparó (dev_plan_phase_2.md §3.1, requisito duro #7: confirmar un
-    lote nunca bloquea el turno). `run_draft_stage`/`run_finalize_stage`
-    (Etapa 2, ya probados) son funciones síncronas que pueden tardar
-    minutos contra la API real de Gemini -- se corren en un hilo aparte
-    (mismo patrón que `revert_command_handler` con `tv_deploy.revert_panels`)
-    para no bloquear el loop de eventos del bot mientras corren.
+    -> finalización 4K -> subida a "Mis Fotos" de las TVs, PRD §15.3 paso
+    8, dev_plan_phase_2.md §4.1) fuera del turno de Telegram que lo
+    disparó (§3.1, requisito duro #7: confirmar un lote nunca bloquea el
+    turno). `run_draft_stage`/`run_finalize_stage`/`run_upload_stage`
+    (Etapas 2 y 4, ya probadas) son funciones síncronas que pueden tardar
+    minutos contra la API real de Gemini o las TVs -- se corren en un
+    hilo aparte (mismo patrón que `revert_command_handler` con
+    `tv_deploy.revert_panels`) para no bloquear el loop de eventos del
+    bot mientras corren.
 
     Al terminar, manda el reporte proactivo (§3.2) al chat que confirmó el
     lote. Marca `batch.status='running'` al arrancar y `'reported'` justo
@@ -537,19 +544,26 @@ async def _run_batch_engine_in_background(
     misma función tanto para un arranque en caliente (recién confirmado)
     como para una reanudación tras un reinicio del bot
     (`reconcile_batches_on_startup`), sin una segunda copia de esta
-    lógica: `run_draft_stage`/`run_finalize_stage` ya son idempotentes
-    (§2.5), así que reinvocarlas sobre un lote a medias simplemente
-    continúa donde se quedó. Una excepción real que escape de aquí (no
-    capturada por el corredor, p. ej. un fallo de I/O o del propio envío
-    del reporte) se propaga a través de `Application.create_task`, que la
-    enruta a `global_error_handler` -- nunca desaparece en silencio; el
-    lote queda en `'running'`, y la próxima reconciliación al reiniciar lo
-    vuelve a recoger igual que uno recién materializado.
+    lógica: las tres etapas ya son idempotentes (§2.5, §4.1), así que
+    reinvocarlas sobre un lote a medias simplemente continúa donde se
+    quedó. Una excepción real que escape de aquí (no capturada por el
+    corredor, p. ej. un fallo de I/O o del propio envío del reporte) se
+    propaga a través de `Application.create_task`, que la enruta a
+    `global_error_handler` -- nunca desaparece en silencio; el lote queda
+    en `'running'`, y la próxima reconciliación al reiniciar lo vuelve a
+    recoger igual que uno recién materializado.
+
+    Nota (§4.1): `upload_image_to_category` (usada por `run_upload_stage`)
+    nunca selecciona la imagen en pantalla ni configura rotación -- eso es
+    4.2. El texto del reporte proactivo (`_format_batch_report_text`) no
+    distingue esto todavía: dice "ya está lista" aunque las TVs no
+    cambien visiblemente de imagen hasta que 4.2 exista.
     """
     _logger.info("Corredor de lote arrancó en segundo plano: batch_id=%s", batch_id)
     batch_store.set_batch_status(batch_id, "running")
     await asyncio.to_thread(run_draft_stage, batch_id)
     await asyncio.to_thread(run_finalize_stage, batch_id)
+    await asyncio.to_thread(run_upload_stage, batch_id)
     _logger.info("Corredor de lote terminó en segundo plano: batch_id=%s", batch_id)
     await _send_batch_report(bot, chat_id, batch_id)
     batch_store.set_batch_status(batch_id, "reported")

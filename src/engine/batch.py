@@ -33,13 +33,31 @@ paneles ya sí lo hicieron, lo que dispararía una regeneración/reintento
 espurio de la fuente ancha en la reinvocación, violando potencialmente
 el requisito duro #1 sobre un `policy_rejection`).
 
-Procesamiento secuencial, no paralelo: a diferencia de
-`tv_deploy.deploy_set_to_panels` (TVs físicas independientes, sin cuota
-compartida), la generación de imágenes comparte una sola cuota de la
-API de Gemini -- procesar en paralelo arriesgaría ráfagas de rate-limit
-sin ganancia real.
+Procesamiento secuencial, no paralelo, en generación/finalización: a
+diferencia de `tv_deploy.deploy_set_to_panels` (TVs físicas
+independientes, sin cuota compartida), la generación de imágenes
+comparte una sola cuota de la API de Gemini -- procesar en paralelo
+arriesgaría ráfagas de rate-limit sin ganancia real.
+
+Etapa de subida (§4.1, dev_plan_phase_2.md): modelo de concurrencia
+DISTINTO al de generación/finalización, porque la restricción real
+también es distinta. Las tres TVs son dispositivos físicos
+independientes sin cuota compartida (mismo principio que
+`tv_deploy.deploy_set_to_panels`) -- así que `run_upload_stage` corre un
+worker por TV en paralelo. Pero dentro de una misma TV, cada worker
+drena su cola de items SECUENCIALMENTE: `SamsungTVArt`/el protocolo de
+la TV asumen una sola conexión websocket a la vez por dispositivo (misma
+asunción que sostiene todo `tv_deploy.py`), así que subir varias
+imágenes a la MISMA TV en paralelo rompería esa asunción sin ganancia
+real -- ni fully-secuencial entre TVs (tres veces más lento sin razón)
+ni fully-paralelo sobre las hasta N*3 imágenes de un lote grande (arriesga
+conexiones concurrentes contra el mismo socket físico). Tampoco hay
+concepto de `policy_rejection` en la subida -- una TV no rechaza
+contenido por política, solo falla de forma transitoria de red, así que
+toda falla es reintentable hasta `tv_deploy_max_attempts`.
 """
 
+import concurrent.futures
 import logging
 import math
 from collections.abc import Callable
@@ -61,6 +79,7 @@ from engine.batch_store import (
 )
 from engine.generation import generate_final_high_res, generate_image
 from engine.split import SplitConfig, load_split_config, split_wide_image
+from engine.tv_deploy import upload_image_to_category
 
 _logger = logging.getLogger(__name__)
 
@@ -449,6 +468,134 @@ def run_finalize_stage(batch_id: str, path: Path | None = None) -> dict:
         "run_finalize_stage: batch_id=%s finalized=%d needs_attention=%d skipped=%d",
         batch_id,
         len(summary["finalized"]),
+        len(summary["needs_attention"]),
+        len(summary["skipped"]),
+    )
+    return summary
+
+
+def _upload_with_retries(
+    attempt: Callable[[], dict], max_attempts: int
+) -> tuple[int, dict]:
+    """Retry loop de la etapa de subida a TV (§4.1) -- variante mínima de
+    `_generate_with_retries`, no reutilizable tal cual: detecta éxito por
+    `'content_id' in result` (el shape de `tv_deploy.upload_image_to_category`),
+    no por `'image_id'`, y no existe concepto de `policy_rejection` en
+    subida -- toda falla es reintentable hasta `max_attempts`, a
+    diferencia del corte inmediato que sí aplica a generación.
+    """
+    attempts = 0
+    while True:
+        attempts += 1
+        result = attempt()
+        if "content_id" in result or attempts >= max_attempts:
+            return attempts, result
+
+
+def _upload_item(
+    batch_id: str,
+    item: BatchItemRecord,
+    max_attempts: int,
+    path: Path | None,
+) -> str:
+    """Sube un único panel físico (43L/43R/50, de un día independiente o
+    split -- indistinguible aquí, ver nota de módulo) ya en
+    stage='finalized' a la TV cuyo nombre coincide con `item.panel`.
+    Devuelve 'uploaded', 'needs_attention', o 'skipped' (todavía no
+    finalizado, o ya subido -- requisito duro #9).
+    """
+    if item.stage != "finalized":
+        return "skipped"
+
+    image_id = item.image_id
+    if image_id is None:
+        raise ValueError(f"batch_item en stage='finalized' sin image_id: {item!r}")
+
+    attempts, result = _upload_with_retries(
+        lambda: upload_image_to_category(item.panel, image_id), max_attempts
+    )
+
+    if "content_id" in result:
+        record_item_attempt(
+            batch_id,
+            item.day_index,
+            item.panel,
+            attempts=attempts,
+            stage="uploaded",
+            image_id=image_id,
+            error=None,
+            path=path,
+        )
+        return "uploaded"
+
+    record_item_attempt(
+        batch_id,
+        item.day_index,
+        item.panel,
+        attempts=attempts,
+        stage="needs_attention",
+        image_id=image_id,  # la imagen finalizada sigue válida en disco
+        error=result.get("error"),
+        path=path,
+    )
+    return "needs_attention"
+
+
+def run_upload_stage(batch_id: str, path: Path | None = None) -> dict:
+    """Sube cada `batch_item` de `batch_id` en `stage='finalized'` a la TV
+    correspondiente a su panel (dev_plan_phase_2.md §4.1), avanzando a
+    `uploaded` o `needs_attention`. Seguro de re-invocar: items ya
+    `uploaded` se saltan (requisito duro #9); items que aún no llegaron a
+    `finalized` también se saltan (todavía no hay nada que subir).
+
+    Concurrencia (ver nota de módulo): un worker por TV física (3 en
+    total), cada uno drenando su propia cola de items de esa TV en orden
+    secuencial de `day_index` -- nunca fully-secuencial entre TVs (tres
+    dispositivos físicos independientes sin cuota compartida) ni
+    fully-paralelo dentro de una misma TV (rompería la asunción de una
+    sola conexión websocket por TV).
+
+    Reintento con `tv_deploy_max_attempts` (config/batch.toml, §15.5) vía
+    `_upload_with_retries` -- sin concepto de `policy_rejection`.
+
+    Días split: sin manejo especial -- para cuando un item llega a
+    `stage='finalized'`, un día split ya dejó dos filas físicas 43L/43R
+    independientes (el split ya ocurrió en 2.3); este corredor itera
+    `batch_item` sin mirar `batch_day.mode` en absoluto.
+    """
+    max_attempts = load_batch_config().tv_deploy_max_attempts
+
+    items_by_panel: dict[str, list[BatchItemRecord]] = {"43L": [], "43R": [], "50": []}
+    for item in get_batch_items(batch_id, path=path):
+        items_by_panel[item.panel].append(item)
+
+    summary: dict[str, list[str]] = {
+        "uploaded": [],
+        "needs_attention": [],
+        "skipped": [],
+    }
+
+    def _drain_panel(panel: str) -> list[tuple[str, str]]:
+        return [
+            (
+                _upload_item(batch_id, item, max_attempts, path),
+                f"{item.day_index}:{panel}",
+            )
+            for item in items_by_panel[panel]
+        ]
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(items_by_panel)
+    ) as executor:
+        futures = [executor.submit(_drain_panel, panel) for panel in items_by_panel]
+        for future in futures:
+            for outcome, label in future.result():
+                summary[outcome].append(label)
+
+    _logger.info(
+        "run_upload_stage: batch_id=%s uploaded=%d needs_attention=%d skipped=%d",
+        batch_id,
+        len(summary["uploaded"]),
         len(summary["needs_attention"]),
         len(summary["skipped"]),
     )

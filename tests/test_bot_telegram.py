@@ -1177,8 +1177,8 @@ def test_materialize_batch_gallery_success_triggers_background_batch_engine(
     monkeypatch,
 ):
     """Confirmar un lote (paso 8, PRD §15.3) debe arrancar el corredor
-    (draft -> finalización 4K) sin que el turno de Telegram lo espere --
-    dev_plan_phase_2.md §3.1, requisito duro #7.
+    (draft -> finalización 4K -> subida a TV) sin que el turno de Telegram
+    lo espere -- dev_plan_phase_2.md §3.1/§4.1, requisito duro #7.
     """
     calls = []
     monkeypatch.setattr(
@@ -1190,6 +1190,11 @@ def test_materialize_batch_gallery_success_triggers_background_batch_engine(
         telegram_bot,
         "run_finalize_stage",
         lambda batch_id: calls.append(("finalize", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_upload_stage",
+        lambda batch_id: calls.append(("upload", batch_id)),
     )
     monkeypatch.setattr(
         telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
@@ -1215,6 +1220,7 @@ def test_materialize_batch_gallery_success_triggers_background_batch_engine(
     assert calls == [
         ("draft", "batch_abc123"),
         ("finalize", "batch_abc123"),
+        ("upload", "batch_abc123"),
     ]
 
 
@@ -1240,6 +1246,11 @@ def test_materialize_batch_gallery_called_twice_in_one_turn_starts_both_batches(
         telegram_bot,
         "run_finalize_stage",
         lambda batch_id: calls.append(("finalize", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_upload_stage",
+        lambda batch_id: calls.append(("upload", batch_id)),
     )
     monkeypatch.setattr(
         telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
@@ -1278,8 +1289,10 @@ def test_materialize_batch_gallery_called_twice_in_one_turn_starts_both_batches(
     assert set(calls) == {
         ("draft", "batch_first111"),
         ("finalize", "batch_first111"),
+        ("upload", "batch_first111"),
         ("draft", "batch_second222"),
         ("finalize", "batch_second222"),
+        ("upload", "batch_second222"),
     }
 
 
@@ -1299,6 +1312,7 @@ def test_materialize_batch_gallery_success_does_not_block_the_turn(monkeypatch):
 
     monkeypatch.setattr(telegram_bot, "run_draft_stage", slow_run_draft_stage)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
     runner, session_service, _ = _build_runner_with_fake_run_async(
         [
             [
@@ -1332,6 +1346,7 @@ def test_materialize_batch_gallery_error_response_does_not_trigger_background_en
         telegram_bot, "run_draft_stage", lambda batch_id: calls.append(batch_id)
     )
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
     runner, session_service, _ = _build_runner_with_fake_run_async(
         [
             [
@@ -1362,6 +1377,7 @@ def test_turn_without_materialize_batch_gallery_does_not_trigger_background_engi
         telegram_bot, "run_draft_stage", lambda batch_id: calls.append(batch_id)
     )
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
     runner, session_service, _ = _build_runner_with_fake_run_async(
         [[_text_event("bicicletas vintage en Santorini, listo")]]
     )
@@ -1432,6 +1448,7 @@ def test_materialize_batch_gallery_persists_chat_id_before_starting_background_t
     )
     monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
     )
@@ -1481,6 +1498,7 @@ def test_run_batch_engine_in_background_updates_status_running_then_reported():
     with (
         patch.object(telegram_bot, "run_draft_stage", spy_run_draft_stage),
         patch.object(telegram_bot, "run_finalize_stage", lambda _batch_id: None),
+        patch.object(telegram_bot, "run_upload_stage", lambda _batch_id: None),
         patch.object(
             telegram_bot, "summarize_batch", lambda _batch_id: _batch_summary()
         ),
@@ -1610,9 +1628,15 @@ def test_reconcile_batches_on_startup_end_to_end_after_simulated_crash(monkeypat
         _write_fixture_images(final_image_id)
         return {"image_id": final_image_id}
 
+    def fake_upload_image_to_category(tv_name, image_id):
+        return {"content_id": f"MY_{tv_name}"}
+
     monkeypatch.setattr(batch_engine, "generate_image", fake_generate_image)
     monkeypatch.setattr(
         batch_engine, "generate_final_high_res", fake_generate_final_high_res
+    )
+    monkeypatch.setattr(
+        batch_engine, "upload_image_to_category", fake_upload_image_to_category
     )
 
     batch_id = batch_store.materialize_batch(
@@ -1642,7 +1666,7 @@ def test_reconcile_batches_on_startup_end_to_end_after_simulated_crash(monkeypat
 
     assert batch_store.get_batch(batch_id).status == "reported"
     items = batch_store.get_batch_items(batch_id)
-    assert {item.stage for item in items} == {"finalized"}
+    assert {item.stage for item in items} == {"uploaded"}
     application.bot.send_message.assert_any_await(
         42, ANY, parse_mode=ParseMode.MARKDOWN_V2
     )
@@ -1695,6 +1719,7 @@ def test_batch_report_full_success_sends_summary_and_one_album(monkeypatch):
     _write_fixture_images("img_1", "img_2", "img_3")
     monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot,
         "summarize_batch",
@@ -1742,6 +1767,7 @@ def test_batch_report_paginates_albums_over_ten_photos(monkeypatch):
     _write_fixture_images(*image_ids)
     monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot,
         "summarize_batch",
@@ -1806,6 +1832,7 @@ def test_batch_report_mixed_failure_distinguishes_policy_vs_technical(monkeypatc
     _write_fixture_images("img_1")
     monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot,
         "summarize_batch",
@@ -1858,6 +1885,7 @@ def test_batch_report_total_failure_sends_text_but_no_album(monkeypatch):
     """
     monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot,
         "summarize_batch",
@@ -1907,6 +1935,7 @@ def test_batch_report_does_not_block_the_turn(monkeypatch):
 
     monkeypatch.setattr(telegram_bot, "run_draft_stage", slow_run_draft_stage)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_upload_stage", lambda batch_id: None)
     monkeypatch.setattr(
         telegram_bot,
         "summarize_batch",
