@@ -1,11 +1,12 @@
 import asyncio
+import contextlib
 import datetime
 import logging
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 
@@ -15,6 +16,7 @@ from google.adk.runners import Runner  # noqa: E402
 from google.adk.sessions import InMemorySessionService  # noqa: E402
 from google.genai import types  # noqa: E402
 from telegram import Chat, Message, MessageEntity, Update, User  # noqa: E402
+from telegram.constants import ParseMode  # noqa: E402
 from telegram.ext import (  # noqa: E402
     CallbackQueryHandler,
     CommandHandler,
@@ -43,12 +45,13 @@ from bot.telegram_bot import (  # noqa: E402
     load_allowed_user_ids,
     load_log_level,
     load_session_timeout_seconds,
+    reconcile_batches_on_startup,
     reset_handler,
     revert_button_handler,
     revert_command_handler,
     rotate_session,
 )
-from engine import tv_deploy  # noqa: E402
+from engine import batch_store, tv_deploy  # noqa: E402
 
 DEFAULT_TIMEOUT = 10_800
 
@@ -58,6 +61,7 @@ def _isolate_session_store(tmp_path, monkeypatch):
     monkeypatch.setattr(session_store, "DB_PATH", tmp_path / "bot_state.sqlite3")
     monkeypatch.setattr(preview_store, "DB_PATH", tmp_path / "bot_state.sqlite3")
     monkeypatch.setattr(telegram_bot, "IMAGES_DIR", tmp_path)
+    monkeypatch.setattr(batch_store, "DB_PATH", tmp_path / "batch.sqlite3")
 
 
 def test_load_allowed_user_ids_parses_comma_separated_ints():
@@ -172,6 +176,12 @@ def test_build_application_registers_revert_command_and_callback_handlers():
     assert len(revert_callbacks) == 1
 
 
+def test_build_application_registers_reconcile_on_startup_hook():
+    app = build_application("123:fake-token-for-tests", [111])
+
+    assert app.post_init is reconcile_batches_on_startup
+
+
 def _text_event(text: str) -> SimpleNamespace:
     return SimpleNamespace(
         content=types.Content(role="model", parts=[types.Part(text=text)])
@@ -260,6 +270,21 @@ def _deploy_to_panels_response_event(response: dict) -> SimpleNamespace:
     )
 
 
+def _materialize_batch_gallery_response_event(response: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name="materialize_batch_gallery", response=response
+                    )
+                )
+            ],
+        )
+    )
+
+
 def _fake_run_async_factory(events_by_call):
     """Returns a fake run_async bound method that yields events_by_call[i]
     (a list of lists) on the i-th call, tracking (user_id, session_id,
@@ -288,6 +313,41 @@ def _make_bot():
     )
 
 
+def _make_application(bot_data, bot=None):
+    """Fake `Application` that supports `create_task` well enough to
+    exercise the real fire-and-forget wiring (dev_plan_phase_2.md §3.1):
+    schedules the coroutine as a genuine `asyncio.Task` on the running
+    loop, without waiting for it — same non-blocking contract as PTB's
+    own `Application.create_task`. Tasks created are collected on
+    `created_tasks` so a test can explicitly `await asyncio.gather(...)`
+    them when it needs the background work to have settled before
+    asserting on it. `bot` defaults to a fresh `_make_bot()` -- needed by
+    `reconcile_batches_on_startup` (§3.3), which reaches `application.bot`
+    directly (no per-turn `context.bot` exists at startup).
+    """
+    application = SimpleNamespace(
+        bot_data=bot_data, created_tasks=[], bot=bot if bot is not None else _make_bot()
+    )
+
+    def create_task(coro, update=None):
+        task = asyncio.ensure_future(coro)
+        application.created_tasks.append(task)
+        return task
+
+    application.create_task = create_task
+    return application
+
+
+async def _run_and_await_background_tasks(coro, application) -> None:
+    """Awaits `coro`, then awaits every task `application.create_task`
+    scheduled during it -- lets a test assert on background batch-engine
+    work (dev_plan_phase_2.md §3.1) after it has actually settled.
+    """
+    await coro
+    if application.created_tasks:
+        await asyncio.gather(*application.created_tasks)
+
+
 def _make_update_and_context(
     runner, session_service, chat_id, text="hola", timeout_seconds=DEFAULT_TIMEOUT
 ):
@@ -299,8 +359,8 @@ def _make_update_and_context(
         effective_chat=SimpleNamespace(id=chat_id),
     )
     context = SimpleNamespace(
-        application=SimpleNamespace(
-            bot_data={
+        application=_make_application(
+            {
                 "runner": runner,
                 "session_service": session_service,
                 "session_timeout_seconds": timeout_seconds,
@@ -870,8 +930,8 @@ def _make_callback_update_and_context(
         effective_user=SimpleNamespace(id=user_id),
     )
     context = SimpleNamespace(
-        application=SimpleNamespace(
-            bot_data={
+        application=_make_application(
+            {
                 "runner": runner,
                 "session_service": session_service,
                 "session_timeout_seconds": timeout_seconds,
@@ -1111,6 +1171,834 @@ def test_full_failure_deploy_sends_no_revert_button():
     asyncio.run(handle_message(update, context))
 
     context.bot.send_message.assert_not_awaited()
+
+
+def test_materialize_batch_gallery_success_triggers_background_batch_engine(
+    monkeypatch,
+):
+    """Confirmar un lote (paso 8, PRD §15.3) debe arrancar el corredor
+    (draft -> finalización 4K) sin que el turno de Telegram lo espere --
+    dev_plan_phase_2.md §3.1, requisito duro #7.
+    """
+    calls = []
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_draft_stage",
+        lambda batch_id: calls.append(("draft", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_finalize_stage",
+        lambda batch_id: calls.append(("finalize", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 3}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    assert calls == [
+        ("draft", "batch_abc123"),
+        ("finalize", "batch_abc123"),
+    ]
+
+
+def test_materialize_batch_gallery_called_twice_in_one_turn_starts_both_batches(
+    monkeypatch,
+):
+    """Si el modelo llama `materialize_batch_gallery` más de una vez en el
+    mismo turno (contra la instrucción de SKILL.md de llamarla "una sola
+    vez", pero sin nada que lo impida a nivel de código), las DOS filas
+    quedan materializadas en SQLite -- ninguna debe quedar huérfana sin
+    `chat_id` ni sin arrancar su corredor. Antes de este fix,
+    `_extract_materialized_batch_id` solo devolvía la última llamada
+    exitosa, dejando la primera con `chat_id=NULL` para siempre (y
+    confundida con un lote legado por `reconcile_batches_on_startup`).
+    """
+    calls = []
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_draft_stage",
+        lambda batch_id: calls.append(("draft", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_finalize_stage",
+        lambda batch_id: calls.append(("finalize", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
+    )
+    chat_id_calls = []
+    monkeypatch.setattr(
+        batch_store,
+        "set_batch_chat_id",
+        lambda batch_id, chat_id: chat_id_calls.append((batch_id, chat_id)),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_first111", "day_count": 2}
+                ),
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_second222", "day_count": 3}
+                ),
+                _text_event("dos lotes guardados"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    assert set(chat_id_calls) == {
+        ("batch_first111", 42),
+        ("batch_second222", 42),
+    }
+    assert set(calls) == {
+        ("draft", "batch_first111"),
+        ("finalize", "batch_first111"),
+        ("draft", "batch_second222"),
+        ("finalize", "batch_second222"),
+    }
+
+
+def test_materialize_batch_gallery_success_does_not_block_the_turn(monkeypatch):
+    """Same non-blocking guarantee as
+    test_revert_handlers_do_not_block_the_event_loop: the handler must
+    return (and the progress message must be edited) well before a slow
+    corredor finishes -- dev_plan_phase_2.md §3.1, requisito duro #7.
+    Records the tick time from inside the coroutine rather than timing
+    the whole `asyncio.run` call, since `asyncio.run`'s own shutdown
+    phase waits for any still-pending background task before returning
+    control, which would make the outer wall-clock misleading here.
+    """
+
+    def slow_run_draft_stage(batch_id):
+        time.sleep(0.2)
+
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", slow_run_draft_stage)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 3}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    start = time.monotonic()
+    finished_at = []
+
+    async def run_and_record():
+        await handle_message(update, context)
+        finished_at.append(time.monotonic() - start)
+
+    asyncio.run(run_and_record())
+
+    assert finished_at[0] < 0.1
+    _final_reply(update).assert_awaited_once()
+
+
+def test_materialize_batch_gallery_error_response_does_not_trigger_background_engine(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        telegram_bot, "run_draft_stage", lambda batch_id: calls.append(batch_id)
+    )
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"error": "day_index no es consecutivo"}
+                ),
+                _text_event("faltó un día"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    assert calls == []
+    assert context.application.created_tasks == []
+
+
+def test_turn_without_materialize_batch_gallery_does_not_trigger_background_engine(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        telegram_bot, "run_draft_stage", lambda batch_id: calls.append(batch_id)
+    )
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [[_text_event("bicicletas vintage en Santorini, listo")]]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    assert calls == []
+    assert context.application.created_tasks == []
+
+
+def test_batch_engine_crash_in_background_is_routed_to_global_error_handler(
+    monkeypatch, caplog
+):
+    """A real crash inside the background corredor (e.g. an unhandled
+    I/O error) must not vanish silently -- PTB's own `create_task`
+    re-raises after `process_error`, which `global_error_handler`
+    (registered on the real Application) logs. Exercised here against a
+    real `python-telegram-bot` `Application`, not the test double, to
+    confirm the actual wiring PTB provides.
+    """
+    from telegram.ext import ApplicationBuilder
+
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_draft_stage",
+        lambda batch_id: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    async def scenario():
+        application = ApplicationBuilder().token("123:fake-token-for-tests").build()
+        application.add_error_handler(telegram_bot.global_error_handler)
+        with pytest.warns(UserWarning, match="won't be automatically awaited"):
+            task = application.create_task(
+                telegram_bot._run_batch_engine_in_background(
+                    "batch_abc123", _make_bot(), 42
+                )
+            )
+        with contextlib.suppress(RuntimeError):
+            await task
+
+    with caplog.at_level(logging.ERROR, logger="bot.telegram_bot"):
+        asyncio.run(scenario())
+
+    assert any("Excepción no manejada" in record.message for record in caplog.records)
+
+
+def test_materialize_batch_gallery_persists_chat_id_before_starting_background_task(
+    monkeypatch,
+):
+    """El chat que confirma un lote debe quedar guardado en `batch_store`
+    antes de que arranque el corredor de fondo -- es lo único que permite
+    a `reconcile_batches_on_startup` (§3.3) saber a dónde reportar si el
+    proceso se cae a la mitad. `batch_id` aquí es un fixture fabricado por
+    `_materialize_batch_gallery_response_event` (no una fila real de
+    `batch_store`), así que se espía `set_batch_chat_id` en vez de leer de
+    vuelta con `get_batch`.
+    """
+    calls = []
+    monkeypatch.setattr(
+        batch_store,
+        "set_batch_chat_id",
+        lambda batch_id, chat_id: calls.append((batch_id, chat_id)),
+    )
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 3}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    assert calls == [("batch_abc123", 42)]
+
+
+def test_run_batch_engine_in_background_updates_status_running_then_reported():
+    """La misma función que corre en caliente al confirmar debe llevar el
+    lote de `'materialized'` -> `'running'` -> `'reported'`
+    (dev_plan_phase_2.md §3.3) -- es la base de la que depende
+    `list_non_terminal_batches` para saber qué reconciliar.
+    """
+    batch_id = batch_store.materialize_batch(
+        "Tema",
+        [
+            batch_store.ApprovedDay(
+                day_index=1,
+                mode="independiente",
+                sub_group="Grupo 1",
+                prompts={"43L": "a", "43R": "b", "50": "c"},
+            )
+        ],
+    )
+    status_during_run = []
+
+    def spy_run_draft_stage(_batch_id):
+        status_during_run.append(batch_store.get_batch(batch_id).status)
+
+    with (
+        patch.object(telegram_bot, "run_draft_stage", spy_run_draft_stage),
+        patch.object(telegram_bot, "run_finalize_stage", lambda _batch_id: None),
+        patch.object(
+            telegram_bot, "summarize_batch", lambda _batch_id: _batch_summary()
+        ),
+    ):
+        asyncio.run(
+            telegram_bot._run_batch_engine_in_background(batch_id, _make_bot(), 42)
+        )
+
+    assert status_during_run == ["running"]
+    assert batch_store.get_batch(batch_id).status == "reported"
+
+
+def _materialize_batch_with_chat_id(chat_id, *, theme="Tema"):
+    batch_id = batch_store.materialize_batch(
+        theme,
+        [
+            batch_store.ApprovedDay(
+                day_index=1,
+                mode="independiente",
+                sub_group="Grupo 1",
+                prompts={"43L": "a", "43R": "b", "50": "c"},
+            )
+        ],
+    )
+    if chat_id is not None:
+        batch_store.set_batch_chat_id(batch_id, chat_id)
+    return batch_id
+
+
+def test_reconcile_batches_on_startup_resumes_non_terminal_batch_with_known_chat_id(
+    monkeypatch,
+):
+    batch_id = _materialize_batch_with_chat_id(42, theme="Faroles")
+    calls = []
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_draft_stage",
+        lambda batch_id: calls.append(("draft", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_finalize_stage",
+        lambda batch_id: calls.append(("finalize", batch_id)),
+    )
+    monkeypatch.setattr(
+        telegram_bot, "summarize_batch", lambda batch_id: _batch_summary()
+    )
+    application = _make_application({"allowed_user_ids": frozenset({111})})
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            reconcile_batches_on_startup(application), application
+        )
+    )
+
+    assert calls == [("draft", batch_id), ("finalize", batch_id)]
+    application.bot.send_message.assert_any_await(
+        42, ANY, parse_mode=ParseMode.MARKDOWN_V2
+    )
+    assert batch_store.get_batch(batch_id).status == "reported"
+
+
+def test_reconcile_batches_on_startup_skips_already_reported_batches(monkeypatch):
+    batch_id = _materialize_batch_with_chat_id(42)
+    batch_store.set_batch_status(batch_id, "reported")
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_draft_stage",
+        lambda batch_id: pytest.fail("no debería reanudar un lote ya reportado"),
+    )
+    application = _make_application({"allowed_user_ids": frozenset({111})})
+
+    asyncio.run(reconcile_batches_on_startup(application))
+
+    application.bot.send_message.assert_not_awaited()
+    assert application.created_tasks == []
+
+
+def test_reconcile_batches_on_startup_broadcasts_without_resuming_missing_chat_id(
+    monkeypatch,
+):
+    _materialize_batch_with_chat_id(None, theme="Lote viejo")
+    monkeypatch.setattr(
+        telegram_bot,
+        "run_draft_stage",
+        lambda batch_id: pytest.fail("no debería reanudar un lote sin chat_id"),
+    )
+    application = _make_application({"allowed_user_ids": frozenset({111, 222})})
+
+    asyncio.run(reconcile_batches_on_startup(application))
+
+    assert application.created_tasks == []
+    sent_to = {call.args[0] for call in application.bot.send_message.await_args_list}
+    assert sent_to == {111, 222}
+
+
+def test_reconcile_batches_on_startup_no_non_terminal_batches_sends_nothing():
+    application = _make_application({"allowed_user_ids": frozenset({111})})
+
+    asyncio.run(reconcile_batches_on_startup(application))
+
+    application.bot.send_message.assert_not_awaited()
+    assert application.created_tasks == []
+
+
+def test_reconcile_batches_on_startup_end_to_end_after_simulated_crash(monkeypatch):
+    """Caso central de esta iteración (dev_plan_phase_2.md §3.3, requisito
+    duro #6): un lote real que ya avanzó a `run_draft_stage` pero cuyo
+    proceso murió antes de finalizar (`status` se quedó en `'materialized'`,
+    simulando un crash a mitad de camino) debe reanudarse por completo al
+    reconciliar -- terminar la finalización y mandar el reporte proactivo
+    -- sin volver a generar los paneles ya drafteados. Generación real de
+    imágenes mockeada a nivel de `engine.batch` (mismo patrón que
+    `tests/test_engine_batch.py`), no contra la API real de Gemini -- esto
+    es un test unitario rápido, la corrida real de verdad vive en el
+    script de demo manual.
+    """
+    from engine import batch as batch_engine
+
+    def fake_generate_image(prompt, aspect_ratio):
+        image_id = f"img_{abs(hash((prompt, aspect_ratio))) % 10**6}"
+        _write_fixture_images(image_id)
+        return {"image_id": image_id}
+
+    def fake_generate_final_high_res(image_id):
+        final_image_id = f"{image_id}_4k"
+        _write_fixture_images(final_image_id)
+        return {"image_id": final_image_id}
+
+    monkeypatch.setattr(batch_engine, "generate_image", fake_generate_image)
+    monkeypatch.setattr(
+        batch_engine, "generate_final_high_res", fake_generate_final_high_res
+    )
+
+    batch_id = batch_store.materialize_batch(
+        "Faroles",
+        [
+            batch_store.ApprovedDay(
+                day_index=1,
+                mode="independiente",
+                sub_group="Grupo 1",
+                prompts={"43L": "a", "43R": "b", "50": "c"},
+            )
+        ],
+    )
+    batch_store.set_batch_chat_id(batch_id, 42)
+    batch_engine.run_draft_stage(batch_id)
+    # El proceso "murió" aquí -- nunca se llamó run_finalize_stage, y
+    # `status` se quedó en 'materialized' (nunca se marcó 'running').
+    assert batch_store.get_batch(batch_id).status == "materialized"
+
+    application = _make_application({"allowed_user_ids": frozenset({111})})
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            reconcile_batches_on_startup(application), application
+        )
+    )
+
+    assert batch_store.get_batch(batch_id).status == "reported"
+    items = batch_store.get_batch_items(batch_id)
+    assert {item.stage for item in items} == {"finalized"}
+    application.bot.send_message.assert_any_await(
+        42, ANY, parse_mode=ParseMode.MARKDOWN_V2
+    )
+    application.bot.send_media_group.assert_awaited()
+
+
+def _batch_summary(
+    *,
+    theme="Otoño",
+    day_count=1,
+    stage_counts=None,
+    needs_attention_policy_rejection=None,
+    needs_attention_technical=None,
+    days=None,
+) -> dict:
+    """Fabrica un dict con el shape exacto de
+    `engine.batch.summarize_batch` (§2.4) para monkeypatchear
+    `telegram_bot.summarize_batch` sin tocar SQLite real -- mismo
+    principio que los demás fakes de este archivo, que trabajan a nivel
+    de tool-call-event en vez de contra el estado persistido real.
+    """
+    return {
+        "batch_id": "batch_abc123",
+        "theme": theme,
+        "day_count": day_count,
+        "stage_counts": stage_counts if stage_counts is not None else {"finalized": 3},
+        "needs_attention_policy_rejection": needs_attention_policy_rejection or [],
+        "needs_attention_technical": needs_attention_technical or [],
+        "days": days if days is not None else [],
+    }
+
+
+def _batch_day_summary(day_index, panel_image_ids: dict) -> dict:
+    return {
+        "day_index": day_index,
+        "mode": "independiente",
+        "sub_group": "Sub-grupo 1",
+        "panels": {
+            panel: {"stage": "finalized", "image_id": image_id, "error": None}
+            for panel, image_id in panel_image_ids.items()
+        },
+    }
+
+
+def test_batch_report_full_success_sends_summary_and_one_album(monkeypatch):
+    """Un lote sin ningún needs_attention manda un texto de éxito simple
+    (sin sección de fallas) seguido de un único álbum con todas las fotos
+    -- dev_plan_phase_2.md §3.2.
+    """
+    _write_fixture_images("img_1", "img_2", "img_3")
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda batch_id: _batch_summary(
+            day_count=1,
+            days=[
+                _batch_day_summary(1, {"43L": "img_1", "43R": "img_2", "50": "img_3"})
+            ],
+        ),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 1}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    context.bot.send_message.assert_awaited_once()
+    text_args, _ = context.bot.send_message.call_args
+    assert "lista" in text_args[1]
+    assert "atención" not in text_args[1]
+
+    context.bot.send_media_group.assert_awaited_once()
+    _, media_kwargs = context.bot.send_media_group.call_args
+    assert len(media_kwargs["media"]) == 3
+
+
+def test_batch_report_paginates_albums_over_ten_photos(monkeypatch):
+    """Requisito duro #8: un lote de más de 10 fotos manda varios álbumes,
+    cada uno de a lo más 10, pausados entre sí en vez de en una sola
+    llamada.
+    """
+    image_ids = [f"img_{i}" for i in range(12)]
+    _write_fixture_images(*image_ids)
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda batch_id: _batch_summary(
+            day_count=4,
+            stage_counts={"finalized": 12},
+            days=[
+                _batch_day_summary(
+                    i + 1,
+                    {
+                        "43L": image_ids[i * 3],
+                        "43R": image_ids[i * 3 + 1],
+                        "50": image_ids[i * 3 + 2],
+                    },
+                )
+                for i in range(4)
+            ],
+        ),
+    )
+    sleep_calls = []
+    real_sleep = asyncio.sleep
+
+    async def spying_sleep(seconds):
+        sleep_calls.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(telegram_bot.asyncio, "sleep", spying_sleep)
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 4}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    assert context.bot.send_media_group.await_count == 2
+    album_sizes = [
+        len(call.kwargs["media"])
+        for call in context.bot.send_media_group.await_args_list
+    ]
+    assert album_sizes == [10, 2]
+    assert sleep_calls.count(telegram_bot._PROACTIVE_SEND_PACING_SECONDS) == 2
+
+
+def test_batch_report_mixed_failure_distinguishes_policy_vs_technical(monkeypatch):
+    """El texto del reporte distingue un rechazo de política (nunca
+    reintentado, ofrece pivote) de una falla técnica agotada (ofrece
+    reintento) -- nunca infiere la distinción del texto de error, la lee
+    tal cual de las dos listas separadas de `summarize_batch`. Los
+    paneles sin `image_id` (los que fallaron) no rompen el álbum.
+    """
+    _write_fixture_images("img_1")
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda batch_id: _batch_summary(
+            day_count=2,
+            stage_counts={"finalized": 1, "needs_attention": 2},
+            needs_attention_policy_rejection=[
+                {"day_index": 1, "panel": "43R", "error": "policy"}
+            ],
+            needs_attention_technical=[
+                {"day_index": 2, "panel": "50", "error": "timeout", "attempts": 2}
+            ],
+            days=[
+                _batch_day_summary(1, {"43L": "img_1"}),
+            ],
+        ),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 2}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    text_args, _ = context.bot.send_message.call_args
+    report_text = text_args[1]
+    assert "rechazo de política" in report_text
+    assert "reintentos" in report_text
+
+    context.bot.send_media_group.assert_awaited_once()
+    _, media_kwargs = context.bot.send_media_group.call_args
+    assert len(media_kwargs["media"]) == 1
+
+
+def test_batch_report_total_failure_sends_text_but_no_album(monkeypatch):
+    """Un lote donde ningún panel produjo imagen manda el texto (con la
+    sección de fallas) pero nunca llama a send_media_group -- no hay
+    fotos que mandar.
+    """
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", lambda batch_id: None)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda batch_id: _batch_summary(
+            day_count=1,
+            stage_counts={"needs_attention": 3},
+            needs_attention_technical=[
+                {"day_index": 1, "panel": "43L", "error": "timeout", "attempts": 2},
+                {"day_index": 1, "panel": "43R", "error": "timeout", "attempts": 2},
+                {"day_index": 1, "panel": "50", "error": "timeout", "attempts": 2},
+            ],
+            days=[_batch_day_summary(1, {})],
+        ),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 1}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(
+        _run_and_await_background_tasks(
+            handle_message(update, context), context.application
+        )
+    )
+
+    context.bot.send_message.assert_awaited_once()
+    context.bot.send_media_group.assert_not_awaited()
+
+
+def test_batch_report_does_not_block_the_turn(monkeypatch):
+    """Mismo criterio de no bloqueo que
+    test_materialize_batch_gallery_success_does_not_block_the_turn, ahora
+    para el envío del reporte proactivo: el turno retorna (y el reporte
+    todavía no se manda) mucho antes de que un corredor lento termine.
+    """
+    _write_fixture_images("img_1")
+
+    def slow_run_draft_stage(batch_id):
+        time.sleep(0.2)
+
+    monkeypatch.setattr(telegram_bot, "run_draft_stage", slow_run_draft_stage)
+    monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda batch_id: _batch_summary(days=[_batch_day_summary(1, {"43L": "img_1"})]),
+    )
+    runner, session_service, _ = _build_runner_with_fake_run_async(
+        [
+            [
+                _materialize_batch_gallery_response_event(
+                    {"batch_id": "batch_abc123", "day_count": 1}
+                ),
+                _text_event("lote guardado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    start = time.monotonic()
+    finished_at = []
+    report_sent_before_turn_finished = []
+
+    async def run_and_record():
+        await handle_message(update, context)
+        finished_at.append(time.monotonic() - start)
+        report_sent_before_turn_finished.append(
+            context.bot.send_message.await_count > 0
+        )
+
+    asyncio.run(run_and_record())
+
+    assert finished_at[0] < 0.1
+    assert report_sent_before_turn_finished == [False]
+    _final_reply(update).assert_awaited_once()
+
+
+def test_send_batch_report_resumes_without_resending_already_delivered_parts(
+    monkeypatch,
+):
+    """Si `_send_batch_report` falla a mitad de camino (p. ej. el segundo
+    álbum de varios revienta por un error de red real de Telegram), una
+    reinvocación posterior -- la que dispara `reconcile_batches_on_startup`
+    tras un reinicio del bot -- no debe volver a mandar el texto ni los
+    álbumes que ya se entregaron con éxito antes de la falla. Antes de
+    este fix, `_send_batch_report` no persistía ningún progreso: una
+    reinvocación repetía el mensaje de texto y TODOS los álbumes desde
+    cero, duplicando lo que el usuario ya había recibido.
+    """
+    _write_fixture_images("img_1", "img_2")
+    batch_id = batch_store.materialize_batch(
+        "Faroles",
+        [
+            batch_store.ApprovedDay(
+                day_index=1,
+                mode="independiente",
+                sub_group="Grupo 1",
+                prompts={"43L": "a", "43R": "b", "50": "c"},
+            )
+        ],
+    )
+    # _BATCH_ALBUM_PAGE_SIZE=1 fuerza 2 álbumes con solo 2 imágenes, sin
+    # necesitar un lote real de más de 10 paneles.
+    monkeypatch.setattr(telegram_bot, "_BATCH_ALBUM_PAGE_SIZE", 1)
+    monkeypatch.setattr(
+        telegram_bot,
+        "summarize_batch",
+        lambda _batch_id: _batch_summary(
+            days=[_batch_day_summary(1, {"43L": "img_1", "43R": "img_2"})]
+        ),
+    )
+    bot = _make_bot()
+    sent_albums = []
+    calls_before_failure = {"n": 0}
+
+    async def flaky_send_media_group(*, chat_id, media):
+        calls_before_failure["n"] += 1
+        if calls_before_failure["n"] == 2:
+            raise RuntimeError("network blip")
+        sent_albums.append(media)
+
+    bot.send_media_group = AsyncMock(side_effect=flaky_send_media_group)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(telegram_bot._send_batch_report(bot, 42, batch_id))
+
+    assert bot.send_message.await_count == 1
+    assert len(sent_albums) == 1  # solo el álbum 1 se entregó antes de la falla
+
+    # Reinvocación (simula la reanudación tras un reinicio real del bot).
+    asyncio.run(telegram_bot._send_batch_report(bot, 42, batch_id))
+
+    assert bot.send_message.await_count == 1  # texto NO reenviado
+    assert len(sent_albums) == 2  # solo el álbum 2 (el pendiente) se mandó ahora
 
 
 def _make_revert_callback_update_and_context(

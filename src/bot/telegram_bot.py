@@ -31,6 +31,7 @@ import logging
 import os
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,7 +61,8 @@ from telegram.ext import filters as tg_filters
 
 from agents.tu_arte_mi_arte.agent import root_agent
 from bot import preview_store, session_store
-from engine import tv_deploy
+from engine import batch_store, tv_deploy
+from engine.batch import run_draft_stage, run_finalize_stage, summarize_batch
 from engine.generation import IMAGES_DIR
 
 _logger = logging.getLogger(__name__)
@@ -106,7 +108,20 @@ PARTIAL_DEPLOY_WARNING_TEXT = (
     "{failed} falló. La pared quedó inconsistente — ¿revertimos las "
     "pantallas que sí cambiaron para dejarlas como estaban antes?"
 )
+RECONCILE_RESUME_TEXT = (
+    "🔄 El bot se reinició mientras tu galería *{theme}* seguía "
+    "procesándose — retomando desde donde se quedó, sin perder lo ya "
+    "logrado. Te aviso en cuanto termine."
+)
+RECONCILE_LEGACY_TEXT = (
+    "⚠️ Se encontró un lote de galería sin terminar (*{theme}*, "
+    "`{batch_id}`) de antes de que el bot supiera a qué chat avisar — no "
+    "se puede retomar automáticamente. Si sigue interesando, hay que "
+    "pedirlo de nuevo."
+)
 _TYPING_INTERVAL_SECONDS = 4.0
+_PROACTIVE_SEND_PACING_SECONDS = 1.0
+_BATCH_ALBUM_PAGE_SIZE = 10
 
 RESET_KEYBOARD = ReplyKeyboardMarkup(
     [[RESET_BUTTON_TEXT]], resize_keyboard=True, is_persistent=True
@@ -336,6 +351,283 @@ def _extract_deploy_results(events: list) -> dict | None:
     return result
 
 
+def _extract_materialized_batch_ids(events: list) -> list[str]:
+    """Devuelve el `batch_id` de cada llamada exitosa a
+    `materialize_batch_gallery` en la corrida, en el orden en que
+    ocurrieron -- lista vacía si esa tool no se llamó (o siempre falló) en
+    este turno. Mismo patrón de caminar `event.content.parts` que
+    `_extract_deploy_results`.
+
+    SKILL.md instruye al modelo a llamar esta tool una sola vez por lote
+    confirmado, pero nada a nivel de código lo impide -- si el modelo la
+    llama más de una vez en el mismo turno (p. ej. tras una respuesta
+    ambigua de una tool), cada llamada exitosa ya materializó una fila
+    real en SQLite y necesita su propio `chat_id`/corredor de fondo; una
+    versión anterior de esta función solo devolvía la última, dejando
+    cualquier lote anterior huérfano (`chat_id=NULL` para siempre,
+    confundido después con un lote legado por
+    `reconcile_batches_on_startup`).
+    """
+    batch_ids: list[str] = []
+    for event_ in events:
+        if not event_.content or not event_.content.parts:
+            continue
+        for part in event_.content.parts:
+            if (
+                part.function_response
+                and part.function_response.name == "materialize_batch_gallery"
+            ):
+                data = part.function_response.response or {}
+                batch_id = data.get("batch_id")
+                if "error" not in data and batch_id is not None:
+                    batch_ids.append(batch_id)
+    return batch_ids
+
+
+def _format_batch_report_text(summary: dict) -> str:
+    """Redacta el texto del reporte final de un lote a partir de
+    `engine.batch.summarize_batch` (dev_plan_phase_2.md §3.2). Es
+    determinístico, no redactado por el LLM -- no hay un turno de agente
+    corriendo cuando el corredor de fondo termina, mismo principio que el
+    estimado de tiempo de §2.4. Nunca infiere la distinción
+    policy_rejection vs. falla técnica del texto de error: la lee tal
+    cual de las dos listas ya separadas que produce `summarize_batch`.
+
+    Un lote sin ningún `needs_attention` produce un mensaje simple de
+    éxito, sin la sección de fallas -- no generalizar el peor caso ni
+    anunciar fallas que no existieron.
+    """
+    lines = [
+        f"🖼️ Tu galería de *{summary['theme']}* ({summary['day_count']} días) "
+        "ya está lista.",
+    ]
+
+    policy_failures = summary["needs_attention_policy_rejection"]
+    technical_failures = summary["needs_attention_technical"]
+
+    if not policy_failures and not technical_failures:
+        lines.append("Todos los paneles se generaron y finalizaron con éxito.")
+        return "\n\n".join(lines)
+
+    succeeded = sum(
+        count
+        for stage, count in summary["stage_counts"].items()
+        if stage != "needs_attention"
+    )
+    lines.append(
+        f"{succeeded} panel(es) se lograron. "
+        f"{len(policy_failures) + len(technical_failures)} necesitan tu atención:"
+    )
+
+    if policy_failures:
+        lines.append(
+            "\n".join(
+                f"❌ Día {failure['day_index']} panel {failure['panel']}: rechazo de "
+                "política, no se reintentó -- considera cambiar el tema de ese panel."
+                for failure in policy_failures
+            )
+        )
+    if technical_failures:
+        lines.append(
+            "\n".join(
+                f"⚠️ Día {failure['day_index']} panel {failure['panel']}: se agotaron "
+                "los reintentos -- puedes pedir que se reintente."
+                for failure in technical_failures
+            )
+        )
+
+    return "\n\n".join(lines)
+
+
+def _batch_report_albums(summary: dict) -> list[list[InputMediaPhoto]]:
+    """Arma los álbumes de fotos del reporte final de un lote, paginados a
+    lo más `_BATCH_ALBUM_PAGE_SIZE` fotos por álbum (Requisito duro #8,
+    dev_plan_phase_2.md §3.2). Recorre los días en orden y junta los
+    `image_id` reales (paneles en `needs_attention` sin imagen se saltan
+    -- nunca revienta por `image_id=None`). Mismo patrón de lectura de
+    bytes que `_panels_album`: nunca un `Path` crudo a `InputMediaPhoto`.
+    Solo la primera foto del primer álbum lleva caption; el detalle por
+    día/panel ya vive en el texto del reporte.
+    """
+    image_ids = [
+        panel["image_id"]
+        for day in summary["days"]
+        for panel in day["panels"].values()
+        if panel["image_id"] is not None
+    ]
+
+    albums = []
+    for page_start in range(0, len(image_ids), _BATCH_ALBUM_PAGE_SIZE):
+        page = image_ids[page_start : page_start + _BATCH_ALBUM_PAGE_SIZE]
+        albums.append(
+            [
+                InputMediaPhoto(
+                    media=(IMAGES_DIR / f"{image_id}.jpg").read_bytes(),
+                    caption=(
+                        _to_markdown_v2(PANELS_ALBUM_CAPTION)
+                        if page_start == 0 and index == 0
+                        else None
+                    ),
+                    parse_mode=(
+                        ParseMode.MARKDOWN_V2
+                        if page_start == 0 and index == 0
+                        else None
+                    ),
+                )
+                for index, image_id in enumerate(page)
+            ]
+        )
+    return albums
+
+
+async def _send_batch_report(bot: object, chat_id: int, batch_id: str) -> None:
+    """Manda el reporte proactivo final de un lote (PRD §15.3 paso 9,
+    §15.6, dev_plan_phase_2.md §3.2): un mensaje de texto con el resumen
+    seguido de los álbumes de fotos paginados, nunca como respuesta de
+    turno (`_deliver_turn_result` no aplica aquí -- no hay turno activo
+    cuando el corredor de fondo termina).
+
+    Respeta el límite de ~1 mensaje/segundo de la API de Telegram
+    (Requisito duro #8) pausando `_PROACTIVE_SEND_PACING_SECONDS` antes de
+    cada envío después del primero -- incluyendo antes del primer álbum,
+    para separarlo del mensaje de texto.
+
+    Reanudable (hallazgo de code review posterior a 3.3): antes de mandar
+    el texto o cada álbum, consulta `batch_store.get_batch_report_progress`
+    y se salta lo que ya se entregó con éxito en una invocación anterior
+    de esta misma función -- si el proceso muere a mitad de camino (texto
+    ya mandado, álbum 2 de 3 falla por un error real de red de Telegram),
+    la reinvocación disparada por `reconcile_batches_on_startup` continúa
+    justo donde se quedó en vez de repetir el reporte completo desde cero.
+    """
+    summary = summarize_batch(batch_id)
+    text_already_sent, albums_already_sent = batch_store.get_batch_report_progress(
+        batch_id
+    )
+    if not text_already_sent:
+        await bot.send_message(  # type: ignore[attr-defined]
+            chat_id,
+            _to_markdown_v2(_format_batch_report_text(summary)),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        batch_store.mark_batch_report_text_sent(batch_id)
+
+    for album in _batch_report_albums(summary)[albums_already_sent:]:
+        await asyncio.sleep(_PROACTIVE_SEND_PACING_SECONDS)
+        await bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)  # type: ignore[attr-defined]
+        await bot.send_media_group(chat_id=chat_id, media=album)  # type: ignore[attr-defined]
+        batch_store.mark_batch_report_album_sent(batch_id)
+
+
+async def _run_batch_engine_in_background(
+    batch_id: str, bot: object, chat_id: int
+) -> None:
+    """Corre el corredor completo de un lote recién confirmado (draft 1K
+    -> finalización 4K, PRD §15.3 paso 8) fuera del turno de Telegram que
+    lo disparó (dev_plan_phase_2.md §3.1, requisito duro #7: confirmar un
+    lote nunca bloquea el turno). `run_draft_stage`/`run_finalize_stage`
+    (Etapa 2, ya probados) son funciones síncronas que pueden tardar
+    minutos contra la API real de Gemini -- se corren en un hilo aparte
+    (mismo patrón que `revert_command_handler` con `tv_deploy.revert_panels`)
+    para no bloquear el loop de eventos del bot mientras corren.
+
+    Al terminar, manda el reporte proactivo (§3.2) al chat que confirmó el
+    lote. Marca `batch.status='running'` al arrancar y `'reported'` justo
+    después de que el reporte se manda (dev_plan_phase_2.md §3.3) -- es la
+    misma función tanto para un arranque en caliente (recién confirmado)
+    como para una reanudación tras un reinicio del bot
+    (`reconcile_batches_on_startup`), sin una segunda copia de esta
+    lógica: `run_draft_stage`/`run_finalize_stage` ya son idempotentes
+    (§2.5), así que reinvocarlas sobre un lote a medias simplemente
+    continúa donde se quedó. Una excepción real que escape de aquí (no
+    capturada por el corredor, p. ej. un fallo de I/O o del propio envío
+    del reporte) se propaga a través de `Application.create_task`, que la
+    enruta a `global_error_handler` -- nunca desaparece en silencio; el
+    lote queda en `'running'`, y la próxima reconciliación al reiniciar lo
+    vuelve a recoger igual que uno recién materializado.
+    """
+    _logger.info("Corredor de lote arrancó en segundo plano: batch_id=%s", batch_id)
+    batch_store.set_batch_status(batch_id, "running")
+    await asyncio.to_thread(run_draft_stage, batch_id)
+    await asyncio.to_thread(run_finalize_stage, batch_id)
+    _logger.info("Corredor de lote terminó en segundo plano: batch_id=%s", batch_id)
+    await _send_batch_report(bot, chat_id, batch_id)
+    batch_store.set_batch_status(batch_id, "reported")
+
+
+async def reconcile_batches_on_startup(application: object) -> None:
+    """Al arrancar el bot, detecta cualquier lote que quedó en un estado no
+    terminal (`status != 'reported'`) por un reinicio/crash del proceso a
+    la mitad y lo reporta o reanuda -- nunca lo deja huérfano en silencio
+    (dev_plan_phase_2.md §3.3, requisito duro #6; PRD §15.6: `JobQueue`/
+    tareas en memoria de PTB no sobreviven un reinicio, por eso el estado
+    del lote vive en SQLite).
+
+    Para un lote con `chat_id` conocido: avisa que se está retomando y
+    dispara `_run_batch_engine_in_background` tal cual -- es la misma
+    función que arranca un lote recién confirmado, sin una rama de
+    "reanudación" separada, porque `run_draft_stage`/`run_finalize_stage`
+    ya son idempotentes (§2.5).
+
+    Para un lote sin `chat_id` (solo posible en filas de antes de esta
+    iteración, ver nota de migración en `batch_store`): nunca se intenta
+    reanudar -- no hay a quién reportarle el resultado, y arrancar el
+    corredor gastaría cuota real de la API de Gemini por un resultado que
+    no se puede entregar. Solo se avisa por broadcast a los usuarios
+    permitidos y se deja un warning en el log.
+
+    Registrada vía `ApplicationBuilder().post_init(...)` -- PTB la llama
+    una sola vez, después de inicializar la `Application` y antes de
+    arrancar el polling, con `application.bot_data` ya poblado. En este
+    punto `Application.running` todavía es `False`, así que
+    `application.create_task` emite un `UserWarning` real ("won't be
+    automatically awaited") -- se suprime a propósito: el estado del lote
+    vive en SQLite, no en la tarea, así que si el proceso vuelve a cerrarse
+    antes de que termine, el siguiente arranque la vuelve a recoger igual.
+    """
+    allowed_user_ids = application.bot_data.get("allowed_user_ids", frozenset())  # type: ignore[attr-defined]
+    for batch in batch_store.list_non_terminal_batches():
+        if batch.chat_id is not None:
+            _logger.info(
+                "Reconciliación al reiniciar: retomando batch_id=%s (chat_id=%s)",
+                batch.batch_id,
+                batch.chat_id,
+            )
+            await application.bot.send_message(  # type: ignore[attr-defined]
+                batch.chat_id,
+                _to_markdown_v2(RECONCILE_RESUME_TEXT.format(theme=batch.theme)),
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*won't be automatically awaited.*",
+                    category=UserWarning,
+                )
+                application.create_task(  # type: ignore[attr-defined]
+                    _run_batch_engine_in_background(
+                        batch.batch_id, application.bot, batch.chat_id  # type: ignore[attr-defined]
+                    )
+                )
+        else:
+            _logger.warning(
+                "Reconciliación al reiniciar: batch_id=%s no terminal sin "
+                "chat_id conocido (lote de antes de esta iteración) -- "
+                "avisando sin reanudar",
+                batch.batch_id,
+            )
+            for user_id in allowed_user_ids:
+                await application.bot.send_message(  # type: ignore[attr-defined]
+                    user_id,
+                    _to_markdown_v2(
+                        RECONCILE_LEGACY_TEXT.format(
+                            theme=batch.theme, batch_id=batch.batch_id
+                        )
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+
+
 def _partially_failed_tvs(deploy_results: dict) -> list[str]:
     """De un resultado de deploy_to_panels, devuelve los nombres de las TVs
     que sí se desplegaron con éxito, solo si el resultado es una falla
@@ -399,7 +691,12 @@ def _panels_album(preview: "_ComposedPreview") -> list[InputMediaPhoto]:
 
 
 async def _deliver_turn_result(
-    bot: object, chat_id: int, session_id: str, progress_message: object, events: list
+    application: object,
+    bot: object,
+    chat_id: int,
+    session_id: str,
+    progress_message: object,
+    events: list,
 ) -> None:
     """Por cada preview compuesto en la corrida: manda primero un álbum
     con las tres piezas por separado (detalle real de cada panel), luego
@@ -413,6 +710,17 @@ async def _deliver_turn_result(
     pantallas sí, otras no), manda además un aviso con un botón "↩️
     Revertir cambios" atado solo a las TVs que sí cambiaron — nunca a la
     que falló, porque esa nunca se tocó (dev_plan §3.5).
+
+    Si el turno materializó uno o más lotes de galería
+    (`materialize_batch_gallery`, dev_plan_phase_2.md §3.1 -- normalmente
+    uno solo por turno, pero nada a nivel de código impide que el modelo
+    la llame más de una vez), persiste primero a qué chat pertenece cada
+    uno (`batch_store.set_batch_chat_id`, §3.3 -- es lo único que le
+    permite a una reconciliación tras un reinicio saber a dónde reportar)
+    y luego dispara el corredor completo (draft -> finalización 4K) de
+    cada uno como tarea de fondo vía `application.create_task` — el turno
+    no espera a que terminen, cumpliendo el requisito duro #7 (confirmar
+    un lote nunca bloquea el turno de Telegram).
     """
     for preview in _extract_compose_previews(events):
         token = preview_store.new_token()
@@ -467,6 +775,12 @@ async def _deliver_turn_result(
                 reply_markup=_revert_keyboard(succeeded),
             )
 
+    for materialized_batch_id in _extract_materialized_batch_ids(events):
+        batch_store.set_batch_chat_id(materialized_batch_id, chat_id)
+        application.create_task(  # type: ignore[attr-defined]
+            _run_batch_engine_in_background(materialized_batch_id, bot, chat_id)
+        )
+
     reply_text = _final_text(events) or "Listo."
     await progress_message.edit_text(  # type: ignore[attr-defined]
         _to_markdown_v2(reply_text), parse_mode=ParseMode.MARKDOWN_V2
@@ -476,6 +790,7 @@ async def _deliver_turn_result(
 async def _run_and_deliver(
     runner: Runner,
     session_service: DatabaseSessionService,
+    application: object,
     bot: object,
     chat_id: int,
     user_id: str,
@@ -505,7 +820,9 @@ async def _run_and_deliver(
         events = await _run_turn_with_progress(
             runner, bot, chat_id, user_id, session_id, text
         )
-        await _deliver_turn_result(bot, chat_id, session_id, progress_message, events)
+        await _deliver_turn_result(
+            application, bot, chat_id, session_id, progress_message, events
+        )
     except Exception:
         _logger.exception("Turno falló para chat_id=%s", chat_id)
         await progress_message.edit_text(  # type: ignore[attr-defined]
@@ -618,6 +935,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _run_and_deliver(
         runner,
         session_service,
+        context.application,
         context.bot,
         chat_id,
         user_id,
@@ -704,6 +1022,7 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _run_and_deliver(
         runner,
         session_service,
+        context.application,
         context.bot,
         chat_id,
         str(chat_id),
@@ -868,8 +1187,19 @@ def build_application(token: str, allowed_user_ids: list[int]) -> Application:
     `CallbackQueryHandler` has no `filters=` parameter, so the whitelist
     check for the confirm button happens manually inside `confirm_handler`
     against `allowed_user_ids` stashed in `bot_data`.
+
+    `post_init(reconcile_batches_on_startup)` (dev_plan_phase_2.md §3.3):
+    PTB awaits this once, right after `Application.initialize()` and
+    before polling starts, with `bot_data["allowed_user_ids"]` already set
+    below -- the natural hook point to detect and resume/report any batch
+    gallery left mid-flight by a previous crash/restart.
     """
-    application = ApplicationBuilder().token(token).build()
+    application = (
+        ApplicationBuilder()
+        .token(token)
+        .post_init(reconcile_batches_on_startup)
+        .build()
+    )
     application.bot_data["runner"] = build_runner()
     application.bot_data["session_service"] = application.bot_data[
         "runner"

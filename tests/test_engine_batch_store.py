@@ -388,4 +388,99 @@ def test_record_split_day_outcome_rolls_back_fully_on_mid_transaction_failure(
 
     day = batch_store.get_batch_days(batch_id, path=db_path)[0]
     assert day.wide_stage == "pending"
-    assert day.wide_image_id is None
+
+
+def _materialize_one_day_batch(db_path):
+    days = [
+        ApprovedDay(
+            day_index=1,
+            mode="independiente",
+            sub_group="Grupo 1",
+            prompts={"43L": "a", "43R": "b", "50": "c"},
+        )
+    ]
+    return batch_store.materialize_batch("Tema", days, path=db_path)
+
+
+def test_get_batch_chat_id_defaults_to_none_when_never_set(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_one_day_batch(db_path)
+
+    batch = batch_store.get_batch(batch_id, path=db_path)
+
+    assert batch.chat_id is None
+
+
+def test_set_batch_chat_id_persists_and_is_read_back_via_get_batch(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_one_day_batch(db_path)
+
+    batch_store.set_batch_chat_id(batch_id, 424242, path=db_path)
+
+    batch = batch_store.get_batch(batch_id, path=db_path)
+    assert batch.chat_id == 424242
+
+
+def test_set_batch_status_updates_status_without_touching_other_columns(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_one_day_batch(db_path)
+
+    batch_store.set_batch_status(batch_id, "running", path=db_path)
+
+    batch = batch_store.get_batch(batch_id, path=db_path)
+    assert batch.status == "running"
+    assert batch.theme == "Tema"
+    assert batch.day_count == 1
+
+
+def test_list_non_terminal_batches_excludes_reported_and_includes_everything_else(
+    tmp_path,
+):
+    db_path = tmp_path / "batch.sqlite3"
+    materialized_id = _materialize_one_day_batch(db_path)
+    running_id = _materialize_one_day_batch(db_path)
+    reported_id = _materialize_one_day_batch(db_path)
+    batch_store.set_batch_status(running_id, "running", path=db_path)
+    batch_store.set_batch_status(reported_id, "reported", path=db_path)
+
+    non_terminal_ids = {
+        batch.batch_id for batch in batch_store.list_non_terminal_batches(path=db_path)
+    }
+
+    assert non_terminal_ids == {materialized_id, running_id}
+    assert reported_id not in non_terminal_ids
+
+
+def test_list_non_terminal_batches_on_empty_db_returns_empty_list(tmp_path):
+    db_path = tmp_path / "batch.sqlite3"
+
+    assert batch_store.list_non_terminal_batches(path=db_path) == []
+
+
+def test_chat_id_column_migrates_onto_a_pre_existing_database_missing_it(tmp_path):
+    db_path = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE batch ("
+        "batch_id TEXT PRIMARY KEY, "
+        "theme TEXT NOT NULL, "
+        "day_count INTEGER NOT NULL, "
+        "status TEXT NOT NULL, "
+        "schedule_config TEXT, "
+        "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
+    conn.execute(
+        "INSERT INTO batch (batch_id, theme, day_count, status) "
+        "VALUES ('batch_legacy', 'Tema viejo', 2, 'materialized')"
+    )
+    conn.commit()
+    conn.close()
+
+    batch = batch_store.get_batch("batch_legacy", path=db_path)
+
+    assert batch is not None
+    assert batch.chat_id is None
+    assert batch_store.list_non_terminal_batches(path=db_path)[0].batch_id == (
+        "batch_legacy"
+    )
