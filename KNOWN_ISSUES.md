@@ -96,3 +96,17 @@ fondo persiste con la nueva redacción.
 **Mitigación aplicada:** párrafo nuevo al inicio de `_BASE_INSTRUCTION` en `agent.py` — "Nunca termines un turno sin texto visible para el usuario, especialmente justo después de llamar una tool... una llamada de tool nunca es, por sí sola, una respuesta completa." Es una instrucción de mejor esfuerzo: puede reducir los casos en que el modelo *elige* terminar el turno tras solo la llamada a la tool, pero no puede prevenir una respuesta de la API con cero tokens de salida — esa causa está fuera del control de cualquier prompt. Cubierto solo por un test estructural (`test_root_agent_instruction_forbids_empty_text_after_a_tool_call` en `tests/test_agent_smoke.py`: el párrafo existe en la instrucción), no por un test de comportamiento real — no hay forma barata y determinística de forzar una respuesta vacía real del modelo bajo pytest.
 
 **Estado:** sin resolver de raíz — riesgo aceptado y documentado, mismo tratamiento que los issues #1 y #2 de este archivo. Si se observa que ocurre con más frecuencia de la esperada, reconsiderar la opción de reintento por código (`after_model_callback`) descartada arriba.
+
+---
+
+## 4. El modelo a veces no devuelve imagen (`finish_reason=NO_IMAGE`) sin ser un rechazo de política
+
+**Encontrado:** 2026-07-18, primer despliegue real en el Pi (`journalctl -u tu-arte-mi-arte.service`, sesión 17:08–18:18), usuario real por Telegram.
+
+**Repro:** durante `generate_set_diptico`, el panel 43R falló dos veces en la misma sesión (17:15:17 y 17:20:11) con `engine.generation` logueando `ERROR ... Respuesta sin partes de contenido (finish_reason=FinishReason.NO_IMAGE)`. No trae `policy_rejection: True` — es el camino de error genérico de la escalera de manejo de errores (PRD §7.9), no un rechazo real de política/derechos.
+
+**Qué pasó en la prueba:** en ambos casos el usuario simplemente reintentó (pidió el panel de nuevo) y la siguiente llamada a `generate_image` tuvo éxito. `root_agent` reportó el fallo del panel 43R sin bloquear los otros dos (`{'43L': 'ok', '43R': 'error'}`), consistente con el diseño de errores genéricos vs. `policy_rejection`.
+
+**Por qué importa:** ocurrió dos veces en una sola sesión de ~70 minutos con tráfico real — no es un caso aislado. Hoy la única mitigación es que el usuario reintente manualmente; no hay reintento automático en código (ver issue #3, mismo principio de no interceptar respuestas del modelo).
+
+**Estado:** sin resolver, v1 no bloqueada por esto — el flujo de error ya existente absorbe el caso sin colgar la conversación ni exponer un traceback crudo, y el reintento manual del usuario funcionó ambas veces. Si la frecuencia sube en producción, considerar si vale la pena un reintento automático acotado (p. ej. un solo retry silencioso) específicamente para `NO_IMAGE` sin `policy_rejection`, ya que ese caso no es una decisión editorial del modelo sino una falla vacía de la respuesta.
