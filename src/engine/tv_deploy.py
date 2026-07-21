@@ -111,11 +111,15 @@ def _delete_old_uploads(
     de despliegue.
     """
     try:
-        old_ids = [
-            item["content_id"]
-            for item in tv.available(category=_MY_PHOTOS_CATEGORY)
-            if item.get("content_id") != keep_content_id
-        ]
+        available = tv.available(category=_MY_PHOTOS_CATEGORY)
+        if keep_content_id is None:
+            old_ids = [item["content_id"] for item in available if "content_id" in item]
+        else:
+            old_ids = [
+                item["content_id"]
+                for item in available
+                if item.get("content_id") not in (None, keep_content_id)
+            ]
         if old_ids:
             tv.delete_list(old_ids)
     except _CONNECTION_ERRORS as error:
