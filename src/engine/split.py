@@ -50,6 +50,10 @@ def split_wide_image(image_id: str, gap_fraction: float) -> dict:
     franja física de marco+hueco, PRD §7.3). Devuelve {'left': {...},
     'right': {...}} o {'error': ...} si no existe la imagen fuente.
     """
+    if not (0 <= gap_fraction < 1):
+        _logger.warning("gap_fraction fuera de rango: %s", gap_fraction)
+        return {"error": f"gap_fraction fuera de rango (0, 1): {gap_fraction!r}."}
+
     source_path = generation.IMAGES_DIR / f"{image_id}.jpg"
     if not source_path.exists():
         _logger.warning("Imagen fuente no encontrada para split: image_id=%s", image_id)
