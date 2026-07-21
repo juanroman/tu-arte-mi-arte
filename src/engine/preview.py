@@ -96,6 +96,10 @@ def compose_preview(image_ids: dict[str, str]) -> dict:
             _logger.warning("Panel desconocido en config/room.toml: %s", panel_name)
             return {"error": f"Panel desconocido en config/room.toml: {panel_name!r}."}
 
+        invalid = generation.validate_image_id(image_id)
+        if invalid is not None:
+            return invalid
+
         panel_path = generation.IMAGES_DIR / f"{image_id}.jpg"
         if not panel_path.exists():
             _logger.warning(

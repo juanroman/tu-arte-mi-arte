@@ -6,6 +6,7 @@ reusable from any interface (adk web today, Telegram in Etapa 2).
 
 import io
 import logging
+import re
 import uuid
 from pathlib import Path
 
@@ -51,8 +52,31 @@ _POLICY_BLOCK_REASONS = {
 }
 
 
+# Word characters only (letters, digits, underscore) after the img_
+# prefix: blocks path-traversal-shaped values (any '.', '/', etc.) without
+# being as narrow as _new_image_id()'s own 8-hex-char output, since plenty
+# of tests across the suite construct image_ids as readable fixture names
+# (e.g. "img_left", "img_old") rather than via _new_image_id() itself.
+_IMAGE_ID_PATTERN = re.compile(r"^img_\w+$")
+
+
 def _new_image_id() -> str:
     return f"img_{uuid.uuid4().hex[:8]}"
+
+
+def validate_image_id(image_id: str) -> dict | None:
+    """Checks `image_id` has a safe shape before it's ever joined into a
+    filesystem path. `image_id` values consumed here often come straight
+    from LLM tool-call arguments (edit_image, split_wide_image,
+    compose_preview, deploy_image_to_tv) with no format check otherwise —
+    a crafted value shaped like a path traversal sequence could in
+    principle escape IMAGES_DIR. Returns an error dict if invalid, `None`
+    if valid.
+    """
+    if not _IMAGE_ID_PATTERN.fullmatch(image_id):
+        _logger.warning("image_id con formato inválido: %r", image_id)
+        return {"error": f"image_id inválido: {image_id!r}."}
+    return None
 
 
 def _save_image_bytes(data: bytes) -> dict:
@@ -131,6 +155,10 @@ def _load_reference(image_id: str) -> types.Part | dict:
     """Loads a previously saved image as a reference Part for image-to-image
     calls, or an error dict if no image exists under that image_id.
     """
+    invalid = validate_image_id(image_id)
+    if invalid is not None:
+        return invalid
+
     reference_path = IMAGES_DIR / f"{image_id}.jpg"
     if not reference_path.exists():
         _logger.warning("Referencia no encontrada: image_id=%s", image_id)

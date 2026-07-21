@@ -178,6 +178,20 @@ def test_deploy_image_to_tv_reports_missing_image(tmp_path, monkeypatch):
     assert "error" in result
 
 
+def test_deploy_image_to_tv_rejects_malformed_image_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+
+    def _fail_resolve(name):
+        raise AssertionError("resolve_tv_host should not run for an invalid image_id")
+
+    monkeypatch.setattr(tv_deploy, "resolve_tv_host", _fail_resolve)
+
+    result = deploy_image_to_tv("43L", "../../../etc/passwd")
+
+    assert "error" in result
+    assert "inválido" in result["error"]
+
+
 def test_deploy_image_to_tv_converts_tv_not_found_to_error_dict(tmp_path, monkeypatch):
     _write_fixture_image(tmp_path, "img_0001")
     monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)

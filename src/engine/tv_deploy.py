@@ -151,6 +151,10 @@ def _resolve_deploy_target(tv_name: str, image_id: str) -> tuple[Path, str, str]
     lanza. Compartido por `deploy_image_to_tv`/`upload_image_to_category`
     para no duplicar estas ~15 líneas entre ambas.
     """
+    invalid = generation.validate_image_id(image_id)
+    if invalid is not None:
+        return invalid
+
     image_path = generation.IMAGES_DIR / f"{image_id}.jpg"
     if not image_path.exists():
         return {"error": f"No existe una imagen con image_id={image_id!r}."}

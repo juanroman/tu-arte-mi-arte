@@ -54,6 +54,10 @@ def split_wide_image(image_id: str, gap_fraction: float) -> dict:
         _logger.warning("gap_fraction fuera de rango: %s", gap_fraction)
         return {"error": f"gap_fraction fuera de rango (0, 1): {gap_fraction!r}."}
 
+    invalid = generation.validate_image_id(image_id)
+    if invalid is not None:
+        return invalid
+
     source_path = generation.IMAGES_DIR / f"{image_id}.jpg"
     if not source_path.exists():
         _logger.warning("Imagen fuente no encontrada para split: image_id=%s", image_id)

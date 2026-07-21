@@ -87,6 +87,21 @@ def test_edit_image_reports_missing_reference(tmp_path, monkeypatch):
     assert "error" in result
 
 
+def test_edit_image_rejects_malformed_image_id(tmp_path, monkeypatch):
+    """image_id flows straight from an LLM tool-call argument into a Path
+    join with no format check -- a crafted value shaped like
+    "../../../etc/passwd" could in principle escape IMAGES_DIR. Validate
+    the format before ever touching the filesystem, distinct from the
+    generic "no existe" 404 for a well-formed but absent image_id.
+    """
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+
+    result = edit_image("more autumnal", "../../../etc/passwd")
+
+    assert "error" in result
+    assert "inválido" in result["error"]
+
+
 @requires_gemini_key
 def test_generate_final_high_res_produces_a_new_image():
     draft = generate_image("a small red apple on a wooden table", "1:1")
