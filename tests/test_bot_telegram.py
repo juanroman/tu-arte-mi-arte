@@ -900,6 +900,62 @@ def test_partial_finalize_failure_does_not_rotate_session():
     assert pointer_after.session_id == session_id_used
 
 
+def test_finalize_success_with_partial_deploy_failure_does_not_rotate_session():
+    """A turn can finish finalize_high_res cleanly and still fail to
+    actually hang the art (deploy_to_panels partially fails) -- the
+    commission isn't done, so the session must stay open for a retry, same
+    principle as test_partial_finalize_failure_does_not_rotate_session but
+    for the deploy step that runs automatically right after finalize.
+    """
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
+        [
+            [
+                _finalize_response_event({"image_id": "img_final1"}),
+                _deploy_to_panels_response_event(
+                    {
+                        "43L": {"content_id": "MY_43L"},
+                        "43R": {"error": "no se pudo conectar"},
+                        "50": {"content_id": "MY_50"},
+                    }
+                ),
+                _text_event("desplegado parcialmente"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    pointer_after = session_store.get_current_session(42)
+    _, session_id_used, _ = fake_run_async.calls[0]
+    assert pointer_after.session_id == session_id_used
+
+
+def test_finalize_success_with_full_deploy_success_still_rotates_session():
+    runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
+        [
+            [
+                _finalize_response_event({"image_id": "img_final1"}),
+                _deploy_to_panels_response_event(
+                    {
+                        "43L": {"content_id": "MY_43L"},
+                        "43R": {"content_id": "MY_43R"},
+                        "50": {"content_id": "MY_50"},
+                    }
+                ),
+                _text_event("desplegado"),
+            ]
+        ]
+    )
+    update, context = _make_update_and_context(runner, session_service, chat_id=42)
+
+    asyncio.run(handle_message(update, context))
+
+    pointer_after = session_store.get_current_session(42)
+    _, session_id_used, _ = fake_run_async.calls[0]
+    assert pointer_after.session_id != session_id_used
+
+
 def test_turn_without_finalize_does_not_rotate_session():
     runner, session_service, fake_run_async = _build_runner_with_fake_run_async(
         [[_text_event("listo, img_123")]]

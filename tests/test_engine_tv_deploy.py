@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from PIL import Image
 from samsungtvws import exceptions
 
-from engine import deploy_history, generation, tv_deploy
+from engine import deploy_history, generation, tv_deploy, tv_discovery
 from engine.tv_deploy import (
     TvDeployConfig,
     clear_photos_category,
@@ -399,6 +399,59 @@ def test_deploy_image_to_tv_returns_error_instead_of_raising_for_legacy_matte_co
     assert fake.uploaded == []
 
 
+def test_deploy_image_to_tv_returns_error_instead_of_raising_when_tvs_config_corrupt(
+    tmp_path, monkeypatch
+):
+    """A corrupt config/tvs.toml (e.g. truncated mid-write by a crash — see
+    tv_discovery._save_last_known_ip) must surface as {'error': ...}, not
+    propagate tomllib.TOMLDecodeError out of a function documented as
+    'nunca lanza'. resolve_tv_host is NOT stubbed here (unlike
+    _install_fake's default) so the real load_tv_configs runs against the
+    corrupt file.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+    monkeypatch.setattr(tv_deploy, "DATA_DIR", tmp_path)
+    corrupt_config = tmp_path / "tvs.toml"
+    corrupt_config.write_text("not valid toml [")
+    monkeypatch.setattr(tv_discovery, "CONFIG_PATH", corrupt_config)
+
+    result = deploy_image_to_tv("43L", "img_0001")
+
+    assert "error" in result
+
+
+def test_deploy_image_to_tv_returns_error_instead_of_raising_when_tvs_config_missing(
+    tmp_path, monkeypatch
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+    monkeypatch.setattr(tv_deploy, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(tv_discovery, "CONFIG_PATH", tmp_path / "does_not_exist.toml")
+
+    result = deploy_image_to_tv("43L", "img_0001")
+
+    assert "error" in result
+
+
+def test_deploy_image_to_tv_returns_error_when_tv_deploy_config_corrupt(
+    tmp_path, monkeypatch
+):
+    """Same failure mode as the tvs.toml case above, but for
+    config/tv_deploy.toml (the matte config) -- also loaded with a bare
+    tomllib.load with no TOMLDecodeError handling around it.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    _install_fake(monkeypatch, tmp_path)
+    corrupt_config = tmp_path / "tv_deploy.toml"
+    corrupt_config.write_text("not valid toml [")
+    monkeypatch.setattr(tv_deploy, "CONFIG_PATH", corrupt_config)
+
+    result = deploy_image_to_tv("43L", "img_0001")
+
+    assert "error" in result
+
+
 def test_deploy_image_to_tv_passes_timeout_to_samsungtvart(tmp_path, monkeypatch):
     _write_fixture_image(tmp_path, "img_0001")
     monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
@@ -660,6 +713,21 @@ def test_upload_image_to_category_uses_the_matte_configured_for_that_tv(
     ]
 
 
+def test_upload_image_to_category_returns_error_when_tvs_config_corrupt(
+    tmp_path, monkeypatch
+):
+    _write_fixture_image(tmp_path, "img_0001")
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+    monkeypatch.setattr(tv_deploy, "DATA_DIR", tmp_path)
+    corrupt_config = tmp_path / "tvs.toml"
+    corrupt_config.write_text("not valid toml [")
+    monkeypatch.setattr(tv_discovery, "CONFIG_PATH", corrupt_config)
+
+    result = upload_image_to_category("43L", "img_0001")
+
+    assert "error" in result
+
+
 def test_upload_image_to_category_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
     """La función nueva comparte el mismo watchdog extraído
     (_run_with_deploy_watchdog) que deploy_image_to_tv -- una TV sin
@@ -760,6 +828,19 @@ def test_clear_photos_category_reports_unsupported_tv(tmp_path, monkeypatch):
     assert fake.deleted == []
 
 
+def test_clear_photos_category_returns_error_instead_of_raising_when_tvs_config_corrupt(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tv_deploy, "DATA_DIR", tmp_path)
+    corrupt_config = tmp_path / "tvs.toml"
+    corrupt_config.write_text("not valid toml [")
+    monkeypatch.setattr(tv_discovery, "CONFIG_PATH", corrupt_config)
+
+    result = clear_photos_category("43L")
+
+    assert "error" in result
+
+
 def test_clear_photos_category_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
     """Comparte el mismo watchdog extraído (_run_with_deploy_watchdog) que
     el resto de las funciones de este módulo.
@@ -843,6 +924,19 @@ def test_configure_batch_rotation_reports_unsupported_tv(tmp_path, monkeypatch):
 
     assert "error" in result
     assert fake.slideshow_status_calls == []
+
+
+def test_configure_batch_rotation_returns_error_when_tvs_config_corrupt(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tv_deploy, "DATA_DIR", tmp_path)
+    corrupt_config = tmp_path / "tvs.toml"
+    corrupt_config.write_text("not valid toml [")
+    monkeypatch.setattr(tv_discovery, "CONFIG_PATH", corrupt_config)
+
+    result = configure_batch_rotation("43L", 1440, False)
+
+    assert "error" in result
 
 
 def test_configure_batch_rotation_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
