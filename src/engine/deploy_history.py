@@ -13,12 +13,22 @@ interfaz que lo dispare (Telegram, un comando, o el agente).
 
 import contextlib
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 DB_PATH = (
     Path(__file__).resolve().parent.parent.parent / "data" / "tv_deploy_history.sqlite3"
 )
+
+# Guards the read-modify-write below: record_deploy reads the current row
+# and writes the shifted current/previous pair as two separate connections,
+# not one transaction. Without serializing, two concurrent calls for the
+# same tv_name (a deploy and a revert issued in quick succession) can both
+# read the same stale snapshot and each commit a write based on it -- the
+# second commit silently discards whichever image_id the first call was
+# about to shift into `previous`.
+_record_deploy_lock = threading.Lock()
 
 
 @dataclass
@@ -55,17 +65,23 @@ def get_history(tv_name: str, path: Path | None = None) -> DeployHistory | None:
 
 def record_deploy(tv_name: str, image_id: str, path: Path | None = None) -> None:
     """Registra `image_id` como el nuevo `current` de `tv_name`, desplazando
-    el `current` anterior (si había uno) a `previous`.
+    el `current` anterior (si había uno) a `previous`. El read-modify-write
+    (leer el `current` vigente, luego escribirlo desplazado a `previous`) se
+    serializa con un lock: dos llamadas concurrentes para el mismo
+    `tv_name` (p. ej. un deploy y un revert seguidos, o un doble-tap en
+    Telegram) podrían, sin el lock, leer el mismo snapshot y hacer que la
+    segunda en escribir pise silenciosamente el resultado de la primera.
     """
-    existing = get_history(tv_name, path)
-    new_previous = existing.current_image_id if existing else None
-    with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
-        conn.execute(
-            "INSERT INTO tv_deploy_history "
-            "(tv_name, current_image_id, previous_image_id) "
-            "VALUES (?, ?, ?) "
-            "ON CONFLICT(tv_name) DO UPDATE SET "
-            "current_image_id = excluded.current_image_id, "
-            "previous_image_id = excluded.previous_image_id",
-            (tv_name, image_id, new_previous),
-        )
+    with _record_deploy_lock:
+        existing = get_history(tv_name, path)
+        new_previous = existing.current_image_id if existing else None
+        with contextlib.closing(_connect(path or DB_PATH)) as conn, conn:
+            conn.execute(
+                "INSERT INTO tv_deploy_history "
+                "(tv_name, current_image_id, previous_image_id) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(tv_name) DO UPDATE SET "
+                "current_image_id = excluded.current_image_id, "
+                "previous_image_id = excluded.previous_image_id",
+                (tv_name, image_id, new_previous),
+            )
