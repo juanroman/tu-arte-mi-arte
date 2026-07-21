@@ -4,6 +4,7 @@ No dependency on google.adk: these functions are testable in isolation and
 reusable from any interface (adk web today, Telegram in Etapa 2).
 """
 
+import io
 import logging
 import uuid
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 import httpx
 from google import genai
 from google.genai import errors, types
+from PIL import Image
 
 _logger = logging.getLogger(__name__)
 
@@ -53,15 +55,22 @@ def _new_image_id() -> str:
     return f"img_{uuid.uuid4().hex[:8]}"
 
 
-def _save_image_bytes(data: bytes, mime_type: str) -> dict:
+def _save_image_bytes(data: bytes) -> dict:
     """Saves raw image bytes to disk under a fresh image_id and returns its
     metadata. Shared by Gemini-response saves and local (Pillow) saves.
+
+    Re-encodes to JPEG regardless of the source format: every consumer of
+    a saved image_id (split.py, preview.py, tv_deploy.py, telegram_bot.py)
+    hardcodes the .jpg extension and image/jpeg mime type, so the on-disk
+    bytes must always actually be JPEG rather than trusting whatever
+    format the caller claims to have handed us.
     """
     image_id = _new_image_id()
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     path = IMAGES_DIR / f"{image_id}.jpg"
-    path.write_bytes(data)
-    return {"image_id": image_id, "path": str(path), "mime_type": mime_type}
+    with Image.open(io.BytesIO(data)) as img:
+        img.convert("RGB").save(path, format="JPEG")
+    return {"image_id": image_id, "path": str(path), "mime_type": "image/jpeg"}
 
 
 def _save_response_image(response: types.GenerateContentResponse) -> dict:
@@ -113,9 +122,7 @@ def _save_response_image(response: types.GenerateContentResponse) -> dict:
         )
         return {"error": "El modelo no devolvió una imagen."}
 
-    result = _save_image_bytes(
-        part.inline_data.data, part.inline_data.mime_type or "image/jpeg"
-    )
+    result = _save_image_bytes(part.inline_data.data)
     _logger.debug("Imagen guardada: image_id=%s", result["image_id"])
     return result
 

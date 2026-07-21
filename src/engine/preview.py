@@ -117,7 +117,7 @@ def compose_preview(image_ids: dict[str, str]) -> dict:
             )
         canvas.paste(fitted, (box[0], box[1]))
 
-    return _save_image_bytes(_encode_jpeg(canvas), "image/jpeg")
+    return _save_image_bytes(_encode_jpeg(canvas))
 
 
 def _encode_jpeg(image: Image.Image) -> bytes:

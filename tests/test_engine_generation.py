@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 from pathlib import Path
@@ -5,6 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 from google.genai import errors, types
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -104,6 +106,46 @@ def test_generate_final_high_res_reports_missing_reference(tmp_path, monkeypatch
     result = generate_final_high_res("img_does_not_exist")
 
     assert "error" in result
+
+
+def _response_with_inline_image(data: bytes, mime_type: str):
+    part = types.Part(inline_data=types.Blob(data=data, mime_type=mime_type))
+    return types.GenerateContentResponse(
+        candidates=[
+            types.Candidate(
+                finish_reason=types.FinishReason.STOP,
+                content=types.Content(parts=[part]),
+            )
+        ]
+    )
+
+
+def test_generate_image_normalizes_png_response_bytes_to_real_jpeg(
+    tmp_path, monkeypatch
+):
+    """The model's reported mime_type is trusted but the file is always
+    saved with a .jpg extension -- if the model ever returns PNG bytes,
+    every downstream consumer that hardcodes .jpg/image/jpeg (split.py,
+    preview.py, tv_deploy.py, telegram_bot.py) would silently mishandle
+    it. Saving must normalize to a real JPEG regardless of what the model
+    claims.
+    """
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+    buffer = io.BytesIO()
+    Image.new("RGB", (10, 10), color="red").save(buffer, format="PNG")
+    png_bytes = buffer.getvalue()
+    response = _response_with_inline_image(png_bytes, "image/png")
+    monkeypatch.setattr(
+        generation.genai, "Client", _fake_client_factory(response=response)
+    )
+
+    result = generate_image("a small red square", "1:1")
+
+    assert result["mime_type"] == "image/jpeg"
+    path = Path(result["path"])
+    assert path.read_bytes()[:2] == JPEG_MAGIC_NUMBER
+    with Image.open(path) as saved:
+        assert saved.format == "JPEG"
 
 
 def test_generate_image_flags_policy_rejection(monkeypatch):

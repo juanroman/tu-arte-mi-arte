@@ -69,8 +69,8 @@ def split_wide_image(image_id: str, gap_fraction: float) -> dict:
         right = img.crop((width - half_px, 0, width, height))
 
     return {
-        "left": _save_image_bytes(_encode_jpeg(left), "image/jpeg"),
-        "right": _save_image_bytes(_encode_jpeg(right), "image/jpeg"),
+        "left": _save_image_bytes(_encode_jpeg(left)),
+        "right": _save_image_bytes(_encode_jpeg(right)),
     }
 
 
