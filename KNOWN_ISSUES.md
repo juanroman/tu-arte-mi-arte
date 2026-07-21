@@ -110,3 +110,19 @@ fondo persiste con la nueva redacción.
 **Por qué importa:** ocurrió dos veces en una sola sesión de ~70 minutos con tráfico real — no es un caso aislado. Hoy la única mitigación es que el usuario reintente manualmente; no hay reintento automático en código (ver issue #3, mismo principio de no interceptar respuestas del modelo).
 
 **Estado:** sin resolver, v1 no bloqueada por esto — el flujo de error ya existente absorbe el caso sin colgar la conversación ni exponer un traceback crudo, y el reintento manual del usuario funcionó ambas veces. Si la frecuencia sube en producción, considerar si vale la pena un reintento automático acotado (p. ej. un solo retry silencioso) específicamente para `NO_IMAGE` sin `policy_rejection`, ya que ese caso no es una decisión editorial del modelo sino una falla vacía de la respuesta.
+
+---
+
+## 5. Una TV atascada durante el handshake de conexión deja un hilo/socket sin liberar
+
+**Encontrado:** revisión de código completa, 2026-07-20 (`CODE_REVIEW_ISSUES.md`, issue #9).
+
+**Dónde:** `src/engine/tv_deploy.py::_run_with_deploy_watchdog`.
+
+**Qué pasa:** el watchdog fuerza el cierre del socket crudo de la TV para destrabar un hilo colgado dentro de `recv()` (bug conocido de `samsungtvws`, ver `docs/matte_investigation.md`). Pero si el hang ocurre *durante* el propio handshake de `tv.open()` — antes de que `samsungtvws` asigne `tv.connection` — no hay socket que forzar: la rama de "sin socket que forzar" ya distingue este caso en el log, pero el hilo (`threading.Thread(daemon=True)`) queda corriendo indefinidamente, bloqueado dentro de la llamada de la librería, sin forma de cancelarlo desde este proceso.
+
+**Por qué importa:** cada reintento (`_upload_with_retries` o un reintento manual del usuario) contra una TV persistentemente atascada (no solo lenta) acumula un hilo daemon y un socket abiertos que nunca se liberan durante la vida del proceso.
+
+**Por qué no se resolvió:** acotado por `max_attempts` en cada llamada individual, y de bajo impacto para un despliegue doméstico con despliegues poco frecuentes. Resolverlo de raíz requeriría inventar un mecanismo de cancelación externo (Python no permite matar un hilo de forma limpia) que la revisión de código no llegó a especificar — fuera de alcance de un fix puntual.
+
+**Estado:** sin resolver, riesgo aceptado documentado — mismo tratamiento que los issues #1-#4 de este archivo. Si se observa que TVs atascadas (no solo lentas) ocurren con regularidad en producción, reconsiderar un mecanismo de cancelación explícito.
