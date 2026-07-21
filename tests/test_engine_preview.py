@@ -96,6 +96,24 @@ def test_compose_preview_reports_missing_panel_image(tmp_path, monkeypatch):
     assert "error" in result
 
 
+def test_compose_preview_rejects_malformed_image_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+
+    reference_path = tmp_path / "reference.jpg"
+    _solid_jpeg(reference_path, (1000, 800), (255, 255, 255))
+    monkeypatch.setattr(preview, "REFERENCE_PHOTO_PATH", reference_path)
+    monkeypatch.setattr(
+        preview,
+        "load_room_config",
+        lambda: RoomConfig(panels={"43L": PanelRect(0.0, 0.0, 0.3, 0.5)}),
+    )
+
+    result = compose_preview({"43L": "../../../etc/passwd"})
+
+    assert "error" in result
+    assert "inválido" in result["error"]
+
+
 def test_compose_preview_reports_unknown_panel_id(tmp_path, monkeypatch):
     monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
 

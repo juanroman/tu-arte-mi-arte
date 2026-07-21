@@ -75,3 +75,32 @@ def test_split_wide_image_reports_missing_source(tmp_path, monkeypatch):
     result = split_wide_image("img_does_not_exist", 0.1)
 
     assert "error" in result
+
+
+def test_split_wide_image_rejects_gap_fraction_at_or_above_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+    wide = Image.new("RGB", (1000, 800), color="red")
+    wide.save(tmp_path / "img_wide0000.jpg", format="JPEG")
+
+    result = split_wide_image("img_wide0000", 1.5)
+
+    assert "error" in result
+
+
+def test_split_wide_image_rejects_negative_gap_fraction(tmp_path, monkeypatch):
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+    wide = Image.new("RGB", (1000, 800), color="red")
+    wide.save(tmp_path / "img_wide0000.jpg", format="JPEG")
+
+    result = split_wide_image("img_wide0000", -0.2)
+
+    assert "error" in result
+
+
+def test_split_wide_image_rejects_malformed_image_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+
+    result = split_wide_image("../../../etc/passwd", 0.1)
+
+    assert "error" in result
+    assert "inválido" in result["error"]

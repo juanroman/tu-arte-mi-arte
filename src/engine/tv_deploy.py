@@ -111,11 +111,15 @@ def _delete_old_uploads(
     de despliegue.
     """
     try:
-        old_ids = [
-            item["content_id"]
-            for item in tv.available(category=_MY_PHOTOS_CATEGORY)
-            if item.get("content_id") != keep_content_id
-        ]
+        available = tv.available(category=_MY_PHOTOS_CATEGORY)
+        if keep_content_id is None:
+            old_ids = [item["content_id"] for item in available if "content_id" in item]
+        else:
+            old_ids = [
+                item["content_id"]
+                for item in available
+                if item.get("content_id") not in (None, keep_content_id)
+            ]
         if old_ids:
             tv.delete_list(old_ids)
     except _CONNECTION_ERRORS as error:
@@ -147,6 +151,10 @@ def _resolve_deploy_target(tv_name: str, image_id: str) -> tuple[Path, str, str]
     lanza. Compartido por `deploy_image_to_tv`/`upload_image_to_category`
     para no duplicar estas ~15 líneas entre ambas.
     """
+    invalid = generation.validate_image_id(image_id)
+    if invalid is not None:
+        return invalid
+
     image_path = generation.IMAGES_DIR / f"{image_id}.jpg"
     if not image_path.exists():
         return {"error": f"No existe una imagen con image_id={image_id!r}."}

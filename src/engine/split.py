@@ -50,6 +50,14 @@ def split_wide_image(image_id: str, gap_fraction: float) -> dict:
     franja física de marco+hueco, PRD §7.3). Devuelve {'left': {...},
     'right': {...}} o {'error': ...} si no existe la imagen fuente.
     """
+    if not (0 <= gap_fraction < 1):
+        _logger.warning("gap_fraction fuera de rango: %s", gap_fraction)
+        return {"error": f"gap_fraction fuera de rango (0, 1): {gap_fraction!r}."}
+
+    invalid = generation.validate_image_id(image_id)
+    if invalid is not None:
+        return invalid
+
     source_path = generation.IMAGES_DIR / f"{image_id}.jpg"
     if not source_path.exists():
         _logger.warning("Imagen fuente no encontrada para split: image_id=%s", image_id)
@@ -65,8 +73,8 @@ def split_wide_image(image_id: str, gap_fraction: float) -> dict:
         right = img.crop((width - half_px, 0, width, height))
 
     return {
-        "left": _save_image_bytes(_encode_jpeg(left), "image/jpeg"),
-        "right": _save_image_bytes(_encode_jpeg(right), "image/jpeg"),
+        "left": _save_image_bytes(_encode_jpeg(left)),
+        "right": _save_image_bytes(_encode_jpeg(right)),
     }
 
 

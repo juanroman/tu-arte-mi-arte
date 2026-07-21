@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 from pathlib import Path
@@ -5,6 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 from google.genai import errors, types
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -17,6 +19,15 @@ requires_gemini_key = pytest.mark.skipif(
     not os.environ.get("GEMINI_API_KEY"),
     reason="GEMINI_API_KEY no está configurada",
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_client_singleton(monkeypatch):
+    """_call_model reuses a single module-level client across calls (issue
+    #10) — without resetting it, whichever fake client the first test in
+    the session installs would leak into every later test.
+    """
+    monkeypatch.setattr(generation, "_client", None)
 
 
 class _FakeModels:
@@ -85,6 +96,21 @@ def test_edit_image_reports_missing_reference(tmp_path, monkeypatch):
     assert "error" in result
 
 
+def test_edit_image_rejects_malformed_image_id(tmp_path, monkeypatch):
+    """image_id flows straight from an LLM tool-call argument into a Path
+    join with no format check -- a crafted value shaped like
+    "../../../etc/passwd" could in principle escape IMAGES_DIR. Validate
+    the format before ever touching the filesystem, distinct from the
+    generic "no existe" 404 for a well-formed but absent image_id.
+    """
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+
+    result = edit_image("more autumnal", "../../../etc/passwd")
+
+    assert "error" in result
+    assert "inválido" in result["error"]
+
+
 @requires_gemini_key
 def test_generate_final_high_res_produces_a_new_image():
     draft = generate_image("a small red apple on a wooden table", "1:1")
@@ -104,6 +130,67 @@ def test_generate_final_high_res_reports_missing_reference(tmp_path, monkeypatch
     result = generate_final_high_res("img_does_not_exist")
 
     assert "error" in result
+
+
+def _response_with_inline_image(data: bytes, mime_type: str):
+    part = types.Part(inline_data=types.Blob(data=data, mime_type=mime_type))
+    return types.GenerateContentResponse(
+        candidates=[
+            types.Candidate(
+                finish_reason=types.FinishReason.STOP,
+                content=types.Content(parts=[part]),
+            )
+        ]
+    )
+
+
+def test_generate_image_normalizes_png_response_bytes_to_real_jpeg(
+    tmp_path, monkeypatch
+):
+    """The model's reported mime_type is trusted but the file is always
+    saved with a .jpg extension -- if the model ever returns PNG bytes,
+    every downstream consumer that hardcodes .jpg/image/jpeg (split.py,
+    preview.py, tv_deploy.py, telegram_bot.py) would silently mishandle
+    it. Saving must normalize to a real JPEG regardless of what the model
+    claims.
+    """
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+    buffer = io.BytesIO()
+    Image.new("RGB", (10, 10), color="red").save(buffer, format="PNG")
+    png_bytes = buffer.getvalue()
+    response = _response_with_inline_image(png_bytes, "image/png")
+    monkeypatch.setattr(
+        generation.genai, "Client", _fake_client_factory(response=response)
+    )
+
+    result = generate_image("a small red square", "1:1")
+
+    assert result["mime_type"] == "image/jpeg"
+    path = Path(result["path"])
+    assert path.read_bytes()[:2] == JPEG_MAGIC_NUMBER
+    with Image.open(path) as saved:
+        assert saved.format == "JPEG"
+
+
+def test_call_model_reuses_a_single_shared_client_across_calls(monkeypatch):
+    """A fresh genai.Client was constructed on every single generation/edit
+    call, relying on __del__/GC to close the underlying httpx connection
+    pool. Not a proven leak at this app's call volume, but a shared,
+    reusable client is the documented fix direction.
+    """
+    response = _response_with_finish_reason(types.FinishReason.OTHER)
+    construction_count = {"n": 0}
+
+    def _counting_factory(*args, **kwargs):
+        construction_count["n"] += 1
+        return _FakeClient(response=response)
+
+    monkeypatch.setattr(generation.genai, "Client", _counting_factory)
+
+    generate_image("un tema cualquiera", "1:1")
+    generate_image("otro tema", "1:1")
+
+    assert construction_count["n"] == 1
 
 
 def test_generate_image_flags_policy_rejection(monkeypatch):

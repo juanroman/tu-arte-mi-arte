@@ -4,13 +4,16 @@ No dependency on google.adk: these functions are testable in isolation and
 reusable from any interface (adk web today, Telegram in Etapa 2).
 """
 
+import io
 import logging
+import re
 import uuid
 from pathlib import Path
 
 import httpx
 from google import genai
 from google.genai import errors, types
+from PIL import Image
 
 _logger = logging.getLogger(__name__)
 
@@ -49,19 +52,49 @@ _POLICY_BLOCK_REASONS = {
 }
 
 
+# Word characters only (letters, digits, underscore) after the img_
+# prefix: blocks path-traversal-shaped values (any '.', '/', etc.) without
+# being as narrow as _new_image_id()'s own 8-hex-char output, since plenty
+# of tests across the suite construct image_ids as readable fixture names
+# (e.g. "img_left", "img_old") rather than via _new_image_id() itself.
+_IMAGE_ID_PATTERN = re.compile(r"^img_\w+$")
+
+
 def _new_image_id() -> str:
     return f"img_{uuid.uuid4().hex[:8]}"
 
 
-def _save_image_bytes(data: bytes, mime_type: str) -> dict:
+def validate_image_id(image_id: str) -> dict | None:
+    """Checks `image_id` has a safe shape before it's ever joined into a
+    filesystem path. `image_id` values consumed here often come straight
+    from LLM tool-call arguments (edit_image, split_wide_image,
+    compose_preview, deploy_image_to_tv) with no format check otherwise —
+    a crafted value shaped like a path traversal sequence could in
+    principle escape IMAGES_DIR. Returns an error dict if invalid, `None`
+    if valid.
+    """
+    if not _IMAGE_ID_PATTERN.fullmatch(image_id):
+        _logger.warning("image_id con formato inválido: %r", image_id)
+        return {"error": f"image_id inválido: {image_id!r}."}
+    return None
+
+
+def _save_image_bytes(data: bytes) -> dict:
     """Saves raw image bytes to disk under a fresh image_id and returns its
     metadata. Shared by Gemini-response saves and local (Pillow) saves.
+
+    Re-encodes to JPEG regardless of the source format: every consumer of
+    a saved image_id (split.py, preview.py, tv_deploy.py, telegram_bot.py)
+    hardcodes the .jpg extension and image/jpeg mime type, so the on-disk
+    bytes must always actually be JPEG rather than trusting whatever
+    format the caller claims to have handed us.
     """
     image_id = _new_image_id()
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     path = IMAGES_DIR / f"{image_id}.jpg"
-    path.write_bytes(data)
-    return {"image_id": image_id, "path": str(path), "mime_type": mime_type}
+    with Image.open(io.BytesIO(data)) as img:
+        img.convert("RGB").save(path, format="JPEG")
+    return {"image_id": image_id, "path": str(path), "mime_type": "image/jpeg"}
 
 
 def _save_response_image(response: types.GenerateContentResponse) -> dict:
@@ -113,9 +146,7 @@ def _save_response_image(response: types.GenerateContentResponse) -> dict:
         )
         return {"error": "El modelo no devolvió una imagen."}
 
-    result = _save_image_bytes(
-        part.inline_data.data, part.inline_data.mime_type or "image/jpeg"
-    )
+    result = _save_image_bytes(part.inline_data.data)
     _logger.debug("Imagen guardada: image_id=%s", result["image_id"])
     return result
 
@@ -124,6 +155,10 @@ def _load_reference(image_id: str) -> types.Part | dict:
     """Loads a previously saved image as a reference Part for image-to-image
     calls, or an error dict if no image exists under that image_id.
     """
+    invalid = validate_image_id(image_id)
+    if invalid is not None:
+        return invalid
+
     reference_path = IMAGES_DIR / f"{image_id}.jpg"
     if not reference_path.exists():
         _logger.warning("Referencia no encontrada: image_id=%s", image_id)
@@ -131,6 +166,20 @@ def _load_reference(image_id: str) -> types.Part | dict:
     return types.Part.from_bytes(
         data=reference_path.read_bytes(), mime_type="image/jpeg"
     )
+
+
+_client: genai.Client | None = None
+
+
+def _get_client() -> genai.Client:
+    """Lazily builds and reuses a single genai.Client for the process's
+    lifetime, instead of constructing a fresh one (and its underlying
+    httpx connection pool) on every single generation/edit call.
+    """
+    global _client
+    if _client is None:
+        _client = genai.Client(http_options=_RETRY_HTTP_OPTIONS)
+    return _client
 
 
 def _call_model(contents, image_config: types.ImageConfig) -> dict:
@@ -147,7 +196,7 @@ def _call_model(contents, image_config: types.ImageConfig) -> dict:
         image_config.aspect_ratio,
         image_config.image_size,
     )
-    client = genai.Client(http_options=_RETRY_HTTP_OPTIONS)
+    client = _get_client()
     try:
         response = client.models.generate_content(
             model=_MODEL_NAME,

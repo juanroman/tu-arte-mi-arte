@@ -178,6 +178,20 @@ def test_deploy_image_to_tv_reports_missing_image(tmp_path, monkeypatch):
     assert "error" in result
 
 
+def test_deploy_image_to_tv_rejects_malformed_image_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
+
+    def _fail_resolve(name):
+        raise AssertionError("resolve_tv_host should not run for an invalid image_id")
+
+    monkeypatch.setattr(tv_deploy, "resolve_tv_host", _fail_resolve)
+
+    result = deploy_image_to_tv("43L", "../../../etc/passwd")
+
+    assert "error" in result
+    assert "inválido" in result["error"]
+
+
 def test_deploy_image_to_tv_converts_tv_not_found_to_error_dict(tmp_path, monkeypatch):
     _write_fixture_image(tmp_path, "img_0001")
     monkeypatch.setattr(generation, "IMAGES_DIR", tmp_path)
@@ -281,6 +295,32 @@ def test_deploy_image_to_tv_cleans_up_old_uploads_excluding_new_one(
 
     assert result == {"content_id": "MY_new"}
     assert sorted(fake.deleted) == ["MY_old1", "MY_old2"]
+
+
+def test_deploy_image_to_tv_does_not_crash_when_an_item_lacks_content_id(
+    tmp_path, monkeypatch
+):
+    """The old-uploads comprehension filtered with item.get("content_id")
+    but then indexed with item["content_id"] -- an item missing that key
+    passes the "not the one to keep" filter and then blows up on the
+    bracket access, breaking deploy_image_to_tv's documented "nunca lanza"
+    guarantee.
+    """
+    _write_fixture_image(tmp_path, "img_0001")
+    fake = _install_fake(
+        monkeypatch,
+        tmp_path,
+        content_id="MY_new",
+        existing_content=[
+            {"content_id": "MY_old1", "category_id": "MY-C0002"},
+            {"category_id": "MY-C0002"},
+        ],
+    )
+
+    result = deploy_image_to_tv("43L", "img_0001")
+
+    assert result == {"content_id": "MY_new"}
+    assert fake.deleted == ["MY_old1"]
 
 
 def test_deploy_image_to_tv_skips_delete_call_when_nothing_to_clean(
@@ -782,6 +822,28 @@ def test_clear_photos_category_deletes_all_existing_content(tmp_path, monkeypatc
     assert result == {"cleared": True}
     assert sorted(fake.deleted) == ["MY_F0001", "MY_F0002"]
     assert fake.closed is True
+
+
+def test_clear_photos_category_deletes_items_even_when_some_lack_content_id(
+    tmp_path, monkeypatch
+):
+    """keep_content_id=None means "delete everything" -- an item missing
+    content_id has nothing to delete by id, but it must not block deletion
+    of the other items that do have one.
+    """
+    fake = _install_fake(
+        monkeypatch,
+        tmp_path,
+        existing_content=[
+            {"content_id": "MY_F0001", "category_id": "MY-C0002"},
+            {"category_id": "MY-C0002"},
+        ],
+    )
+
+    result = clear_photos_category("43L")
+
+    assert result == {"cleared": True}
+    assert fake.deleted == ["MY_F0001"]
 
 
 def test_clear_photos_category_reports_no_content_without_error(tmp_path, monkeypatch):
