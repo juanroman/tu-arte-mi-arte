@@ -21,6 +21,15 @@ requires_gemini_key = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _reset_client_singleton(monkeypatch):
+    """_call_model reuses a single module-level client across calls (issue
+    #10) — without resetting it, whichever fake client the first test in
+    the session installs would leak into every later test.
+    """
+    monkeypatch.setattr(generation, "_client", None)
+
+
 class _FakeModels:
     def __init__(self, response=None, exception=None):
         self._response = response
@@ -161,6 +170,27 @@ def test_generate_image_normalizes_png_response_bytes_to_real_jpeg(
     assert path.read_bytes()[:2] == JPEG_MAGIC_NUMBER
     with Image.open(path) as saved:
         assert saved.format == "JPEG"
+
+
+def test_call_model_reuses_a_single_shared_client_across_calls(monkeypatch):
+    """A fresh genai.Client was constructed on every single generation/edit
+    call, relying on __del__/GC to close the underlying httpx connection
+    pool. Not a proven leak at this app's call volume, but a shared,
+    reusable client is the documented fix direction.
+    """
+    response = _response_with_finish_reason(types.FinishReason.OTHER)
+    construction_count = {"n": 0}
+
+    def _counting_factory(*args, **kwargs):
+        construction_count["n"] += 1
+        return _FakeClient(response=response)
+
+    monkeypatch.setattr(generation.genai, "Client", _counting_factory)
+
+    generate_image("un tema cualquiera", "1:1")
+    generate_image("otro tema", "1:1")
+
+    assert construction_count["n"] == 1
 
 
 def test_generate_image_flags_policy_rejection(monkeypatch):

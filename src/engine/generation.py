@@ -168,6 +168,20 @@ def _load_reference(image_id: str) -> types.Part | dict:
     )
 
 
+_client: genai.Client | None = None
+
+
+def _get_client() -> genai.Client:
+    """Lazily builds and reuses a single genai.Client for the process's
+    lifetime, instead of constructing a fresh one (and its underlying
+    httpx connection pool) on every single generation/edit call.
+    """
+    global _client
+    if _client is None:
+        _client = genai.Client(http_options=_RETRY_HTTP_OPTIONS)
+    return _client
+
+
 def _call_model(contents, image_config: types.ImageConfig) -> dict:
     """Calls Nano Banana 2 and saves the resulting image, centralizing retry
     (§7.9: 1-2 reintentos silenciosos ante fallas transitorias, vía el
@@ -182,7 +196,7 @@ def _call_model(contents, image_config: types.ImageConfig) -> dict:
         image_config.aspect_ratio,
         image_config.image_size,
     )
-    client = genai.Client(http_options=_RETRY_HTTP_OPTIONS)
+    client = _get_client()
     try:
         response = client.models.generate_content(
             model=_MODEL_NAME,
