@@ -122,6 +122,23 @@ def _delete_old_uploads(
         _logger.warning("No se pudo limpiar subidas viejas en %s: %s", tv_name, error)
 
 
+def _resolve_tv_host_or_error(tv_name: str) -> str | dict:
+    """Resuelve el host de `tv_name`, convirtiendo también una falla al
+    cargar `config/tvs.toml` (TOML corrupto o archivo ausente -- p. ej.
+    producido por un crash a mitad de `tv_discovery._save_last_known_ip`)
+    en `{'error': ...}` en vez de dejarla propagar. Compartido por
+    `_resolve_deploy_target`/`clear_photos_category`/
+    `configure_batch_rotation`: las cuatro funciones públicas de este
+    módulo documentan "nunca lanza", y un `tomllib.TOMLDecodeError`/
+    `OSError` sin capturar aquí rompería esa garantía para las tres.
+    """
+    try:
+        return resolve_tv_host(tv_name)
+    except (TvNotFoundError, tomllib.TOMLDecodeError, OSError) as error:
+        _logger.error("No se pudo resolver la TV %s: %s", tv_name, error)
+        return {"error": str(error)}
+
+
 def _resolve_deploy_target(tv_name: str, image_id: str) -> tuple[Path, str, str] | dict:
     """Resuelve las precondiciones comunes a cualquier operación de subida
     (con o sin selección en pantalla): que la imagen exista en disco, el
@@ -134,16 +151,14 @@ def _resolve_deploy_target(tv_name: str, image_id: str) -> tuple[Path, str, str]
     if not image_path.exists():
         return {"error": f"No existe una imagen con image_id={image_id!r}."}
 
-    try:
-        host = resolve_tv_host(tv_name)
-    except TvNotFoundError as error:
-        _logger.error("No se pudo resolver la TV %s: %s", tv_name, error)
-        return {"error": str(error)}
+    host = _resolve_tv_host_or_error(tv_name)
+    if isinstance(host, dict):
+        return host
 
     try:
         config = load_tv_deploy_config()
         matte = config.matte[tv_name]
-    except (KeyError, TypeError) as error:
+    except (KeyError, TypeError, tomllib.TOMLDecodeError, OSError) as error:
         return {
             "error": (
                 f"Configuración de matte inválida para la TV {tv_name!r}: {error}"
@@ -466,11 +481,9 @@ def clear_photos_category(tv_name: str) -> dict:
     """
     _logger.info("Vaciando 'Mis Fotos' de %s", tv_name)
 
-    try:
-        host = resolve_tv_host(tv_name)
-    except TvNotFoundError as error:
-        _logger.error("No se pudo resolver la TV %s: %s", tv_name, error)
-        return {"error": str(error)}
+    host = _resolve_tv_host_or_error(tv_name)
+    if isinstance(host, dict):
+        return host
 
     token_file = DATA_DIR / f"tv_{tv_name.lower()}_token.json"
     tv = SamsungTVArt(
@@ -543,11 +556,9 @@ def configure_batch_rotation(
         shuffle,
     )
 
-    try:
-        host = resolve_tv_host(tv_name)
-    except TvNotFoundError as error:
-        _logger.error("No se pudo resolver la TV %s: %s", tv_name, error)
-        return {"error": str(error)}
+    host = _resolve_tv_host_or_error(tv_name)
+    if isinstance(host, dict):
+        return host
 
     token_file = DATA_DIR / f"tv_{tv_name.lower()}_token.json"
     tv = SamsungTVArt(

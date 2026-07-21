@@ -1,4 +1,5 @@
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -10,6 +11,7 @@ from engine.tv_discovery import (
     CONFIG_PATH,
     TvConfig,
     TvNotFoundError,
+    _save_last_known_ip,
     load_tv_configs,
     resolve_tv_host,
 )
@@ -160,3 +162,81 @@ def test_browse_mdns_listens_for_the_full_timeout_budget(monkeypatch):
 class _FakeZeroconf:
     def close(self):
         pass
+
+
+def test_concurrent_saves_for_different_tvs_do_not_lose_either_update(
+    tmp_path, monkeypatch
+):
+    """_save_last_known_ip does a read-modify-write of the whole config
+    file. Two TVs resolving concurrently (deploy_set_to_panels runs all
+    three in a ThreadPoolExecutor) can both read the same stale snapshot
+    and then each write back the full file with only their own TV
+    updated -- last writer wins, silently discarding the other's freshly
+    confirmed IP. A lock around the read-modify-write critical section
+    must serialize the two calls so neither update is lost.
+    """
+    config_path = tmp_path / "tvs.toml"
+    _write_config(config_path)
+
+    thread_1_reading = threading.Event()
+    release_thread_1 = threading.Event()
+    real_load_tv_configs = tv_discovery.load_tv_configs
+    first_call_done = False
+
+    def _load_tv_configs_pausing_first_caller(path):
+        nonlocal first_call_done
+        configs = real_load_tv_configs(path)
+        if not first_call_done:
+            first_call_done = True
+            thread_1_reading.set()
+            release_thread_1.wait(timeout=5)
+        return configs
+
+    monkeypatch.setattr(
+        tv_discovery, "load_tv_configs", _load_tv_configs_pausing_first_caller
+    )
+
+    thread_1 = threading.Thread(
+        target=_save_last_known_ip, args=("43L", "10.0.0.111", config_path)
+    )
+    thread_1.start()
+    assert thread_1_reading.wait(timeout=5)
+
+    # Give thread_2 a real window to run to completion (buggy code: no
+    # lock, so it finishes here comfortably) or to block on the fix's
+    # lock (in which case this join simply times out without completing).
+    thread_2 = threading.Thread(
+        target=_save_last_known_ip, args=("50", "10.0.0.222", config_path)
+    )
+    thread_2.start()
+    thread_2.join(timeout=0.3)
+    release_thread_1.set()
+    thread_1.join(timeout=5)
+    thread_2.join(timeout=5)
+
+    configs = load_tv_configs(path=config_path)
+    assert configs["43L"].last_known_ip == "10.0.0.111"
+    assert configs["50"].last_known_ip == "10.0.0.222"
+
+
+def test_save_last_known_ip_does_not_corrupt_file_when_replace_fails(
+    tmp_path, monkeypatch
+):
+    """A failure during the final atomic swap (e.g. the disk fills up
+    mid-operation) must never leave `tvs.toml` truncated or invalid: the
+    new content must be written to a temp file first and only swapped in
+    via an atomic replace, never a direct in-place overwrite.
+    """
+    config_path = tmp_path / "tvs.toml"
+    _write_config(config_path)
+    original_content = config_path.read_text()
+
+    def _failing_replace(*args, **kwargs):
+        raise OSError("disco lleno durante el reemplazo atómico")
+
+    monkeypatch.setattr(tv_discovery.os, "replace", _failing_replace)
+
+    with pytest.raises(OSError):
+        _save_last_known_ip("43L", "10.0.0.99", config_path)
+
+    assert config_path.read_text() == original_content

@@ -17,7 +17,9 @@ reusable from any interface.
 """
 
 import logging
+import os
 import socket
+import threading
 import time
 import tomllib
 from dataclasses import dataclass
@@ -71,18 +73,34 @@ _TOML_HEADER = (
 )
 
 
+# Guards the read-modify-write below: resolve_tv_host runs concurrently for
+# all three TVs (deploy_set_to_panels's ThreadPoolExecutor), and this
+# function rewrites the ENTIRE config file, not just one TV's row. Without
+# serializing, two threads can both read the same stale snapshot and each
+# write back a full file reflecting only their own update, silently
+# discarding the other's freshly-confirmed IP.
+_save_lock = threading.Lock()
+
+
 def _save_last_known_ip(name: str, ip: str, path: Path | None = None) -> None:
     target = path or CONFIG_PATH
-    configs = load_tv_configs(target)
-    configs[name].last_known_ip = ip
-    lines = [_TOML_HEADER, ""]
-    for tv_name, config in configs.items():
-        lines.append(f'[tvs."{tv_name}"]')
-        lines.append(f'mac = "{config.mac}"')
-        ip_value = f'"{config.last_known_ip}"' if config.last_known_ip else '""'
-        lines.append(f"last_known_ip = {ip_value}")
-        lines.append("")
-    target.write_text("\n".join(lines))
+    with _save_lock:
+        configs = load_tv_configs(target)
+        configs[name].last_known_ip = ip
+        lines = [_TOML_HEADER, ""]
+        for tv_name, config in configs.items():
+            lines.append(f'[tvs."{tv_name}"]')
+            lines.append(f'mac = "{config.mac}"')
+            ip_value = f'"{config.last_known_ip}"' if config.last_known_ip else '""'
+            lines.append(f"last_known_ip = {ip_value}")
+            lines.append("")
+
+        # Write to a temp file and swap it in atomically (os.replace) so a
+        # failure mid-write (disk full, power loss on the Pi) never leaves
+        # the real config truncated/invalid for the other two TVs.
+        tmp_path = target.with_suffix(target.suffix + ".tmp")
+        tmp_path.write_text("\n".join(lines))
+        os.replace(tmp_path, target)
 
 
 def _mac_at(ip: str, timeout: float) -> str | None:

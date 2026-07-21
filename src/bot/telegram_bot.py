@@ -419,6 +419,24 @@ def _finalize_high_res_all_succeeded(events: list) -> bool:
     return bool(responses) and all("error" not in r for r in responses)
 
 
+def _deploy_to_panels_all_succeeded(events: list) -> bool:
+    """True if deploy_to_panels wasn't called this turn (nothing to fail),
+    or if it was called and every panel succeeded. `agent.py`'s ETAPA 4
+    instructions call deploy_to_panels automatically right after
+    finalize_high_res succeeds, in the same turn -- so a session-closing
+    decision that only checks finalize_high_res would rotate the session
+    even when the deploy that followed left the wall in a partial,
+    inconsistent state (some TVs changed, some didn't). That's exactly the
+    "commission isn't actually done" case _finalize_high_res_all_succeeded
+    already protects against for finalize itself; this extends the same
+    guarantee to the deploy step.
+    """
+    result = _extract_deploy_results(events)
+    if result is None:
+        return True
+    return all("error" not in tv_result for tv_result in result.values())
+
+
 def _extract_deploy_results(events: list) -> dict | None:
     """Devuelve el dict de resultado de la última llamada a deploy_to_panels
     en la corrida ({'43L': {...}, '43R': {...}, '50': {...}}), o None si
@@ -1037,11 +1055,13 @@ async def _run_and_deliver(
     trabajo del propio agente vía 'MANEJO DE ERRORES' en su instrucción.
 
     Si el turno completó finalize_high_res sin ningún error (aprobación
-    exitosa) y la entrega también terminó sin excepción, rota la sesión en
-    silencio al terminar: una sesión "expirada" debe significar siempre un
-    encargo abandonado a medias, nunca uno que ya se completó (dev_plan
-    §2.4) — una entrega que truena a medias no cuenta como encargo
-    cerrado, mismo criterio que ya aplica a un fallo parcial de
+    exitosa), el deploy_to_panels que corre automáticamente justo después
+    también tuvo éxito en las tres pantallas (o no se llamó), y la entrega
+    también terminó sin excepción, rota la sesión en silencio al terminar:
+    una sesión "expirada" debe significar siempre un encargo abandonado a
+    medias, nunca uno que ya se completó (dev_plan §2.4) — un despliegue
+    parcial deja la pared inconsistente, así que tampoco cuenta como
+    encargo cerrado, mismo criterio que ya aplica a un fallo parcial de
     finalize_high_res.
     """
     try:
@@ -1058,7 +1078,9 @@ async def _run_and_deliver(
         )
         raise
 
-    if _finalize_high_res_all_succeeded(events):
+    if _finalize_high_res_all_succeeded(events) and _deploy_to_panels_all_succeeded(
+        events
+    ):
         await rotate_session(session_service, chat_id, reason="aprobacion_exitosa")
 
 
