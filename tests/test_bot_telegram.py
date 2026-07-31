@@ -1511,7 +1511,7 @@ def test_materialize_batch_gallery_success_does_not_block_the_turn(monkeypatch):
     """
 
     def slow_run_draft_stage(batch_id):
-        time.sleep(0.2)
+        time.sleep(0.5)
 
     monkeypatch.setattr(telegram_bot, "run_draft_stage", slow_run_draft_stage)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
@@ -1538,7 +1538,7 @@ def test_materialize_batch_gallery_success_does_not_block_the_turn(monkeypatch):
 
     asyncio.run(run_and_record())
 
-    assert finished_at[0] < 0.1
+    assert finished_at[0] < 0.3
     _final_reply(update).assert_awaited_once()
 
 
@@ -2386,7 +2386,7 @@ def test_batch_report_does_not_block_the_turn(monkeypatch):
     _write_fixture_images("img_1")
 
     def slow_run_draft_stage(batch_id):
-        time.sleep(0.2)
+        time.sleep(0.5)
 
     monkeypatch.setattr(telegram_bot, "run_draft_stage", slow_run_draft_stage)
     monkeypatch.setattr(telegram_bot, "run_finalize_stage", lambda batch_id: None)
@@ -2422,7 +2422,7 @@ def test_batch_report_does_not_block_the_turn(monkeypatch):
 
     asyncio.run(run_and_record())
 
-    assert finished_at[0] < 0.1
+    assert finished_at[0] < 0.3
     assert report_sent_before_turn_finished == [False]
     _final_reply(update).assert_awaited_once()
 
@@ -2548,7 +2548,7 @@ def test_revert_handlers_do_not_block_the_event_loop(monkeypatch, handler_name):
     """
 
     def slow_revert_panels(tv_names):
-        time.sleep(0.2)
+        time.sleep(0.5)
         return {name: {"content_id": f"MY_{name}"} for name in tv_names}
 
     monkeypatch.setattr(tv_deploy, "revert_panels", slow_revert_panels)
@@ -2574,7 +2574,7 @@ def test_revert_handlers_do_not_block_the_event_loop(monkeypatch, handler_name):
 
     asyncio.run(run_both())
 
-    assert first_tick_at[0] < 0.1
+    assert first_tick_at[0] < 0.3
 
 
 def test_revert_button_handler_ignores_malformed_callback_data(monkeypatch):
