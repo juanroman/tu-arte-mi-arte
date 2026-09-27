@@ -534,6 +534,88 @@ def clear_photos_category(tv_name: str) -> dict:
     return _run_with_deploy_watchdog(tv_name, tv, work)
 
 
+def select_uploaded_image(tv_name: str, content_id: str) -> dict:
+    """Selecciona en pantalla, en Art Mode, una imagen que ya está subida a
+    'Mis Fotos' de `tv_name` -- identificada por el `content_id` que la TV
+    devolvió en su momento al subirla. A diferencia de `deploy_image_to_tv`,
+    no sube nada ni borra subidas viejas: solo cambia cuál de las imágenes
+    ya presentes se muestra ahora mismo.
+
+    Pensada para el cierre de `run_upload_stage` (dev_plan_phase_2.md §4.1,
+    bug real reportado por el usuario): la TV real, tras recibir varias
+    subidas seguidas vía `upload_image_to_category` (que nunca selecciona
+    nada), termina mostrando de por sí la última imagen subida -- es decir,
+    el último día del lote, no el Día 1 -- porque nada llamó nunca
+    `select_image` explícitamente. Esta función deja explícitamente el Día
+    1 en pantalla al terminar de subir todo el lote, antes de que
+    `run_rotation_stage` configure la rotación nativa hacia adelante desde
+    ahí.
+
+    Mismo andamiaje de watchdog que el resto del módulo. Nunca lanza;
+    devuelve {'result': True} o {'error': '<mensaje>'}.
+    """
+    host = _resolve_tv_host_or_error(tv_name)
+    if isinstance(host, dict):
+        return host
+
+    token_file = DATA_DIR / f"tv_{tv_name.lower()}_token.json"
+    tv = SamsungTVArt(
+        host=host, token_file=str(token_file), timeout=_TV_TIMEOUT_SECONDS
+    )
+
+    def work(outcome: dict, abandoned: threading.Event) -> None:
+        del abandoned  # nada que proteger: no hay estado compartido que mutar
+        try:
+            try:
+                tv.open()
+            except _CONNECTION_ERRORS as error:
+                _logger.warning("No se pudo conectar con la TV %s: %s", tv_name, error)
+                outcome["result"] = {
+                    "error": f"No se pudo conectar con la TV {tv_name!r}: {error}"
+                }
+                return
+
+            if not tv.supported():
+                _logger.warning("La TV %s no soporta Art Mode", tv_name)
+                outcome["result"] = {"error": f"La TV {tv_name!r} no soporta Art Mode."}
+                return
+
+            try:
+                tv.select_image(content_id, show=True)
+            except _CONNECTION_ERRORS as error:
+                _logger.warning(
+                    "No se pudo seleccionar la imagen en %s: %s", tv_name, error
+                )
+                outcome["result"] = {
+                    "error": (
+                        f"No se pudo seleccionar la imagen en {tv_name!r}: {error}"
+                    )
+                }
+                return
+
+            _logger.info(
+                "Imagen seleccionada con éxito en %s: content_id=%s",
+                tv_name,
+                content_id,
+            )
+            outcome["result"] = {"result": True}
+        except Exception as error:  # red de seguridad: corre sin supervisión
+            _logger.exception("Fallo inesperado seleccionando imagen en %s", tv_name)
+            outcome["result"] = {
+                "error": (
+                    f"Fallo inesperado seleccionando imagen en la TV {tv_name!r}: "
+                    f"{error}"
+                )
+            }
+        finally:
+            try:
+                tv.close()
+            except Exception as error:
+                _logger.debug("Cierre de conexión falló para %s: %s", tv_name, error)
+
+    return _run_with_deploy_watchdog(tv_name, tv, work)
+
+
 def configure_batch_rotation(
     tv_name: str, duration_minutes: int, shuffle: bool
 ) -> dict:

@@ -18,6 +18,7 @@ from engine.tv_deploy import (
     load_tv_deploy_config,
     revert_panels,
     revert_tv,
+    select_uploaded_image,
     upload_image_to_category,
 )
 from engine.tv_discovery import TvNotFoundError
@@ -800,6 +801,83 @@ def test_upload_image_to_category_logs_error_when_watchdog_times_out(
         record.levelno == logging.ERROR and "43L" in record.message
         for record in caplog.records
     )
+
+
+def test_select_uploaded_image_success_selects_without_uploading_or_deleting(
+    tmp_path, monkeypatch
+):
+    """dev_plan_phase_2.md §4.3: a diferencia de deploy_image_to_tv, esta
+    función no sube nada ni borra subidas viejas -- solo cambia cuál de
+    las imágenes ya presentes en 'Mis Fotos' se muestra ahora mismo.
+    """
+    fake = _install_fake(monkeypatch, tmp_path)
+
+    result = select_uploaded_image("43L", "MY_F0099")
+
+    assert result == {"result": True}
+    assert fake.selected == ["MY_F0099"]
+    assert fake.uploaded == []
+    assert fake.deleted == []
+    assert fake.closed is True
+
+
+def test_select_uploaded_image_converts_tv_not_found_to_error_dict(monkeypatch):
+    def _raise_not_found(name):
+        raise TvNotFoundError(f"No hay TV {name!r}")
+
+    monkeypatch.setattr(tv_deploy, "resolve_tv_host", _raise_not_found)
+
+    result = select_uploaded_image("43L", "MY_F0099")
+
+    assert "error" in result
+
+
+def test_select_uploaded_image_reports_connection_failure_on_open(
+    tmp_path, monkeypatch
+):
+    fake = _install_fake(
+        monkeypatch, tmp_path, open_error=exceptions.ConnectionFailure("no conecta")
+    )
+
+    result = select_uploaded_image("43L", "MY_F0099")
+
+    assert "error" in result
+    assert fake.closed is True
+
+
+def test_select_uploaded_image_reports_unsupported_tv(tmp_path, monkeypatch):
+    fake = _install_fake(monkeypatch, tmp_path, supported=False)
+
+    result = select_uploaded_image("43L", "MY_F0099")
+
+    assert "error" in result
+    assert fake.selected == []
+
+
+def test_select_uploaded_image_reports_select_failure(tmp_path, monkeypatch):
+    fake = _install_fake(
+        monkeypatch, tmp_path, select_error=exceptions.ResponseError("no se pudo")
+    )
+
+    result = select_uploaded_image("43L", "MY_F0099")
+
+    assert "error" in result
+    assert fake.closed is True
+
+
+def test_select_uploaded_image_times_out_on_unresponsive_tv(tmp_path, monkeypatch):
+    """Mismo watchdog compartido (_run_with_deploy_watchdog) que el resto
+    del módulo -- una TV sin responder no debe colgar este llamado tampoco
+    aquí.
+    """
+    monkeypatch.setattr(tv_deploy, "_DEPLOY_DEADLINE_SECONDS", 0.1)
+    monkeypatch.setattr(tv_deploy, "_FORCE_CLOSE_GRACE_SECONDS", 0.1)
+    _install_fake(monkeypatch, tmp_path, open_hang_seconds=2)
+
+    result = select_uploaded_image("43L", "MY_F0099")
+
+    assert "error" in result
+    assert "no respondió" in result["error"]
 
 
 def test_clear_photos_category_deletes_all_existing_content(tmp_path, monkeypatch):
