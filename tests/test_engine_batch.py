@@ -27,6 +27,19 @@ def _stub_clear_photos_category(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_select_uploaded_image(monkeypatch):
+    """run_upload_stage (dev_plan_phase_2.md §4.3) selecciona el Día 1 en
+    pantalla al terminar de drenar cada panel -- sin este stub, las
+    pruebas de subida dispararían resolve_tv_host/mDNS reales. Los tests
+    que quieren verificar la selección en sí lo sobrescriben con su propio
+    monkeypatch.
+    """
+    monkeypatch.setattr(
+        batch, "select_uploaded_image", lambda tv_name, content_id: {"result": True}
+    )
+
+
 def _materialize_independiente_day(db_path, day_index=1):
     days = [
         ApprovedDay(
@@ -1513,6 +1526,121 @@ def test_run_upload_stage_still_uploads_when_clear_photos_category_fails(
 
     assert set(summary["uploaded"]) == {"1:43L", "1:43R", "1:50"}
     assert {tv_name for tv_name, _ in calls} == {"43L", "43R", "50"}
+
+
+# --- 4.3: selección explícita del Día 1 al terminar de subir un lote -----
+
+
+def test_run_upload_stage_selects_day_1_content_id_on_each_panel_after_upload(
+    tmp_path, monkeypatch
+):
+    """Bug real reportado por el usuario: subir un lote de 5 días dejaba
+    la TV mostrando el Día 5 (el último subido), no el Día 1 --
+    `upload_image_to_category` nunca selecciona nada en pantalla, así que
+    sin este paso explícito la TV real se queda mostrando lo último que
+    llegó. `run_upload_stage` debe llamar `select_uploaded_image` con el
+    `content_id` del Día 1 de cada panel, una sola vez, después de que ese
+    panel terminó de subir TODOS sus días -- nunca antes.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_n_independiente_days(db_path, 5)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+
+    monkeypatch.setattr(
+        batch,
+        "upload_image_to_category",
+        lambda tv_name, image_id: {"content_id": f"MY_{tv_name}_{image_id}"},
+    )
+
+    select_calls = []
+
+    def fake_select(tv_name, content_id):
+        select_calls.append((tv_name, content_id))
+        return {"result": True}
+
+    monkeypatch.setattr(batch, "select_uploaded_image", fake_select)
+
+    summary = batch.run_upload_stage(batch_id, path=db_path)
+
+    assert len(summary["uploaded"]) == 15
+    assert len(select_calls) == 3  # una vez por panel, nunca más
+    day1_items = {
+        item.panel: item
+        for item in batch_store.get_batch_items(batch_id, path=db_path)
+        if item.day_index == 1
+    }
+    expected = {
+        (panel, f"MY_{panel}_{day1_items[panel].image_id}")
+        for panel in ("43L", "43R", "50")
+    }
+    assert set(select_calls) == expected
+
+
+def test_run_upload_stage_does_not_select_when_day_1_was_already_uploaded_before(
+    tmp_path, monkeypatch
+):
+    """Si el Día 1 de un panel ya estaba 'uploaded' de una corrida
+    anterior (reinvocación tras un crash a medio subir), esta corrida
+    nunca vuelve a subirlo -- así que no tiene un content_id fresco para
+    seleccionar. No debe llamar `select_uploaded_image` para ese panel en
+    este caso (no hay nada nuevo que seleccionar).
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_n_independiente_days(db_path, 2)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+    batch_store.record_item_attempt(
+        batch_id,
+        1,
+        "43L",
+        attempts=1,
+        stage="uploaded",
+        image_id="final_img_day1_43l",
+        error=None,
+        path=db_path,
+    )
+
+    monkeypatch.setattr(
+        batch,
+        "upload_image_to_category",
+        lambda tv_name, image_id: {"content_id": f"MY_{tv_name}_{image_id}"},
+    )
+
+    select_calls = []
+    monkeypatch.setattr(
+        batch,
+        "select_uploaded_image",
+        lambda tv_name, content_id: select_calls.append((tv_name, content_id))
+        or {"result": True},
+    )
+
+    batch.run_upload_stage(batch_id, path=db_path)
+
+    assert "43L" not in {tv_name for tv_name, _ in select_calls}
+    assert {"43R", "50"} == {tv_name for tv_name, _ in select_calls}
+
+
+def test_run_upload_stage_survives_select_uploaded_image_failure(tmp_path, monkeypatch):
+    """La selección del Día 1 es best-effort, igual que el vaciado previo:
+    una TV inalcanzable al seleccionar no debe convertir uploads exitosos
+    en needs_attention ni hacer fallar la etapa.
+    """
+    db_path = tmp_path / "batch.sqlite3"
+    batch_id = _materialize_independiente_day(db_path)
+    _draft_and_finalize_successfully(batch_id, db_path, monkeypatch)
+
+    monkeypatch.setattr(
+        batch, "upload_image_to_category", _succeeding_upload_image_to_category([])
+    )
+    monkeypatch.setattr(
+        batch,
+        "select_uploaded_image",
+        lambda tv_name, content_id: {"error": "TV inalcanzable"},
+    )
+
+    summary = batch.run_upload_stage(batch_id, path=db_path)
+
+    assert set(summary["uploaded"]) == {"1:43L", "1:43R", "1:50"}
+    assert summary["needs_attention"] == []
 
 
 def test_run_rotation_stage_configures_all_three_tvs_with_config_values(monkeypatch):

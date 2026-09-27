@@ -82,6 +82,7 @@ from engine.split import SplitConfig, load_split_config, split_wide_image
 from engine.tv_deploy import (
     clear_photos_category,
     configure_batch_rotation,
+    select_uploaded_image,
     upload_image_to_category,
 )
 
@@ -506,15 +507,20 @@ def _upload_item(
     item: BatchItemRecord,
     max_attempts: int,
     path: Path | None,
-) -> str:
+) -> tuple[str, str | None]:
     """Sube un único panel físico (43L/43R/50, de un día independiente o
     split -- indistinguible aquí, ver nota de módulo) ya en
     stage='finalized' a la TV cuyo nombre coincide con `item.panel`.
-    Devuelve 'uploaded', 'needs_attention', o 'skipped' (todavía no
-    finalizado, o ya subido -- requisito duro #9).
+    Devuelve `(outcome, content_id)`: `outcome` es 'uploaded',
+    'needs_attention', o 'skipped' (todavía no finalizado, o ya subido --
+    requisito duro #9); `content_id` solo viene poblado cuando esta llamada
+    de hecho subió la imagen ahora (nunca en un 'skipped' de un item ya
+    'uploaded' en una corrida anterior) -- lo necesita `_drain_panel` para
+    poder seleccionar el Día 1 en pantalla al terminar de subir el lote
+    (dev_plan_phase_2.md §4.3).
     """
     if item.stage != "finalized":
-        return "skipped"
+        return "skipped", None
 
     image_id = item.image_id
     if image_id is None:
@@ -535,7 +541,7 @@ def _upload_item(
             error=None,
             path=path,
         )
-        return "uploaded"
+        return "uploaded", result["content_id"]
 
     record_item_attempt(
         batch_id,
@@ -547,7 +553,7 @@ def _upload_item(
         error=result.get("error"),
         path=path,
     )
-    return "needs_attention"
+    return "needs_attention", None
 
 
 def run_upload_stage(batch_id: str, path: Path | None = None) -> dict:
@@ -584,6 +590,20 @@ def run_upload_stage(batch_id: str, path: Path | None = None) -> dict:
     éxito. Un vaciado fallido (TV inalcanzable) se loguea como warning y
     la subida real continúa igual -- es limpieza best-effort, nunca debe
     bloquear la subida.
+
+    Selección del Día 1 al terminar ("bug real reportado por el usuario",
+    dev_plan_phase_2.md §4.3): `upload_image_to_category` nunca selecciona
+    nada en pantalla (ver su docstring), así que en hardware real la TV
+    termina mostrando de por sí la última imagen subida -- el último día
+    del lote, no el Día 1 -- porque nada llamó nunca `select_image`. Tras
+    drenar toda la cola de un panel en orden ascendente de `day_index`,
+    si el Día 1 de ESTA corrida se subió con éxito (no un 'skipped' de una
+    reinvocación donde ya estaba `uploaded` de antes), se llama
+    `select_uploaded_image` con su `content_id` para dejarlo explícitamente
+    en pantalla antes de que `run_rotation_stage` configure la rotación
+    hacia adelante desde ahí. Una falla de selección se loguea como
+    warning y no bloquea el resultado de la subida -- mismo principio
+    best-effort que el vaciado previo.
     """
     max_attempts = load_batch_config().tv_deploy_max_attempts
 
@@ -609,13 +629,27 @@ def run_upload_stage(batch_id: str, path: Path | None = None) -> dict:
                     batch_id,
                     clear_result["error"],
                 )
-        return [
-            (
-                _upload_item(batch_id, item, max_attempts, path),
-                f"{item.day_index}:{panel}",
-            )
-            for item in items
-        ]
+
+        results: list[tuple[str, str]] = []
+        day1_content_id: str | None = None
+        for item in items:
+            outcome, content_id = _upload_item(batch_id, item, max_attempts, path)
+            results.append((outcome, f"{item.day_index}:{panel}"))
+            if item.day_index == 1 and content_id is not None:
+                day1_content_id = content_id
+
+        if day1_content_id is not None:
+            select_result = select_uploaded_image(panel, day1_content_id)
+            if "error" in select_result:
+                _logger.warning(
+                    "No se pudo dejar el Día 1 seleccionado en pantalla en "
+                    "%s tras subir el lote %s: %s",
+                    panel,
+                    batch_id,
+                    select_result["error"],
+                )
+
+        return results
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=len(items_by_panel)
