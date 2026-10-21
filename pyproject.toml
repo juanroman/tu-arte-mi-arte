@@ -9,11 +9,12 @@ dependencies = [
     "google-adk[db]~=2.3",
     "aiosqlite>=0.22.1",
     "greenlet>=3.1.1",
-    "pillow>=12.3.0",
+    "pillow>=13.0.0",
     "python-telegram-bot~=22.8",
     "telegramify-markdown>=1.2.0",
     "samsungtvws==3.0.5",
     "zeroconf>=0.150.0",
+    "urllib3>=2.8.0",
 ]
 
 [dependency-groups]
