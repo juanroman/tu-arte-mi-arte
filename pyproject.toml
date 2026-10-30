@@ -52,3 +52,8 @@ python_version = "3.12"
 warn_unused_configs = true
 ignore_missing_imports = true
 explicit_package_bases = true
+
+[tool.uv]
+# google-adk caps opentelemetry-* at <=1.44 (latest adk 2.13), but CVE-2026-114603
+# (unbounded tracestate parsing) is only fixed in 1.45.1. Drop once adk lifts the cap.
+override-dependencies = ["opentelemetry-api>=1.45.1", "opentelemetry-sdk>=1.45.1"]
