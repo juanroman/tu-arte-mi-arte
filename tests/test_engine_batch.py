@@ -1406,8 +1406,19 @@ def test_run_upload_stage_processes_one_tv_concurrently_but_serializes_within_a_
     lock = threading.Lock()
     active_by_tv: dict[str, int] = {"43L": 0, "43R": 0, "50": 0}
     max_active_by_tv: dict[str, int] = {"43L": 0, "43R": 0, "50": 0}
+    # Prueba determinista de paralelismo entre TVs (en vez de medir tiempo
+    # de pared, que es frágil en runners de CI lentos): el primer upload de
+    # cada TV espera a que las otras dos TVs también hayan empezado el suyo.
+    # Si las TVs se procesaran en serie, el barrier expira y el upload falla.
+    first_upload_barrier = threading.Barrier(3, timeout=5)
+    seen_first_upload: set[str] = set()
 
     def fake_upload(tv_name, image_id):
+        with lock:
+            is_first = tv_name not in seen_first_upload
+            seen_first_upload.add(tv_name)
+        if is_first:
+            first_upload_barrier.wait()
         with lock:
             active_by_tv[tv_name] += 1
             max_active_by_tv[tv_name] = max(
@@ -1420,14 +1431,9 @@ def test_run_upload_stage_processes_one_tv_concurrently_but_serializes_within_a_
 
     monkeypatch.setattr(batch, "upload_image_to_category", fake_upload)
 
-    start = time.monotonic()
     summary = batch.run_upload_stage(batch_id, path=db_path)
-    elapsed = time.monotonic() - start
 
     assert max_active_by_tv == {"43L": 1, "43R": 1, "50": 1}
-    # 15 uploads/TV * 0.02s, en paralelo entre las 3 TVs: ~0.3s, nunca
-    # cerca de 45 * 0.02s = 0.9s (que sería el caso fully-secuencial).
-    assert elapsed < 0.7
 
     assert len(summary["uploaded"]) == 45
     assert summary["needs_attention"] == []
@@ -1705,14 +1711,16 @@ def test_run_rotation_stage_one_tv_failure_does_not_block_the_others(monkeypatch
 
 
 def test_run_rotation_stage_configures_the_three_tvs_concurrently(monkeypatch):
+    # Barrier en vez de medir tiempo de pared (frágil en CI lento): las tres
+    # llamadas deben estar en vuelo a la vez o el barrier expira y falla.
+    barrier = threading.Barrier(3, timeout=5)
+
     def fake_configure(tv_name, duration, shuffle):
-        time.sleep(0.2)
+        barrier.wait()
         return {"result": "ok"}
 
     monkeypatch.setattr(batch, "configure_batch_rotation", fake_configure)
 
-    start = time.monotonic()
-    batch.run_rotation_stage("batch_x")
-    elapsed = time.monotonic() - start
+    result = batch.run_rotation_stage("batch_x")
 
-    assert elapsed < 0.5
+    assert all(result[tv] == {"result": "ok"} for tv in ("43L", "43R", "50"))
